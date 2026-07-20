@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Proxy desktop multi-rota</strong><br/>
-  <b>Grok (xAI)</b> + <b>Kimi Work</b> · multi-conta · streaming · API local <code>/v1</code> · SQLite
+  <b>Grok (xAI)</b> + <b>Kimi Work</b> + <b>Qwen</b> · multi-conta · streaming · API local <code>/v1</code> · SQLite
 </p>
 
 <p align="center">
@@ -29,11 +29,12 @@
 
 1. **Grok (xAI)** — login OAuth por device-code, pool multi-conta, API **`/v1/responses`**
 2. **Kimi Work** — login Google no navegador do sistema (mesmo fluxo do Kimi Desktop), gera `sk-kimi`, multi-conta, API **`/v1/chat/completions`**
-3. Um servidor local compatível com OpenAI (`http://127.0.0.1:8787/v1`) para Cursor, OpenCode, etc.
-4. Chat na própria UI (streaming, thinking, tokens/custo)
-5. Opcional: importar SSO do Grok e bot de auto-registro
+3. **Qwen (via QwenBridge)** — base URL + API key do bridge local; catálogo de models via probe; sem rotação no proxy (o bridge já rotaciona)
+4. Um servidor local compatível com OpenAI (`http://127.0.0.1:8787/v1`) para Cursor, OpenCode, etc.
+5. Chat na própria UI (streaming, thinking, tokens/custo)
+6. Opcional: importar SSO do Grok e bot de auto-registro
 
-> **Não é afiliado à xAI nem à Moonshot/Kimi.** Projeto comunitário não oficial. Use por sua conta e risco. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [LICENSE](./LICENSE).
+> **Não é afiliado à xAI, Moonshot/Kimi nem Alibaba/Qwen.** Projeto comunitário não oficial. Use por sua conta e risco. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [LICENSE](./LICENSE).
 
 ---
 
@@ -43,14 +44,17 @@
 |----------|--------------|------------------------|-------------------|--------------------|
 | **Grok (xAI)** | **Auth** (pool de sessão) | OAuth device / SSO / auto-registro | **Padrão `POST /v1/chat/completions`** (também aceita `/v1/responses`) | `grok-4.5` |
 | **Kimi Work** | **Auth** (pool de sessão) | **Login com Google** (navegador do sistema) → mint `sk-kimi` | **`POST /v1/chat/completions`** | `kimi-for-coding`, `k3-agent`, `k3-agent-{low,medium,high,xhigh}`, `k2d6-agent` |
+| **Qwen** | **API key** (bridge) | UI → provider Qwen → base URL + API key do QwenBridge | **`POST /v1/chat/completions`** (+ conversão responses/messages) | Catálogo dinâmico via probe (`/v1/models` do bridge) |
 
 ### Regras de roteamento (v1.3+)
 
 - O **modelo escolhido na UI do app** vale **somente no chat interno**. **Não** reescreve o `model` das requests HTTP (OpenCode/Cursor/SDK/Kilo).
-- Clientes HTTP mandam o `model` que quiserem; o proxy **roteia o provedor pelo model** na mesma base URL (`grok-*` → xAI, `kimi-for-coding` / `k3-agent` → Kimi Work).
-- `GET /v1/models` lista **Grok + Kimi** juntos.
-- **Grok** padrão: `/v1/chat/completions` (OpenCode/Kilo). `/v1/responses` continua opcional.
+- Clientes HTTP mandam o `model` que quiserem; o proxy **roteia o provedor pelo model** na mesma base URL (`grok-*` → xAI, `kimi-for-coding` / `k3-agent` → Kimi Work, models Qwen → bridge).
+- `GET /v1/models` lista **todos os provedores** (independente do provider selecionado na UI).
+- **`/v1/search`** só aceita models Grok (400 claro se o cliente mandar outro).
+- **Grok** padrão: `/v1/chat/completions` (OpenCode/Kilo). `/v1/responses` continua opcional. `/v1/messages` (Anthropic) fala `/responses` com xAI + rotação + SSE.
 - **Kimi** usa `/v1/chat/completions` (se mandar `/responses`, o proxy reescreve).
+- **Qwen**: configure base URL (ex. `http://127.0.0.1:3000/v1`) + API key do bridge; sem rotação no lado do proxy.
 - Contas: pool separado por provedor (login Grok e login Kimi no app; o proxy puxa o pool certo pelo model).
 
 ---
@@ -59,15 +63,18 @@
 
 | Recurso | Descrição |
 |---------|-----------|
-| **Multi-rota** | Grok + Kimi Work no mesmo app / mesma porta local |
+| **Multi-rota** | Grok + Kimi Work + Qwen no mesmo app / mesma porta local |
 | **Sem Grok CLI** | OAuth device próprio + refresh de token |
 | **Kimi Work (coding)** | Login Google → `CreateAPIKey(WORK)` → `sk-kimi` → `agent-gw.kimi.com/coding/v1` |
+| **Kimi multi-conta** | Fila FIFO de relogin com dedupe, poller por conta, cura de morte parcial, cap atômico |
+| **Qwen (bridge)** | Base URL + API key mascarada na UI; models via probe 60s; chat/completions + conversões |
 | **Multi-conta (Auth)** | Pool separado por provedor; sidebar + modal **Ver contas** |
 | **Persistência SQLite** | Contas, settings, usage e history em `grokdesktop.db` (JSON antigo migra 1x) |
-| **Failover de cota** | Marca conta esgotada, pula e tenta de novo na mesma request (Grok) |
+| **Failover de cota** | Marca conta esgotada, pula e tenta de novo na mesma request (Grok); pin de provider no retry |
 | **Erro de capacidade Kimi** | “Too many people chatting…” → falha rápida, **sem** rotacionar conta |
-| **Streaming + thinking** | Raciocínio e resposta em tempo real |
+| **Streaming + thinking** | Raciocínio e resposta em tempo real; quota detectada dentro de SSE |
 | **Pesquisa nativa xAI** | `web_search` / `x_search` (painel de pesquisa no chat) |
+| **Logging estruturado** | `internal/logging` · `GROK_LOG_LEVEL` · máscara de segredos · `req_id` por request |
 | **Estatísticas** | Tokens, latência e custo estimado (Grok 4.5 + Kimi K3/K2.6) |
 | **Proxy local** | OpenAI chat/completions + responses (conforme provedor) · models · Anthropic messages · SSO |
 | **Importar SSO** | Colar token, arquivo, pasta `sso-watch`, `POST /v1/sso` |

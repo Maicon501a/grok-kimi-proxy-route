@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"grok-desktop/internal/logging"
 )
 
 const (
@@ -29,6 +31,7 @@ const (
 	ProviderKimiWork = "kimi_work"
 	ProviderOllie    = "ollie"
 	ProviderGemini   = "gemini"
+	ProviderQwen     = "qwen"
 
 	// AuthMode: how credentials are obtained for a provider.
 	AuthModeSession = "auth"    // multi-account session flow (xAI OAuth, Kimi Work mint)
@@ -47,8 +50,16 @@ const (
 
 	// Kimi Work / Kimi Code (Desktop) — coding gateway with sk-kimi keys.
 	KimiWorkUpstream     = "https://agent-gw.kimi.com/coding/v1"
-	KimiWorkDefaultModel = "kimi-for-coding"
+	// Wire model ids observed from official Kimi Desktop (agent-gw): k3-agent, k2d6-agent, k2p6.
+	// "kimi-for-coding" is product branding / legacy alias, not the chat model field.
+	KimiWorkDefaultModel = "k3-agent"
 	KimiWorkUserAgent    = "Desktop Kimi Work"
+
+	// QwenBridge — local OpenAI-compatible bridge (multi-account internally).
+	// The grok proxy only needs the bridge base URL + its API_KEY; model list
+	// is discovered dynamically via GET {base}/models.
+	QwenDefaultUpstream = "http://127.0.0.1:3000/v1"
+	QwenDefaultModel    = "qwen3.8"
 )
 
 type LoadBalancerStrategy string
@@ -150,6 +161,8 @@ func (a *Account) NormalizedProvider() string {
 		return ProviderOllie
 	case ProviderGemini, "google", "vertex":
 		return ProviderGemini
+	case ProviderQwen, "qwenbridge", "qwen-bridge":
+		return ProviderQwen
 	case "", ProviderXAI, "grok", "x.ai":
 		return ProviderXAI
 	default:
@@ -238,7 +251,7 @@ func decodeB64URL(s string) ([]byte, error) {
 
 type Settings struct {
 	ActiveAccountID string `json:"active_account_id"`
-	// Provider: xai | ollie | gemini
+	// Provider: xai | kimi_work | ollie | gemini | qwen
 	Provider        string `json:"provider,omitempty"`
 	DefaultModel    string `json:"default_model"`
 	ReasoningEffort string `json:"reasoning_effort"`
@@ -254,6 +267,9 @@ type Settings struct {
 	// Gemini / Vertex AI (Application Default Credentials).
 	GeminiProject  string `json:"gemini_project,omitempty"`
 	GeminiLocation string `json:"gemini_location,omitempty"`
+	// QwenBridge local bridge: base URL (with or without /v1) + its API_KEY.
+	QwenUpstream string `json:"qwen_upstream,omitempty"`
+	QwenAPIKey   string `json:"qwen_api_key,omitempty"`
 	ThemeAccent    string `json:"theme_accent,omitempty"`
 	KimiStealthHeadless bool `json:"kimi_stealth_headless"`
 	GoogleEmail    string `json:"google_email,omitempty"`
@@ -338,18 +354,35 @@ func (s Settings) resolveModel(requested string, force bool) string {
 }
 
 func resolveKimiWorkModel(requested string) string {
-	m := strings.ToLower(strings.TrimSpace(requested))
-	m = StripKimiEffortSuffix(m)
-	switch m {
+	// Preserve real agent-gw wire ids. Only map empty/legacy aliases.
+	// Effort suffixes (k3-agent-high) are stripped for the model field; callers
+	// may still read effort via ExtractKimiWorkEffort on the original id.
+	raw := strings.TrimSpace(requested)
+	m := strings.ToLower(raw)
+	m = NormalizeKimiModelAlias(m)
+	base, _ := ExtractKimiWorkEffort(m)
+	if base == "" {
+		base = m
+	}
+	switch base {
 	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
-		"k3-agent", "k3-max", "k3", "k3-agent-ultra", "k3-swarm",
-		"k2d6-agent", "k2p6", "k2p6-agent", "kimi-for-coding-chat":
+		"kimi-for-coding-chat", "k3", "k3-max", "k3-agent-ultra":
 		return KimiWorkDefaultModel
-	default:
-		if looksLikeKimiWorkModel(m) {
-			return KimiWorkDefaultModel
+	case "k3-swarm", "k3-agent-swarm":
+		return "k3-agent-swarm"
+	case "k3-agent":
+		return "k3-agent"
+	case "k2d6-agent", "k2p6-agent", "k2p6", "k2d6":
+		if base == "k2d6" {
+			return "k2d6-agent"
 		}
-		return strings.TrimSpace(requested)
+		return base
+	default:
+		// Pass through native ids (k3-agent, k2d6-agent, k2p6, …).
+		if looksLikeKimiWorkModel(base) {
+			return base
+		}
+		return raw
 	}
 }
 
@@ -369,11 +402,15 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 		id = id[i+len("/models/"):]
 	}
 	id = normalizeOllieModelAlias(id)
+	id = NormalizeKimiModelAlias(id)
 	switch {
 	case looksLikeKimiWorkModel(id):
 		return s.WithProvider(ProviderKimiWork)
 	case looksLikeGeminiModel(id):
 		return s.WithProvider(ProviderGemini)
+	case looksLikeQwenModel(id):
+		// Before Ollie: its catalog hints contain "qwen-".
+		return s.WithProvider(ProviderQwen)
 	case looksLikeOllieModel(id):
 		return s.WithProvider(ProviderOllie)
 	case looksLikeXAIModel(id):
@@ -412,6 +449,13 @@ func (s Settings) WithProvider(provider string) Settings {
 		if out.DefaultModel == "" || looksLikeXAIModel(out.DefaultModel) || looksLikeKimiWorkModel(out.DefaultModel) || looksLikeOllieModel(out.DefaultModel) {
 			out.DefaultModel = GeminiDefaultModel
 		}
+	case ProviderQwen, "qwenbridge", "qwen-bridge":
+		out.Provider = ProviderQwen
+		out.UpstreamBase = out.EffectiveQwenUpstream()
+		out.APIMode = "chat"
+		if out.DefaultModel == "" || looksLikeXAIModel(out.DefaultModel) || looksLikeKimiWorkModel(out.DefaultModel) || looksLikeGeminiModel(out.DefaultModel) {
+			out.DefaultModel = QwenDefaultModel
+		}
 	case ProviderXAI, "grok", "x.ai":
 		out.Provider = ProviderXAI
 		out.UpstreamBase = DefaultUpstream
@@ -447,8 +491,10 @@ func (s Settings) isNativeModelForProvider(requested string) bool {
 		return looksLikeOllieModel(id) || looksLikeOllieModel(normalizeOllieModelAlias(id))
 	case ProviderGemini:
 		return looksLikeGeminiModel(id)
+	case ProviderQwen:
+		return looksLikeQwenModel(id)
 	case ProviderKimiWork:
-		return looksLikeKimiWorkModel(id)
+		return looksLikeKimiWorkModel(id) || looksLikeKimiWorkModel(NormalizeKimiModelAlias(id))
 	default:
 		return looksLikeXAIModel(id)
 	}
@@ -468,12 +514,34 @@ func normalizeOllieModelAlias(id string) string {
 	}
 }
 
+// NormalizeKimiModelAlias maps common friendly names (including spaced variants) to Kimi catalog ids.
+func NormalizeKimiModelAlias(id string) string {
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "kimi k3 max", "k3 max", "k3 agent", "k3 max (work)", "k3":
+		return "k3-agent"
+	case "k3 agent low", "k3 max low", "k3 low think":
+		return "k3-agent-low"
+	case "k3 agent medium", "k3 max medium", "k3 medium think":
+		return "k3-agent-medium"
+	case "k3 agent high", "k3 max high", "k3 high think":
+		return "k3-agent-high"
+	case "k3 agent xhigh", "k3 max xhigh", "k3 extra high", "k3 extra high think", "k3 xhigh think":
+		return "k3-agent-xhigh"
+	case "kimi k2", "k2 agent", "k2d6 agent", "k2p6 agent":
+		return "k2p6-agent"
+	default:
+		return strings.TrimSpace(id)
+	}
+}
+
 func (s Settings) ProviderDefaultModel() string {
 	switch s.NormalizedProvider() {
 	case ProviderOllie:
 		return OllieDefaultModel
 	case ProviderGemini:
 		return GeminiDefaultModel
+	case ProviderQwen:
+		return QwenDefaultModel
 	case ProviderKimiWork:
 		return KimiWorkDefaultModel
 	default:
@@ -491,7 +559,7 @@ func (s Settings) ProviderAuthMode() string {
 	}
 }
 
-// NormalizedProvider returns xai|kimi_work|ollie|gemini.
+// NormalizedProvider returns xai|kimi_work|ollie|gemini|qwen.
 func (s Settings) NormalizedProvider() string {
 	p := strings.ToLower(strings.TrimSpace(s.Provider))
 	switch p {
@@ -501,6 +569,8 @@ func (s Settings) NormalizedProvider() string {
 		return ProviderGemini
 	case ProviderKimiWork, "kimi", "kimi-work", "kimiwork", "moonshot-work", "kimi-code":
 		return ProviderKimiWork
+	case ProviderQwen, "qwenbridge", "qwen-bridge":
+		return ProviderQwen
 	case "", ProviderXAI, "grok", "x.ai", "cli":
 		return ProviderXAI
 	default:
@@ -523,6 +593,7 @@ func (s Settings) IsOllie() bool     { return s.NormalizedProvider() == Provider
 func (s Settings) IsXAI() bool       { return s.NormalizedProvider() == ProviderXAI }
 func (s Settings) IsGemini() bool    { return s.NormalizedProvider() == ProviderGemini }
 func (s Settings) IsKimiWork() bool  { return s.NormalizedProvider() == ProviderKimiWork }
+func (s Settings) IsQwen() bool      { return s.NormalizedProvider() == ProviderQwen }
 func (s Settings) IsSessionAuth() bool { return s.ProviderAuthMode() == AuthModeSession }
 
 // EffectiveUpstream returns the base URL including /v1 used for OpenAI-style paths.
@@ -554,6 +625,8 @@ func (s Settings) EffectiveUpstream() string {
 		loc := s.EffectiveGeminiLocation()
 		proj := s.EffectiveGeminiProject()
 		return fmt.Sprintf("https://aiplatform.googleapis.com/v1beta1/projects/%s/locations/%s", proj, loc)
+	case ProviderQwen:
+		return s.EffectiveQwenUpstream()
 	default:
 		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
 		if b == "" || strings.Contains(strings.ToLower(b), "olliechat") ||
@@ -563,6 +636,20 @@ func (s Settings) EffectiveUpstream() string {
 		}
 		return b
 	}
+}
+
+// EffectiveQwenUpstream returns the QwenBridge base URL including /v1.
+// Falls back to the default local bridge address when unset; never inherits
+// another provider's upstream from UpstreamBase.
+func (s Settings) EffectiveQwenUpstream() string {
+	b := strings.TrimRight(strings.TrimSpace(s.QwenUpstream), "/")
+	if b == "" {
+		return QwenDefaultUpstream
+	}
+	if !strings.HasSuffix(b, "/v1") {
+		return b + "/v1"
+	}
+	return b
 }
 
 func (s Settings) EffectiveGeminiProject() string {
@@ -624,6 +711,13 @@ func (s *Settings) ApplyProviderDefaults(provider string) {
 		// agent-gw has no /responses — chat/completions only.
 		s.APIMode = "chat"
 		s.DefaultModel = KimiWorkDefaultModel
+	case ProviderQwen:
+		s.Provider = ProviderQwen
+		s.UpstreamBase = s.EffectiveQwenUpstream()
+		// QwenBridge speaks OpenAI chat/completions (+ its own /responses, but
+		// the proxy wires qwen through chat/completions like Ollie/Kimi).
+		s.APIMode = "chat"
+		s.DefaultModel = QwenDefaultModel
 	default:
 		s.Provider = ProviderXAI
 		s.UpstreamBase = DefaultUpstream
@@ -715,6 +809,16 @@ func looksLikeKimiWorkModel(model string) bool {
 	return false
 }
 
+// looksLikeQwenModel reports whether the id belongs to the QwenBridge provider.
+// Bridge ids are dynamic but Qwen-prefixed (qwen3.8, qwen3.7-plus, …).
+func looksLikeQwenModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	return strings.HasPrefix(m, "qwen")
+}
+
 func looksLikeXAIModel(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	return strings.HasPrefix(m, "grok-") || strings.Contains(m, "grok-")
@@ -755,6 +859,13 @@ func (s *Settings) SanitizeModelForProvider() {
 		}
 		// Always force chat/completions for Kimi Work.
 		s.APIMode = "chat"
+	case ProviderQwen:
+		// Deliberately no looksLikeOllieModel check: "qwen-*" ids trip Ollie hints.
+		if s.DefaultModel == "" || looksLikeXAIModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) {
+			s.DefaultModel = QwenDefaultModel
+		}
+		s.UpstreamBase = s.EffectiveQwenUpstream()
+		s.APIMode = "chat"
 	default:
 		if s.DefaultModel == "" || looksLikeOllieModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) {
 			s.DefaultModel = DefaultModel
@@ -775,7 +886,7 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 	want := s.normalizeProviderFilter(provider)
 
 	// API-key providers don't have account pools.
-	if want == ProviderOllie || want == ProviderGemini {
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen {
 		return nil
 	}
 
@@ -833,6 +944,7 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 		idx := state.RRIndex % len(usable)
 		state.RRIndex++
 		cp := usable[idx]
+		logging.Debug("store.account.picked", "provider", want, "account_id", cp.ID, "strategy", string(strategy))
 		return &cp
 	case StrategyLeastUsed:
 		// Pick the account with the lowest in-flight request count.
@@ -843,16 +955,40 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 			}
 		}
 		cp := *best
+		logging.Debug("store.account.picked", "provider", want, "account_id", cp.ID, "strategy", string(strategy))
 		return &cp
 	case StrategyRandom:
 		// Seed with time for simplicity; good enough for load balancing.
 		rng := time.Now().UnixNano()
 		idx := int(rng % int64(len(usable)))
 		cp := usable[idx]
+		logging.Debug("store.account.picked", "provider", want, "account_id", cp.ID, "strategy", string(strategy))
 		return &cp
 	}
 
 	return nil
+}
+
+// HasUsableAccountForProvider reports whether any account for the provider is
+// usable, WITHOUT advancing the round-robin cursor or mutating balancer state.
+// Use this in pollers/readiness checks; PickAccountForProvider advances RR.
+func (s *Store) HasUsableAccountForProvider(provider string) bool {
+	want := s.normalizeProviderFilter(provider)
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.accounts {
+		if a.NormalizedProvider() != want || !a.Usable() {
+			continue
+		}
+		if want != ProviderKimiWork && a.Expired() && a.RefreshToken == "" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // IncAccountRequestCount atomically increments the in-flight request counter for an account.
@@ -922,6 +1058,11 @@ func ProviderCatalog() []map[string]any {
 			"id": ProviderGemini, "name": "Gemini (ADC)", "auth_mode": AuthModeAPIKey,
 			"description": "Google ADC / projeto · sem pool de contas",
 			"default_model": GeminiDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderQwen, "name": "Qwen (QwenBridge)", "auth_mode": AuthModeAPIKey,
+			"description": "QwenBridge local · base URL + API key · sem pool de contas",
+			"default_model": QwenDefaultModel, "default_api": "chat",
 		},
 	}
 }
@@ -1486,7 +1627,7 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 		want = ProviderXAI
 	}
 	// API-key providers have no session account pool.
-	if want == ProviderOllie || want == ProviderGemini {
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen {
 		return []map[string]any{}
 	}
 	out := make([]map[string]any, 0, len(s.accounts))
@@ -1679,7 +1820,7 @@ func (s *Store) ReloadAccountsFromDB() error {
 	rows, err := s.db.Query(`SELECT id, provider, label, email, team_id, user_id,
 		access_token, refresh_token, expires_at, api_key, device_id, source,
 		exhausted_at, exhaust_reason, auth_denied_at, auth_denied_reason,
-		client_id, issuer, scope, created_at, updated_at FROM accounts`)
+		client_id, issuer, scope, google_refresh_token, created_at, updated_at FROM accounts`)
 	if err != nil {
 		return err
 	}
@@ -1692,7 +1833,7 @@ func (s *Store) ReloadAccountsFromDB() error {
 			&a.ID, &a.Provider, &a.Label, &a.Email, &a.TeamID, &a.UserID,
 			&a.AccessToken, &a.RefreshToken, &exp, &a.APIKey, &a.DeviceID, &a.Source,
 			&exh, &a.ExhaustReason, &auth, &a.AuthDeniedReason,
-			&a.ClientID, &a.Issuer, &a.Scope, &created, &updated,
+			&a.ClientID, &a.Issuer, &a.Scope, &a.GoogleRefreshToken, &created, &updated,
 		); err != nil {
 			continue
 		}
@@ -1711,6 +1852,22 @@ func (s *Store) ReloadAccountsFromDB() error {
 		}
 		if a.NormalizedProvider() == ProviderKimiWork && a.APIKey == "" && strings.HasPrefix(a.AccessToken, "sk-kimi-") {
 			a.APIKey = a.AccessToken
+		}
+		// Merge with the existing in-memory row instead of wholesale replacing:
+		// Google email/password live only in the JSON sidecar (no SQLite column),
+		// and a reload must never strip the Google refresh token that HTTP
+		// re-login depends on, nor the in-flight request counter.
+		if old, ok := s.accounts[a.ID]; ok {
+			if a.GoogleRefreshToken == "" {
+				a.GoogleRefreshToken = old.GoogleRefreshToken
+			}
+			if a.GoogleEmail == "" {
+				a.GoogleEmail = old.GoogleEmail
+			}
+			if a.GooglePassword == "" {
+				a.GooglePassword = old.GooglePassword
+			}
+			a.requestCount = old.requestCount
 		}
 		next[a.ID] = a
 	}
@@ -1821,6 +1978,7 @@ func (s *Store) MarkExhausted(id, reason string) (*Account, error) {
 	if err := s.saveAccountLocked(a); err != nil {
 		return nil, err
 	}
+	logging.Warn("store.account.exhausted", "account_id", id, "provider", a.NormalizedProvider(), "reason", reason)
 	cp := a
 	return &cp, nil
 }
@@ -1874,6 +2032,7 @@ func (s *Store) MarkAuthDenied(id, reason string) (*Account, error) {
 		}
 	}
 	s.accounts[id] = a
+	logging.Warn("store.account.auth_denied", "account_id", id, "provider", a.NormalizedProvider(), "reason", reason)
 	if err := s.saveAccountLocked(a); err != nil {
 		return nil, err
 	}
@@ -2085,6 +2244,7 @@ func (s *Store) SyncFromGrokCLI() (int, error) {
 }
 
 func (s *Store) UpsertAccount(a Account) error {
+	logging.Debug("store.account.upsert", "account_id", a.ID, "provider", a.NormalizedProvider())
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -2125,6 +2285,7 @@ func (s *Store) RemoveAccount(id string) error {
 	defer s.mu.Unlock()
 	old, had := s.accounts[id]
 	delete(s.accounts, id)
+	logging.Info("store.account.remove", "account_id", id)
 	if s.db != nil {
 		_ = s.deleteAccountDB(id)
 	}

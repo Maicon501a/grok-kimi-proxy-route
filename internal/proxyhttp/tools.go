@@ -3,6 +3,8 @@ package proxyhttp
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // xAI Responses API accepts only these tool type variants.
@@ -334,6 +336,92 @@ func cloneMap(m map[string]any) map[string]any {
 	out := make(map[string]any, len(m))
 	for k, v := range m {
 		out[k] = v
+	}
+	return out
+}
+
+// sanitizeToolCall normalizes a single OpenAI-style tool_call so downstream clients always get a valid shape.
+// It ensures: id is non-empty, type is "function", name is non-empty, and arguments is a valid JSON string.
+func sanitizeToolCall(tc map[string]any) map[string]any {
+	if tc == nil {
+		return nil
+	}
+	out := cloneMap(tc)
+
+	// Ensure id exists
+	id := asString(out["id"])
+	if id == "" {
+		id = "call_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:20]
+		out["id"] = id
+	}
+
+	// Ensure type is function
+	if strings.ToLower(asString(out["type"])) != "function" {
+		out["type"] = "function"
+	}
+
+	fn, _ := out["function"].(map[string]any)
+	if fn == nil {
+		fn = map[string]any{}
+		out["function"] = fn
+	}
+
+	// Ensure name is non-empty
+	name := strings.TrimSpace(asString(fn["name"]))
+	if name == "" {
+		return nil
+	}
+	fn["name"] = name
+
+	// Normalize arguments to a valid JSON string
+	args := fn["arguments"]
+	switch a := args.(type) {
+	case string:
+		if a == "" {
+			fn["arguments"] = "{}"
+		} else {
+			var tmp any
+			if err := json.Unmarshal([]byte(a), &tmp); err != nil {
+				// Invalid JSON: wrap literally as a string value or default to {}
+				fn["arguments"] = "{}"
+			} else {
+				fn["arguments"] = a
+			}
+		}
+	case map[string]any, []any:
+		b, err := json.Marshal(a)
+		if err != nil {
+			fn["arguments"] = "{}"
+		} else {
+			fn["arguments"] = string(b)
+		}
+	case nil:
+		fn["arguments"] = "{}"
+	default:
+		// Try to marshal anything else
+		b, err := json.Marshal(a)
+		if err != nil {
+			fn["arguments"] = "{}"
+		} else {
+			fn["arguments"] = string(b)
+		}
+	}
+
+	return out
+}
+
+// sanitizeToolCallsList applies sanitizeToolCall to every element in a list, dropping nil/invalid entries.
+func sanitizeToolCallsList(raw []any) []any {
+	out := make([]any, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		sanitized := sanitizeToolCall(m)
+		if sanitized != nil && asString(sanitized["id"]) != "" {
+			out = append(out, sanitized)
+		}
 	}
 	return out
 }

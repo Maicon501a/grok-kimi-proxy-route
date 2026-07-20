@@ -127,12 +127,9 @@ func pipeSSE(ctx context.Context, dst http.ResponseWriter, src io.Reader) error 
 		block.WriteString(line)
 		block.WriteByte('\n')
 		if line == "" {
-			if err := flushBlock(); err != nil {
-				// Client gone — stop quietly; do not surface as process death.
-				return nil
-			}
-			// Detect mid-stream quota error inside SSE data lines (if any were written into the block).
-			// We scan the block for data: {...} lines and check JSON payload.
+			// Detect mid-stream quota error inside SSE data lines BEFORE flushing
+			// the block (flushBlock resets it, so scanning afterwards was dead code).
+			quotaMsg := ""
 			for _, ln := range strings.Split(block.String(), "\n") {
 				if strings.HasPrefix(ln, "data: ") {
 					payload := strings.TrimSpace(strings.TrimPrefix(ln, "data: "))
@@ -142,23 +139,30 @@ func pipeSSE(ctx context.Context, dst http.ResponseWriter, src io.Reader) error 
 					var m map[string]any
 					if json.Unmarshal([]byte(payload), &m) == nil {
 						if isQuota, qmsg := isQuotaPayload(m); isQuota {
-							// Emit a graceful SSE error to the client so the stream ends cleanly
-							// instead of a raw connection drop.
-							errPayload, _ := json.Marshal(map[string]any{
-								"error": map[string]any{
-									"message": qmsg,
-									"type":    "upstream_error",
-									"code":    "quota_exhausted",
-								},
-							})
-							_, _ = io.WriteString(fw, fmt.Sprintf("data: %s\n\n", errPayload))
-							_, _ = io.WriteString(fw, "data: [DONE]\n\n")
-							return fmt.Errorf("sse quota error: %s", qmsg)
+							quotaMsg = qmsg
+							break
 						}
 					}
 				}
 			}
-			block.Reset()
+			if err := flushBlock(); err != nil {
+				// Client gone — stop quietly; do not surface as process death.
+				return nil
+			}
+			if quotaMsg != "" {
+				// Emit a graceful SSE error to the client so the stream ends cleanly
+				// instead of a raw connection drop.
+				errPayload, _ := json.Marshal(map[string]any{
+					"error": map[string]any{
+						"message": quotaMsg,
+						"type":    "upstream_error",
+						"code":    "quota_exhausted",
+					},
+				})
+				_, _ = io.WriteString(fw, fmt.Sprintf("data: %s\n\n", errPayload))
+				_, _ = io.WriteString(fw, "data: [DONE]\n\n")
+				return fmt.Errorf("sse quota error: %s", quotaMsg)
+			}
 		}
 	}
 	_ = flushBlock()

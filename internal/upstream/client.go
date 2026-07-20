@@ -14,6 +14,7 @@ import (
 
 	"grok-desktop/internal/gemini"
 	"grok-desktop/internal/httperr"
+	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
 )
 
@@ -94,6 +95,9 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 	if token == "" && settings.IsOllie() {
 		token = store.OllieAPIKey
 	}
+	if token == "" && settings.IsQwen() {
+		token = strings.TrimSpace(settings.QwenAPIKey)
+	}
 	h.Set("Authorization", "Bearer "+token)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream, application/json")
@@ -101,6 +105,8 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 		version = store.DefaultClientVersion
 	}
 	switch {
+	case settings.IsQwen():
+		// QwenBridge: bearer only, no provider-specific headers.
 	case settings.IsOllie():
 		h.Set("User-Agent", "grok-desktop-ollie/"+version)
 	case settings.IsKimiWork():
@@ -144,6 +150,9 @@ func (c *Client) ListModels(ctx context.Context, token string, settings store.Se
 	}
 	if settings.IsOllie() {
 		return c.listOllieModels(ctx, token, settings)
+	}
+	if settings.IsQwen() {
+		return c.listQwenModels(ctx, token, settings)
 	}
 	url := c.baseURL(settings) + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -246,6 +255,59 @@ func shortModelName(id string) string {
 	return id
 }
 
+// listQwenModels fetches the dynamic model list from the local QwenBridge.
+// Falls back to a minimal static list when the bridge errors or returns nothing.
+func (c *Client) listQwenModels(ctx context.Context, token string, settings store.Settings) ([]ModelInfo, error) {
+	url := c.baseURL(settings) + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.authHeaders(token, settings.ClientVersion, settings)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return qwenFallbackModels(), err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return qwenFallbackModels(), fmt.Errorf("models HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var parsed struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(b, &parsed)
+	seen := map[string]bool{}
+	out := make([]ModelInfo, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		name := m.Name
+		if name == "" {
+			name = m.ID
+		}
+		out = append(out, ModelInfo{
+			ID: m.ID, Name: name, Description: "QwenBridge · local", APIMode: "chat",
+		})
+	}
+	if len(out) == 0 {
+		return qwenFallbackModels(), nil
+	}
+	return out, nil
+}
+
+func qwenFallbackModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: store.QwenDefaultModel, Name: store.QwenDefaultModel, Description: "QwenBridge · local", APIMode: "chat"},
+	}
+}
+
 func ollieFallbackModels() []ModelInfo {
 	ids := []string{
 		"claude-sonnet-5", "claude-opus-4-8", "claude-fable-5",
@@ -302,10 +364,9 @@ func (c *Client) StreamChat(
 	emit func(StreamEvent),
 ) error {
 	model := settings.ResolveModel(req.Model)
+	// Use only what the caller put on the request. Desktop app chat fills
+	// ReasoningEffort from UI settings in app.go; HTTP proxy never does.
 	effort := req.ReasoningEffort
-	if effort == "" {
-		effort = settings.ReasoningEffort
-	}
 	emit(StreamEvent{
 		Type:    "meta",
 		Account: accountLabel,
@@ -318,41 +379,79 @@ func (c *Client) StreamChat(
 		req.Messages = ensureTemporalContext(append([]ChatMessage{}, req.Messages...))
 	}
 
-	// Gemini: Vertex generateContent via ADC (never hit xAI /responses).
-	if settings.IsGemini() {
-		return c.streamGemini(ctx, settings, model, req, emit)
-	}
+	prov := settings.NormalizedProvider()
+	logging.Info("upstream.stream.start", "provider", prov, "model", model, "account_id", accountLabel)
+	streamT0 := time.Now()
 
-	// OllieChat (and explicit chat mode): OpenAI chat/completions.
-	// Kimi Work coding gateway only exposes /chat/completions (no /responses).
-	// Ollie is chat-only. xAI defaults to Responses + native search.
-	if settings.IsKimiWork() || settings.IsOllie() || strings.EqualFold(req.APIMode, "chat") {
+	// Gemini: Vertex generateContent via ADC (never hit xAI /responses).
+	var streamErr error
+	if settings.IsGemini() {
+		streamErr = c.streamGemini(ctx, settings, model, req, emit)
+	} else if settings.IsKimiWork() || settings.IsOllie() || settings.IsQwen() || strings.EqualFold(req.APIMode, "chat") {
+		// OllieChat (and explicit chat mode): OpenAI chat/completions.
+		// Kimi Work coding gateway only exposes /chat/completions (no /responses).
+		// Ollie is chat-only. QwenBridge is wired chat-only.
 		if settings.IsKimiWork() {
 			model = resolveKimiUpstreamModel(model)
 		}
-		return c.streamChatCompletions(ctx, token, settings, model, effort, req, emit)
+		streamErr = c.streamChatCompletions(ctx, token, settings, model, effort, req, emit)
+	} else {
+		streamErr = c.streamResponses(ctx, token, settings, model, effort, req, emit)
 	}
-	return c.streamResponses(ctx, token, settings, model, effort, req, emit)
+	if streamErr != nil {
+		logging.Error("upstream.stream.error", "provider", prov, "model", model, "account_id", accountLabel, "err", streamErr.Error(), "duration_ms", time.Since(streamT0).Milliseconds())
+		return streamErr
+	}
+	logging.Info("upstream.stream.done", "provider", prov, "model", model, "account_id", accountLabel, "duration_ms", time.Since(streamT0).Milliseconds())
+	return nil
 }
 
 func resolveKimiUpstreamModel(model string) string {
-	m := strings.ToLower(strings.TrimSpace(model))
-	m = strings.TrimSuffix(m, "-responses")
-	m = strings.TrimSuffix(m, "-chat")
-	m = store.StripKimiEffortSuffix(m)
-	switch m {
-	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
-		"k3-agent", "k3-max", "k3", "k3-agent-ultra", "k3-swarm",
-		"k2d6-agent", "k2p6", "k2p6-agent":
-		return "kimi-for-coding"
+	// Honor real agent-gw model ids (k3-agent, k2d6-agent, k2p6). Do not collapse
+	// everything to the legacy "kimi-for-coding" brand string.
+	return store.Settings{Provider: store.ProviderKimiWork}.ResolveModelForClient(model)
+}
+
+// applyKimiThinkingBody maps client effort into agent-gw `thinking` object.
+// Desktop wire (observed): thinking: { type: "enabled"|"disabled", effort?: string, keep?: "all" }.
+// effort is only set for known levels; empty effort → no thinking field (client omitted).
+func applyKimiThinkingBody(body map[string]any, effort string) {
+	if body == nil {
+		return
+	}
+	// If client already sent a thinking object, leave it (and drop openAI-only effort).
+	if th, ok := body["thinking"].(map[string]any); ok && th != nil {
+		delete(body, "reasoning_effort")
+		return
+	}
+	eff := strings.ToLower(strings.TrimSpace(effort))
+	switch eff {
+	case "":
+		// Client sent nothing — do not invent global defaults.
+		delete(body, "reasoning_effort")
+		return
+	case "off", "none", "disabled":
+		body["thinking"] = map[string]any{"type": "disabled"}
+		delete(body, "reasoning_effort")
+	case "low", "medium", "high", "xhigh", "max", "minimal":
+		// Map OpenAI-ish names to desktop levels. xhigh→max (desktop catalog).
+		if eff == "xhigh" || eff == "extra_high" || eff == "extra-high" {
+			eff = "max"
+		}
+		if eff == "minimal" {
+			eff = "low"
+		}
+		body["thinking"] = map[string]any{
+			"type":   "enabled",
+			"effort": eff,
+			"keep":   "all",
+		}
+		delete(body, "reasoning_effort")
 	default:
-		if strings.Contains(m, "kimi") || strings.HasPrefix(m, "k3") || strings.HasPrefix(m, "k2") {
-			return "kimi-for-coding"
-		}
-		if m == "" {
-			return "kimi-for-coding"
-		}
-		return model
+		// Unknown string: enable thinking without effort (desktop does this when
+		// supportEfforts is empty).
+		body["thinking"] = map[string]any{"type": "enabled", "keep": "all"}
+		delete(body, "reasoning_effort")
 	}
 }
 
@@ -376,10 +475,8 @@ func (c *Client) streamGemini(
 	if c.HTTP != nil {
 		gc.HTTP = c.HTTP
 	}
+	// Client/request effort only — no global settings fallback.
 	effort := req.ReasoningEffort
-	if effort == "" {
-		effort = settings.ReasoningEffort
-	}
 	t0 := time.Now()
 	var ttftMs int64
 	var contentLen, thinkLen int
@@ -516,13 +613,6 @@ func (c *Client) streamChatCompletions(
 		}
 	} else if effort != "" && !settings.IsKimiWork() {
 		body["reasoning_effort"] = effort
-	} else if settings.IsKimiWork() {
-		// agent-gw accepts standard chat body; skip unknown effort enums that may 4xx
-		eff := strings.ToLower(strings.TrimSpace(effort))
-		switch eff {
-		case "low", "medium", "high":
-			body["reasoning_effort"] = eff
-		}
 	}
 	if req.Temperature > 0 {
 		body["temperature"] = req.Temperature
@@ -535,12 +625,15 @@ func (c *Client) streamChatCompletions(
 		}
 	}
 	if settings.IsKimiWork() {
-		// Kimi Work: model alias may embed effort (k3-agent-high → high)
+		// Client-owned only: effort from request field and/or model alias (k3-agent-high).
+		// Official Desktop agent-gw body uses thinking: {type, effort?, keep?} — not
+		// OpenAI reasoning_effort alone (see KimiChatProvider.withThinking).
 		_, modelEffort := store.ExtractKimiWorkEffort(model)
 		if modelEffort != "" {
 			effort = modelEffort
 		}
 		body["model"] = resolveKimiUpstreamModel(model)
+		applyKimiThinkingBody(body, effort)
 	}
 	raw, _ := json.Marshal(body)
 	url := c.baseURL(settings) + "/chat/completions"

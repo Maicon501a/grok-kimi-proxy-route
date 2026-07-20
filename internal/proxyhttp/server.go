@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"grok-desktop/internal/gemini"
+	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
 )
@@ -87,6 +89,24 @@ type Server struct {
 
 	addr       string
 
+}
+
+// maxProxyBodyBytes caps inbound request bodies (32 MiB) so a rogue client
+// cannot exhaust memory with an unbounded io.ReadAll.
+const maxProxyBodyBytes = 32 << 20
+
+// upstreamHTTPClient is used for upstream provider calls. Total Timeout stays
+// 0 (SSE streams must stay open for minutes); ResponseHeaderTimeout bounds
+// how long we wait for the upstream to start responding.
+var upstreamHTTPClient = &http.Client{
+	Timeout: 0,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ResponseHeaderTimeout: 120 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 5 * time.Second,
+	},
 }
 
 type ctxKey int
@@ -208,6 +228,33 @@ func (s *Server) quotaHandler() func(accountID, reason string) (rotated bool) {
 	defer s.mu.Unlock()
 
 	return s.onQuota
+
+}
+
+
+
+// handleStreamQuota reports a quota error detected INSIDE an SSE stream (the
+// upstream sent a 200 then an error payload mid-stream). The client already got
+// a graceful error frame, so there is nothing to retry — but the account must be
+// marked exhausted so the NEXT request rotates, and a background re-login must
+// be kicked or the pool silently shrinks. Async: the quota handler may block.
+func (s *Server) handleStreamQuota(accountID string, pipeErr error) {
+
+	if accountID == "" || pipeErr == nil || !strings.Contains(pipeErr.Error(), "sse quota error") {
+
+		return
+
+	}
+
+	if fn := s.quotaHandler(); fn != nil {
+
+		go fn(accountID, pipeErr.Error())
+
+		return
+
+	}
+
+	_, _ = s.store.MarkExhausted(accountID, pipeErr.Error())
 
 }
 
@@ -391,7 +438,10 @@ func (s *Server) Start(listen string) error {
 
 		ReadHeaderTimeout: 30 * time.Second,
 
-		// IdleTimeout 0: long-lived SSE streams from Codex must not be cut.
+		// IdleTimeout bounds keep-alive connections waiting for the NEXT request;
+		// an active SSE stream is not idle, so long-lived Codex streams are not cut.
+
+		IdleTimeout: 120 * time.Second,
 
 		// WriteTimeout 0: Grok 4.5 long reasoning streams can exceed minutes.
 
@@ -604,24 +654,26 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	// --- Kimi Work ---
 	kimiModels := []upstream.ModelInfo{
-		{ID: "k3-agent", Name: "K3 Max (Work)", Description: "Kimi Work · chat/completions", APIMode: "chat"},
-		{ID: "k3-agent-low", Name: "K3 Max — Low Think", Description: "Kimi Work · low reasoning", APIMode: "chat"},
-		{ID: "k3-agent-medium", Name: "K3 Max — Medium Think", Description: "Kimi Work · medium reasoning", APIMode: "chat"},
-		{ID: "k3-agent-high", Name: "K3 Max — High Think", Description: "Kimi Work · high reasoning", APIMode: "chat"},
-		{ID: "k3-agent-xhigh", Name: "K3 Max — Extra High Think", Description: "Kimi Work · xhigh reasoning", APIMode: "chat"},
-		{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "Kimi Work · chat/completions", APIMode: "chat"},
-		{ID: "k2d6-agent-low", Name: "K2.6 Agent — Low Think", Description: "Kimi Work · low reasoning", APIMode: "chat"},
-		{ID: "k2d6-agent-medium", Name: "K2.6 Agent — Medium Think", Description: "Kimi Work · medium reasoning", APIMode: "chat"},
-		{ID: "k2d6-agent-high", Name: "K2.6 Agent — High Think", Description: "Kimi Work · high reasoning", APIMode: "chat"},
-		{ID: "k2d6-agent-xhigh", Name: "K2.6 Agent — Extra High Think", Description: "Kimi Work · xhigh reasoning", APIMode: "chat"},
+		{ID: "k3-agent", Name: "K3 Max (Work)", Description: "Kimi Work · responses", APIMode: "responses"},
+		{ID: "k3-agent-low", Name: "K3 Max — Low Think", Description: "Kimi Work · low reasoning", APIMode: "responses"},
+		{ID: "k3-agent-medium", Name: "K3 Max — Medium Think", Description: "Kimi Work · medium reasoning", APIMode: "responses"},
+		{ID: "k3-agent-high", Name: "K3 Max — High Think", Description: "Kimi Work · high reasoning", APIMode: "responses"},
+		{ID: "k3-agent-xhigh", Name: "K3 Max — Extra High Think", Description: "Kimi Work · xhigh reasoning", APIMode: "responses"},
+		{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "Kimi Work · responses", APIMode: "responses"},
+		{ID: "k2d6-agent-low", Name: "K2.6 Agent — Low Think", Description: "Kimi Work · low reasoning", APIMode: "responses"},
+		{ID: "k2d6-agent-medium", Name: "K2.6 Agent — Medium Think", Description: "Kimi Work · medium reasoning", APIMode: "responses"},
+		{ID: "k2d6-agent-high", Name: "K2.6 Agent — High Think", Description: "Kimi Work · high reasoning", APIMode: "responses"},
+		{ID: "k2d6-agent-xhigh", Name: "K2.6 Agent — Extra High Think", Description: "Kimi Work · xhigh reasoning", APIMode: "responses"},
 	}
 	for _, m := range kimiModels {
 		data = append(data, enrichModelMeta(m, store.ProviderKimiWork))
 	}
 
-	// Optional: Ollie / Gemini still listed if configured as default (legacy)
-	switch base.NormalizedProvider() {
-	case store.ProviderOllie:
+	// Ollie / Gemini are listed whenever configured — independent of the global
+	// UI provider, since HTTP clients route per-request by model id.
+	// The Ollie probe is cached with a hard short timeout so a dead gateway
+	// never blocks the catalog.
+	if ollieUpstreamReachable() {
 		for _, m := range []upstream.ModelInfo{
 			{ID: "claude-sonnet-5", Name: "claude-sonnet-5", Description: "OllieChat", APIMode: "chat"},
 			{ID: "claude-fable-5", Name: "claude-fable-5", Description: "OllieChat", APIMode: "chat"},
@@ -630,10 +682,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		} {
 			data = append(data, enrichModelMeta(m, store.ProviderOllie))
 		}
-	case store.ProviderGemini:
-		for _, id := range gemini.ListModels(r.Context(), base) {
+	}
+	if geminiConfigured(base) {
+		for _, id := range gemini.ListModels(r.Context(), base.WithProvider(store.ProviderGemini)) {
 			data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "Vertex AI · ADC", APIMode: "chat"}, store.ProviderGemini))
 		}
+	}
+
+	// QwenBridge: dynamic model list from the local bridge. Omitted entirely
+	// when the bridge is unreachable or no API key is configured; when
+	// reachable, exactly the ids the bridge returns are listed.
+	for _, id := range qwenBridgeModels(base) {
+		data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "QwenBridge · local", APIMode: "chat"}, store.ProviderQwen))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -649,6 +709,130 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ollieProbeCache memoizes the Ollie gateway reachability probe so /v1/models
+// never pays more than one short network check per TTL window.
+var ollieProbeCache = struct {
+	sync.Mutex
+	at time.Time
+	ok bool
+}{}
+
+const ollieProbeTTL = 60 * time.Second
+
+// ollieUpstreamReachable pings the keyless OllieChat gateway with a hard short
+// timeout. Any HTTP response below 500 means the gateway is up (even a 4xx);
+// network errors and 5xx count as unreachable. Result is cached ollieProbeTTL.
+func ollieUpstreamReachable() bool {
+	ollieProbeCache.Lock()
+	if time.Since(ollieProbeCache.at) < ollieProbeTTL {
+		ok := ollieProbeCache.ok
+		ollieProbeCache.Unlock()
+		return ok
+	}
+	ollieProbeCache.Unlock()
+
+	ok := false
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(store.OllieUpstream, "/")+"/models", nil)
+	if err == nil {
+		req.Header.Set("Authorization", "Bearer "+store.OllieAPIKey)
+		resp, derr := upstreamHTTPClient.Do(req)
+		if derr == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+			_ = resp.Body.Close()
+			ok = resp.StatusCode < 500
+		}
+	}
+
+	ollieProbeCache.Lock()
+	ollieProbeCache.at = time.Now()
+	ollieProbeCache.ok = ok
+	ollieProbeCache.Unlock()
+	return ok
+}
+
+// qwenProbeCache memoizes the QwenBridge model-list probe so /v1/models never
+// pays more than one short network check per TTL window. Keyed by upstream+key
+// so a settings change invalidates immediately.
+var qwenProbeCache = struct {
+	sync.Mutex
+	at     time.Time
+	key    string
+	models []string
+}{}
+
+const qwenProbeTTL = 60 * time.Second
+
+// qwenBridgeModels fetches the dynamic model list from the local QwenBridge
+// (GET {base}/models with Bearer). Returns nil when the key is missing, the
+// bridge is unreachable (network error or 5xx), or the payload cannot be
+// parsed — qwen is then omitted from the catalog. Result cached qwenProbeTTL.
+func qwenBridgeModels(settings store.Settings) []string {
+	base := strings.TrimRight(settings.EffectiveQwenUpstream(), "/")
+	key := strings.TrimSpace(settings.QwenAPIKey)
+	if base == "" || key == "" {
+		return nil
+	}
+	cacheKey := base + "|" + key
+	qwenProbeCache.Lock()
+	if qwenProbeCache.key == cacheKey && time.Since(qwenProbeCache.at) < qwenProbeTTL {
+		models := qwenProbeCache.models
+		qwenProbeCache.Unlock()
+		return models
+	}
+	qwenProbeCache.Unlock()
+
+	var models []string
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	if err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, derr := upstreamHTTPClient.Do(req)
+		if derr == nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			if resp.StatusCode < 500 {
+				var parsed struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(body, &parsed) == nil {
+					for _, m := range parsed.Data {
+						if id := strings.TrimSpace(m.ID); id != "" {
+							models = append(models, id)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	qwenProbeCache.Lock()
+	qwenProbeCache.at = time.Now()
+	qwenProbeCache.key = cacheKey
+	qwenProbeCache.models = models
+	qwenProbeCache.Unlock()
+	return models
+}
+
+// geminiConfigured reports whether Vertex/ADC credentials are plausibly set up
+// (explicit project in settings, or standard Google env vars), so /v1/models
+// can list Gemini models without depending on the global UI provider switch.
+func geminiConfigured(s store.Settings) bool {
+	if strings.TrimSpace(s.GeminiProject) != "" {
+		return true
+	}
+	for _, env := range []string{"GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS"} {
+		if strings.TrimSpace(os.Getenv(env)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 	ctxWindow := 256000
 	owner := "xAI"
@@ -662,6 +846,10 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 		owner = "Google"
 		prov = store.ProviderGemini
 		ctxWindow = 1048576
+	case store.ProviderQwen, "qwenbridge":
+		owner = "Qwen"
+		prov = store.ProviderQwen
+		ctxWindow = 131072
 	case store.ProviderKimiWork, "kimi", "kimi-work":
 		owner = "Kimi"
 		prov = store.ProviderKimiWork
@@ -829,6 +1017,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	}
 
 	// Read body first so we can route provider from client model id (same baseURL).
+	// Cap the body so a rogue client cannot exhaust memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxProxyBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -852,25 +1042,38 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	}
 
 	// Route ONLY by client model (never UI global provider).
-	// grok-* → xAI, k3-agent/kimi-* → Kimi, empty/alias/unknown → xAI.
+	// grok-* → xAI, k3-agent/kimi-* → Kimi, qwen* → QwenBridge, empty/alias/unknown → xAI.
 	baseSettings := s.store.Settings()
 	routeSettings := baseSettings.WithProviderForModel(reqModel)
 	routeProv := routeSettings.NormalizedProvider()
 	ctx := WithRouteProvider(r.Context(), routeProv)
+	ctx = logging.WithRequestID(ctx, uuid.NewString()[:8])
+	reqLog := logging.FromContext(ctx).With("provider", routeProv, "path", clientPath, "stream", stream)
+	// Track every account Inc'd by ensure (initial pick + rotation retries) so
+	// in-flight counters are decremented exactly once per Inc on any exit path.
+	ctx, inflight := store.WithInflightTracker(ctx)
+	defer inflight.DecAll(s.store)
 
 	token, acc, settings, err := s.ensure(ctx)
 	if err != nil {
+		reqLog.Error("proxy.request.error", "model", reqModel, "status", 401, "reason", err.Error())
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	// Decrement in-flight counter when request completes (for least-used strategy).
+	accountID := ""
 	if acc != nil {
-		defer s.store.DecAccountRequestCount(acc.ID)
+		store.TrackInflight(ctx, acc.ID)
+		accountID = acc.ID
 	}
+	resolvedModel := settings.ResolveModelForClient(reqModel)
+	reqLog.Info("proxy.request.start", "model", reqModel, "resolved_model", resolvedModel, "account_id", accountID)
 	// ensure may return store settings; force route from client model again.
 	settings = routeSettings
 	if routeProv == store.ProviderKimiWork {
 		settings.UpstreamBase = store.KimiWorkUpstream
+		settings.APIMode = "chat"
+	} else if routeProv == store.ProviderQwen {
+		settings.UpstreamBase = settings.EffectiveQwenUpstream()
 		settings.APIMode = "chat"
 	} else if routeProv == store.ProviderXAI {
 		settings.UpstreamBase = store.DefaultUpstream
@@ -886,15 +1089,22 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	wantClientResponses := path == "/responses"
 
 	startedAt := time.Now()
-	resolvedModel := settings.ResolveModelForClient(reqModel)
+	resolvedModel = settings.ResolveModelForClient(reqModel)
+	var clientStatus int
+	defer func() {
+		dur := time.Since(startedAt).Milliseconds()
+		if clientStatus >= 400 {
+			reqLog.Error("proxy.request.error", "model", resolvedModel, "account_id", accountID, "status", clientStatus, "duration_ms", dur)
+		} else if clientStatus > 0 {
+			reqLog.Info("proxy.request.done", "model", resolvedModel, "account_id", accountID, "duration_ms", dur, "status", clientStatus)
+		}
+	}()
 
 	if m != nil {
-		// Inherit global reasoning effort when client omits it.
-		if _, ok := m["reasoning_effort"]; !ok {
-			if settings.ReasoningEffort != "" {
-				m["reasoning_effort"] = settings.ReasoningEffort
-			}
-		}
+		// Do NOT inject settings.ReasoningEffort here.
+		// Global effort is only for the desktop app's own chat UI (app.go).
+		// HTTP clients (OpenCode, etc.) must send reasoning_effort themselves
+		// or via model alias (e.g. k3-agent-high). Omitted = upstream default.
 		// Honor client model; only empty/alias → default of ROUTEd provider.
 		m["model"] = settings.ResolveModelForClient(reqModel)
 		resolvedModel, _ = m["model"].(string)
@@ -905,8 +1115,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			delete(m, "last_response_id")
 		}
 
-		// Kimi / Ollie / Gemini: /responses → chat/completions
-		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork()) && path == "/responses" {
+		// Kimi / Ollie / Gemini / Qwen: /responses → chat/completions
+		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen()) && path == "/responses" {
 			path = "/chat/completions"
 			wantClientChat = true
 			wantClientResponses = false
@@ -914,6 +1124,11 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			if mid, ok := m["model"].(string); ok && mid != "" {
 				resolvedModel = mid
 			}
+		}
+
+		// Enforce Kimi hard context-window limits (K2.6 = 262k, K3 = 1M).
+		if settings.IsKimiWork() {
+			m = clampKimiContextLimits(m, resolvedModel)
 		}
 
 		// Grok default path: client chat/completions → xAI /responses (response translated back later)
@@ -971,6 +1186,11 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			}
 
+			// Kimi agent-gw: real wire model + thinking object from client only.
+			if settings.IsKimiWork() {
+				sanitizeKimiWorkChatBody(m)
+			}
+
 			if settings.IsGemini() {
 
 				// Vertex path ignores OpenAI-only junk.
@@ -1003,15 +1223,13 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			}
 
+			// Only map client-provided effort → Responses reasoning object.
+			// Never invent from global settings (app UI only).
 			if _, ok := m["reasoning"]; !ok {
 
 				if eff, _ := m["reasoning_effort"].(string); eff != "" {
 
 					m["reasoning"] = map[string]any{"effort": eff, "summary": "auto"}
-
-				} else if settings.ReasoningEffort != "" {
-
-					m["reasoning"] = map[string]any{"effort": settings.ReasoningEffort, "summary": "auto"}
 
 				}
 
@@ -1101,6 +1319,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 		}
 
+		clientStatus = 200
 		s.handleGeminiUpstream(w, r.Context(), clientPath, stream, m, settings)
 
 		return
@@ -1110,14 +1329,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 
 	// Up to 3 attempts: original → force-refresh same account (auth) → rotated account.
-
-	accountID := ""
-
-	if acc != nil {
-
-		accountID = acc.ID
-
-	}
 
 	maxAttempts := 3
 
@@ -1129,7 +1340,44 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	}
 
+	// QwenBridge: single bridge account — no rotation; upstream 429/401 goes
+	// straight back to the client.
+	if settings.IsQwen() {
+
+		maxAttempts = 1
+
+		accountID = ""
+
+	}
+
 	authRetried := false
+
+	// rotateCreds adopts credentials from a retry ensure/forceRefresh.
+	// Settings stay pinned to routeSettings; only token/acc swap. Returns false
+	// when the rotated account belongs to another provider — the request must
+	// fail instead of sending a Kimi-shaped body to the xAI upstream (or vice
+	// versa) with a mismatched token.
+	rotateCreds := func(tok2 string, acc2 *store.Account) bool {
+		if acc2 != nil && acc2.NormalizedProvider() != routeProv {
+			return false
+		}
+		if acc2 != nil && acc2.ID != accountID {
+			// Dec the previous account now that the next one is Inc'd.
+			if n := inflight.Remove(accountID); n > 0 {
+				for i := 0; i < n; i++ {
+					s.store.DecAccountRequestCount(accountID)
+				}
+			}
+		}
+		if acc2 != nil {
+			store.TrackInflight(ctx, acc2.ID)
+		}
+		token, acc = tok2, acc2
+		if acc2 != nil {
+			accountID = acc2.ID
+		}
+		return true
+	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 
@@ -1163,10 +1411,12 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 
 
-		resp, err := http.DefaultClient.Do(req)
+		upstreamSentAt := time.Now()
+		reqLog.Debug("proxy.upstream.request", "attempt", attempt+1, "url", url, "account_id", accountID)
+		resp, err := upstreamHTTPClient.Do(req)
 
 		if err != nil {
-
+			reqLog.Error("proxy.upstream.error", "attempt", attempt+1, "err", err.Error(), "latency_ms", time.Since(upstreamSentAt).Milliseconds())
 			http.Error(w, err.Error(), http.StatusBadGateway)
 
 			return
@@ -1175,6 +1425,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 
 
+		reqLog.Info("proxy.upstream.response", "attempt", attempt+1, "status", resp.StatusCode, "latency_ms", time.Since(upstreamSentAt).Milliseconds())
 		// Read error body only when status is bad; keep stream body for SSE success path.
 
 		if resp.StatusCode >= 400 {
@@ -1191,7 +1442,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			if settings.IsKimiWork() && isKimiCapacityBusy(resp.StatusCode, errBody) {
 
-				log.Printf("proxyhttp: kimi capacity busy (no rotate): %s", truncateForLog(string(errBody), 200))
+				reqLog.Warn("proxy.kimi.capacity_busy", "detail", truncateForLog(string(errBody), 200))
 
 				writeKimiCapacityError(w, errBody)
 
@@ -1206,15 +1457,15 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			if isQuotaStatus(resp.StatusCode, errBody) {
 				if fn := s.quotaHandler(); fn != nil && accountID != "" {
 					if rotated := fn(accountID, reason); rotated {
-						tok2, acc2, settings2, err2 := s.ensure(r.Context())
+						tok2, acc2, _, err2 := s.ensure(ctx)
 						// Retry on new account OR same id refilled (re-login / remint).
 						if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
 							prev := accountID
-							token, acc, settings = tok2, acc2, settings2
-							if acc2 != nil {
-								accountID = acc2.ID
+							if !rotateCreds(tok2, acc2) {
+								writeCrossProviderError(w, routeProv, acc2)
+								return
 							}
-							log.Printf("proxyhttp: quota on account %s — ready %s, retrying", prev, accountID)
+							reqLog.Warn("proxy.rotate", "from_account", prev, "to_account", accountID, "reason", "quota")
 							continue
 						}
 					}
@@ -1222,11 +1473,11 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 					_, _ = s.store.MarkExhausted(accountID, reason)
 					if next := s.store.NextUsableAccountID(accountID); next != "" {
 						_ = s.store.SetActiveAccount(next)
-						tok2, acc2, settings2, err2 := s.ensure(r.Context())
+						tok2, acc2, _, err2 := s.ensure(ctx)
 						if err2 == nil {
-							token, acc, settings = tok2, acc2, settings2
-							if acc2 != nil {
-								accountID = acc2.ID
+							if !rotateCreds(tok2, acc2) {
+								writeCrossProviderError(w, routeProv, acc2)
+								return
 							}
 							continue
 						}
@@ -1239,31 +1490,30 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			// upstream (e.g. sk-kimi hit cli-chat-proxy / xAI JWT hit agent-gw).
 			if isAuthStatus(resp.StatusCode, errBody) && accountID != "" && !isQuotaStatus(resp.StatusCode, errBody) {
 				if isCrossProviderAuthMismatch(acc, settings, errBody) {
-					log.Printf("proxyhttp: cross-provider auth mismatch on %s — not marking auth-denied: %s",
-						accountID, truncateForLog(string(errBody), 180))
+					reqLog.Warn("proxy.auth.cross_provider_mismatch", "account_id", accountID, "detail", truncateForLog(string(errBody), 180))
 					// Fall through to return the upstream error without poisoning the account.
 				} else {
 					if !authRetried {
 						authRetried = true
 						if fr := s.forceRefreshFn(); fr != nil {
-							tok2, acc2, settings2, err2 := fr(r.Context(), accountID)
+							tok2, acc2, _, err2 := fr(ctx, accountID)
 							if err2 == nil && tok2 != "" && tok2 != token {
-								token, acc, settings = tok2, acc2, settings2
-								if acc2 != nil {
-									accountID = acc2.ID
+								if !rotateCreds(tok2, acc2) {
+									writeCrossProviderError(w, routeProv, acc2)
+									return
 								}
-								log.Printf("proxyhttp: auth failure — force-refreshed account %s and retrying", accountID)
+								reqLog.Warn("proxy.auth.force_refresh", "account_id", accountID)
 								continue
 							}
 						}
 						// Also re-run ensure (pulls CLI sync) in case refresh path was unavailable.
-						tok2, acc2, settings2, err2 := s.ensure(r.Context())
+						tok2, acc2, _, err2 := s.ensure(ctx)
 						if err2 == nil && tok2 != "" && tok2 != token {
-							token, acc, settings = tok2, acc2, settings2
-							if acc2 != nil {
-								accountID = acc2.ID
+							if !rotateCreds(tok2, acc2) {
+								writeCrossProviderError(w, routeProv, acc2)
+								return
 							}
-							log.Printf("proxyhttp: auth failure — ensure got different token, retrying")
+							reqLog.Warn("proxy.auth.token_changed")
 							continue
 						}
 					}
@@ -1271,14 +1521,14 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 					// Mark auth-denied and rotate to another account.
 					if fn := s.authFailHandler(); fn != nil {
 						if rotated := fn(accountID, reason); rotated {
-							tok2, acc2, settings2, err2 := s.ensure(r.Context())
+							tok2, acc2, _, err2 := s.ensure(ctx)
 							if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
 								prev := accountID
-								token, acc, settings = tok2, acc2, settings2
-								if acc2 != nil {
-									accountID = acc2.ID
+								if !rotateCreds(tok2, acc2) {
+									writeCrossProviderError(w, routeProv, acc2)
+									return
 								}
-								log.Printf("proxyhttp: auth denied on %s — rotated to %s and retrying", prev, accountID)
+								reqLog.Warn("proxy.rotate", "from_account", prev, "to_account", accountID, "reason", "auth")
 								continue
 							}
 						}
@@ -1286,11 +1536,11 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 						_, _ = s.store.MarkAuthDenied(accountID, reason)
 						if next := s.store.NextUsableAccountID(accountID); next != "" {
 							_ = s.store.SetActiveAccount(next)
-							tok2, acc2, settings2, err2 := s.ensure(r.Context())
+							tok2, acc2, _, err2 := s.ensure(ctx)
 							if err2 == nil {
-								token, acc, settings = tok2, acc2, settings2
-								if acc2 != nil {
-									accountID = acc2.ID
+								if !rotateCreds(tok2, acc2) {
+									writeCrossProviderError(w, routeProv, acc2)
+									return
 								}
 								continue
 							}
@@ -1317,6 +1567,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			}
 
+			clientStatus = resp.StatusCode
 			w.Header().Set("Content-Type", "application/json")
 
 			w.WriteHeader(resp.StatusCode)
@@ -1358,6 +1609,69 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 				accountID = acc.ID
 			}
 			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			clientStatus = 200
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(out)
+			return
+		}
+
+		// Qwen (QwenBridge): client asked for Responses but we hit chat/completions — translate wire format.
+		if settings.IsQwen() && clientPath == "/responses" {
+			accountID := ""
+			if acc != nil {
+				accountID = acc.ID
+			}
+			if isSSE {
+				if err := pipeKimiChatSSEToResponses(w, resp.Body, resolvedModel); err != nil {
+					log.Printf("proxyhttp qwen responses sse: %v", err)
+					s.handleStreamQuota(accountID, err)
+				}
+				_ = resp.Body.Close()
+				return
+			}
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+			_ = resp.Body.Close()
+			out, err := chatCompletionJSONToResponse(raw, resolvedModel)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(raw)
+				return
+			}
+			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			clientStatus = 200
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(out)
+			return
+		}
+
+		// Kimi Work: client asked for Responses but we hit chat/completions — translate wire format fully (reasoning + tools).
+		if settings.IsKimiWork() && clientPath == "/responses" {
+			accountID := ""
+			if acc != nil {
+				accountID = acc.ID
+			}
+		if isSSE {
+			if err := pipeKimiChatSSEToResponses(w, resp.Body, resolvedModel); err != nil {
+				log.Printf("proxyhttp kimi responses sse: %v", err)
+				s.handleStreamQuota(accountID, err)
+			}
+			_ = resp.Body.Close()
+			return
+		}
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+			_ = resp.Body.Close()
+			out, err := chatCompletionJSONToResponse(raw, resolvedModel)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(raw)
+				return
+			}
+			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			clientStatus = 200
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(out)
@@ -1370,11 +1684,12 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			if acc != nil {
 				accountID = acc.ID
 			}
-			if isSSE {
-				tee := newUsageTeeReader(resp.Body)
-				if err := pipeResponsesSSEToChat(r.Context(), w, tee, resolvedModel); err != nil {
-					log.Printf("proxyhttp grok responses→chat sse: %v", err)
-				}
+		if isSSE {
+			tee := newUsageTeeReader(resp.Body)
+			if err := pipeResponsesSSEToChat(r.Context(), w, tee, resolvedModel); err != nil {
+				log.Printf("proxyhttp grok responses→chat sse: %v", err)
+				s.handleStreamQuota(accountID, err)
+			}
 				_ = resp.Body.Close()
 				if len(tee.lastJSON) > 0 {
 					s.recordUsageFromSSECapture(tee.lastJSON, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
@@ -1415,13 +1730,23 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			}
 
-			tee := newUsageTeeReader(resp.Body)
+		tee := newUsageTeeReader(resp.Body)
 
-			if err := pipeSSE(r.Context(), w, tee); err != nil {
+		if err := pipeSSE(r.Context(), w, tee); err != nil {
 
-				log.Printf("proxyhttp sse: %v", err)
+			log.Printf("proxyhttp sse: %v", err)
+
+			streamAccountID := ""
+
+			if acc != nil {
+
+				streamAccountID = acc.ID
 
 			}
+
+			s.handleStreamQuota(streamAccountID, err)
+
+		}
 
 			_ = resp.Body.Close()
 
@@ -1438,6 +1763,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 				s.recordUsageFromSSECapture(tee.lastJSON, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
 
 			}
+
+			clientStatus = 200
 
 			return
 
@@ -1460,6 +1787,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		}
 
 		s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+
+		clientStatus = 200
 
 		for k, vv := range resp.Header {
 
@@ -1484,6 +1813,128 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		return
 
 	}
+
+}
+
+
+
+// sanitizeKimiWorkChatBody rewrites HTTP chat bodies for agent-gw:
+//   - real wire model ids (k3-agent / k2d6-agent / …), never force kimi-for-coding
+//   - client thinking / reasoning_effort only (no global settings)
+//   - Desktop shape: thinking: { type, effort?, keep? }
+func sanitizeKimiWorkChatBody(m map[string]any) {
+	if m == nil {
+		return
+	}
+	orig, _ := m["model"].(string)
+	// Resolve wire model from client id (strips effort suffix for model field).
+	wire := store.Settings{Provider: store.ProviderKimiWork}.ResolveModelForClient(orig)
+	if wire != "" {
+		m["model"] = wire
+	}
+
+	// Prefer explicit client thinking object.
+	if th, ok := m["thinking"].(map[string]any); ok && th != nil {
+		delete(m, "reasoning_effort")
+		return
+	}
+
+	// Effort from: reasoning_effort | reasoning.effort | model alias suffix.
+	effort := ""
+	if v, ok := m["reasoning_effort"].(string); ok {
+		effort = strings.TrimSpace(v)
+	}
+	if effort == "" {
+		if r, ok := m["reasoning"].(map[string]any); ok {
+			if v, ok := r["effort"].(string); ok {
+				effort = strings.TrimSpace(v)
+			}
+		}
+	}
+	if effort == "" {
+		_, effort = store.ExtractKimiWorkEffort(orig)
+	}
+
+	eff := strings.ToLower(strings.TrimSpace(effort))
+	delete(m, "reasoning_effort")
+	delete(m, "reasoning") // Responses-style object invalid on chat/completions
+
+	switch eff {
+	case "":
+		// Client omitted — do not invent settings.ReasoningEffort.
+		return
+	case "off", "none", "disabled":
+		m["thinking"] = map[string]any{"type": "disabled"}
+	case "low", "medium", "high", "xhigh", "max", "minimal", "extra_high", "extra-high":
+		if eff == "xhigh" || eff == "extra_high" || eff == "extra-high" {
+			eff = "max"
+		}
+		if eff == "minimal" {
+			eff = "low"
+		}
+		m["thinking"] = map[string]any{
+			"type":   "enabled",
+			"effort": eff,
+			"keep":   "all",
+		}
+	default:
+		m["thinking"] = map[string]any{"type": "enabled", "keep": "all"}
+	}
+}
+
+// clampKimiContextLimits enforces the upstream token ceiling Kimi actually accepts.
+
+// Both K3 and K2.6 are 262_144 tokens. We clamp max_tokens to leave headroom
+
+// for the system prompt / tool history already in the messages.
+
+func clampKimiContextLimits(m map[string]any, model string) map[string]any {
+
+	if m == nil {
+
+		return m
+
+	}
+
+	// Kimi hard ceiling: both K3 and K2.6 are 262_144 tokens.
+
+	// Leave 10 % headroom for prompts, tools, reasoning.
+
+	ceiling := 235930
+
+
+
+	cur := 0
+
+	switch v := m["max_tokens"].(type) {
+
+	case float64:
+
+		cur = int(v)
+
+	case int:
+
+		cur = v
+
+	case int64:
+
+		cur = int(v)
+
+	case json.Number:
+
+		i, _ := v.Int64()
+
+		cur = int(i)
+
+	}
+
+	if cur == 0 || cur > ceiling {
+
+		m["max_tokens"] = ceiling
+
+	}
+
+	return m
 
 }
 
@@ -1782,6 +2233,25 @@ func isCrossProviderAuthMismatch(acc *store.Account, settings store.Settings, bo
 
 
 
+// writeCrossProviderError fails the request when account rotation landed on a
+// different provider than the model route pinned (a Kimi-shaped body would go
+// to the xAI upstream with an xAI token, or vice versa).
+func writeCrossProviderError(w http.ResponseWriter, routeProv string, acc *store.Account) {
+	got := "nil"
+	if acc != nil {
+		got = acc.NormalizedProvider()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": "account rotation returned provider " + got + " for route " + routeProv + " — refusing cross-provider retry",
+			"type":    "server_error",
+			"code":    "cross_provider_rotation",
+		},
+	})
+}
+
 func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Settings) {
 
 	version := settings.ClientVersion
@@ -1798,9 +2268,22 @@ func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Sett
 
 	}
 
+	if token == "" && settings.IsQwen() {
+
+		token = strings.TrimSpace(settings.QwenAPIKey)
+
+	}
+
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	req.Header.Set("Content-Type", "application/json")
+
+	// QwenBridge: Authorization + Content-Type only — no provider-specific headers.
+	if settings.IsQwen() {
+
+		return
+
+	}
 
 	if settings.IsOllie() {
 
@@ -1855,11 +2338,10 @@ func chatCompletionsBodyToResponses(m map[string]any, settings store.Settings) m
 	} else if v, ok := m["max_completion_tokens"]; ok {
 		out["max_output_tokens"] = v
 	}
+	// Client-provided effort only — no global settings fallback on HTTP path.
 	if v, ok := m["reasoning_effort"].(string); ok && strings.TrimSpace(v) != "" {
 		out["reasoning"] = map[string]any{"effort": v, "summary": "auto"}
 		out["reasoning_effort"] = v
-	} else if settings.ReasoningEffort != "" {
-		out["reasoning"] = map[string]any{"effort": settings.ReasoningEffort, "summary": "auto"}
 	}
 	// tools: chat function tools → responses tools when possible
 	if tools, ok := m["tools"]; ok {
@@ -1911,25 +2393,29 @@ func chatCompletionsBodyToResponses(m map[string]any, settings store.Settings) m
 			}
 			// assistant with tool_calls
 			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
-				for _, tc := range tcs {
-					tcm, ok := tc.(map[string]any)
-					if !ok {
-						continue
-					}
-					fn, _ := tcm["function"].(map[string]any)
-					name, _ := fn["name"].(string)
-					args, _ := fn["arguments"].(string)
-					callID, _ := tcm["id"].(string)
-					item := map[string]any{
-						"type":      "function_call",
-						"name":      name,
-						"arguments": args,
-					}
-					if callID != "" {
-						item["call_id"] = callID
-					}
-					input = append(input, item)
+			for _, tc := range tcs {
+				tcm, ok := tc.(map[string]any)
+				if !ok {
+					continue
 				}
+				sanitized := sanitizeToolCall(tcm)
+				if sanitized == nil {
+					continue
+				}
+				fn, _ := sanitized["function"].(map[string]any)
+				name := asString(fn["name"])
+				args := asString(fn["arguments"])
+				callID := asString(sanitized["id"])
+				item := map[string]any{
+					"type":      "function_call",
+					"name":      name,
+					"arguments": args,
+				}
+				if callID != "" {
+					item["call_id"] = callID
+				}
+				input = append(input, item)
+			}
 				if content != "" {
 					input = append(input, map[string]any{
 						"type": "message",
@@ -2284,7 +2770,15 @@ func responsesInputToChatMessages(input any) []any {
 
 				if tcs, ok := item["tool_calls"]; ok {
 
-					msg["tool_calls"] = tcs
+					if rawList, ok := tcs.([]any); ok {
+
+						msg["tool_calls"] = sanitizeToolCallsList(rawList)
+
+					} else {
+
+						msg["tool_calls"] = tcs
+
+					}
 
 					if content != "" {
 
@@ -2416,7 +2910,7 @@ func responsesInputToChatMessages(input any) []any {
 
 					"content": nil,
 
-					"tool_calls": []any{
+					"tool_calls": sanitizeToolCallsList([]any{
 
 						map[string]any{
 
@@ -2434,7 +2928,7 @@ func responsesInputToChatMessages(input any) []any {
 
 						},
 
-					},
+					}),
 
 				})
 
@@ -2660,7 +3154,11 @@ func chatCompletionJSONToResponse(raw []byte, model string) (map[string]any, err
 		if !ok {
 			continue
 		}
-		fn, _ := tcm["function"].(map[string]any)
+		sanitized := sanitizeToolCall(tcm)
+		if sanitized == nil {
+			continue
+		}
+		fn, _ := sanitized["function"].(map[string]any)
 		name := asString(fn["name"])
 		if name == "" {
 			continue
@@ -2669,7 +3167,7 @@ func chatCompletionJSONToResponse(raw []byte, model string) (map[string]any, err
 		if args == "" {
 			args = "{}"
 		}
-		callID := asString(tcm["id"])
+		callID := asString(sanitized["id"])
 		if callID == "" {
 			callID = "call_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:20]
 		}
@@ -2838,14 +3336,14 @@ func responsesItemToChatToolCall(item map[string]any) map[string]any {
 	if args == "" {
 		args = "{}"
 	}
-	return map[string]any{
+	return sanitizeToolCall(map[string]any{
 		"id":   callID,
 		"type": "function",
 		"function": map[string]any{
 			"name":      name,
 			"arguments": args,
 		},
-	}
+	})
 }
 
 func normalizeUsageToChat(u any) map[string]any {

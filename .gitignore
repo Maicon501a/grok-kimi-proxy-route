@@ -6,9 +6,10 @@ build/windows/*.syso
 *.dll
 *.syso
 
-# Frontend
+# Frontend / Node
 frontend/dist/
 frontend/node_modules/
+node_modules/
 npm-debug.log*
 frontend/package.json.md5
 

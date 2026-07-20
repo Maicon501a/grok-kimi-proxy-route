@@ -116,3 +116,91 @@ func TestSanitizeResponsesInput_LocalShellCallCollapsed(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeToolCall_NormalizesMissingFields(t *testing.T) {
+	raw := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":      "bash",
+			"arguments": `{"cmd":"ls"}`,
+		},
+	}
+	sanitized := sanitizeToolCall(raw)
+	if sanitized == nil {
+		t.Fatal("expected non-nil")
+	}
+	if asString(sanitized["id"]) == "" {
+		t.Fatal("expected id to be generated")
+	}
+	if asString(sanitized["type"]) != "function" {
+		t.Fatalf("expected type=function, got %s", asString(sanitized["type"]))
+	}
+	fn := sanitized["function"].(map[string]any)
+	if asString(fn["name"]) != "bash" {
+		t.Fatalf("expected name=bash, got %s", asString(fn["name"]))
+	}
+	if asString(fn["arguments"]) != `{"cmd":"ls"}` {
+		t.Fatalf("expected arguments={\"cmd\":\"ls\"}, got %s", asString(fn["arguments"]))
+	}
+}
+
+func TestSanitizeToolCall_FixesInvalidArguments(t *testing.T) {
+	raw := map[string]any{
+		"id":   "call_1",
+		"type": "function",
+		"function": map[string]any{
+			"name":      "bash",
+			"arguments": `not-json`,
+		},
+	}
+	sanitized := sanitizeToolCall(raw)
+	fn := sanitized["function"].(map[string]any)
+	if asString(fn["arguments"]) != "{}" {
+		t.Fatalf("expected {} for invalid JSON, got %s", asString(fn["arguments"]))
+	}
+}
+
+func TestSanitizeToolCall_NormalizesMapArguments(t *testing.T) {
+	raw := map[string]any{
+		"id":   "call_1",
+		"type": "function",
+		"function": map[string]any{
+			"name":      "bash",
+			"arguments": map[string]any{"cmd": "ls"},
+		},
+	}
+	sanitized := sanitizeToolCall(raw)
+	fn := sanitized["function"].(map[string]any)
+	if asString(fn["arguments"]) != `{"cmd":"ls"}` {
+		t.Fatalf("expected serialized JSON, got %s", asString(fn["arguments"]))
+	}
+}
+
+func TestSanitizeToolCallsList_DropsInvalid(t *testing.T) {
+	raw := []any{
+		map[string]any{
+			"id":   "call_1",
+			"type": "function",
+			"function": map[string]any{
+				"name":      "bash",
+				"arguments": `{"cmd":"ls"}`,
+			},
+		},
+		"not-a-map",
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":      "",
+				"arguments": `{}`,
+			},
+		},
+	}
+	out := sanitizeToolCallsList(raw)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 valid tool call, got %d", len(out))
+	}
+	fn := out[0].(map[string]any)["function"].(map[string]any)
+	if asString(fn["name"]) != "bash" {
+		t.Fatalf("expected bash, got %s", asString(fn["name"]))
+	}
+}

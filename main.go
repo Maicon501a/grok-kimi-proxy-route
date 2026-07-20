@@ -17,6 +17,8 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
+
+	"grok-desktop/internal/logging"
 )
 
 //go:embed all:frontend/dist
@@ -100,8 +102,11 @@ func setupFileLog() {
 	if err != nil {
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	mw := io.MultiWriter(os.Stdout, f)
+	log.SetOutput(mw)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	logging.SetOutput(mw)
+	logging.SetLevel(logging.ParseLevel(os.Getenv("GROK_LOG_LEVEL")))
 	log.Printf("——— Grok Desktop start %s ———", time.Now().Format(time.RFC3339))
 }
 

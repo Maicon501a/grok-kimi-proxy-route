@@ -405,6 +405,15 @@ function ensureShell() {
             <span class="field-label">Modelo</span>
             <div id="set-model"></div>
           </div>
+          <div class="field" id="qwen-fields" style="display:none">
+            <span class="field-label">QwenBridge URL</span>
+            <input id="qwen-upstream" type="text" placeholder="http://127.0.0.1:3000/v1"
+              style="width:100%;box-sizing:border-box;padding:7px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.3);color:#eee;font-size:12px;margin-bottom:8px" />
+            <span class="field-label">Qwen API key</span>
+            <input id="qwen-api-key" type="password" placeholder="API_KEY do QwenBridge"
+              style="width:100%;box-sizing:border-box;padding:7px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.3);color:#eee;font-size:12px;margin-bottom:8px" />
+            <button class="btn btn-quiet" id="qwen-save" type="button">Salvar Qwen</button>
+          </div>
         </div>
 
         <div class="rail-foot">
@@ -474,6 +483,7 @@ function ensureShell() {
     { value: "kimi_work", label: "Kimi Work · Auth" },
     { value: "ollie", label: "OllieChat · API key" },
     { value: "gemini", label: "Gemini · API key" },
+    { value: "qwen", label: "Qwen · API key" },
   ];
   const apiOpts = [
     { value: "responses", label: "Responses ★" },
@@ -481,6 +491,9 @@ function ensureShell() {
   ];
   const fallbackModels = (prov) => {
     const p = (prov || state.settings?.provider || "xai").toLowerCase();
+    if (p === "qwen" || p === "qwenbridge") {
+      return [{ id: "qwen3.8", name: "qwen3.8" }];
+    }
     if (p === "ollie") {
       return [
         { id: "claude-sonnet-5", name: "claude-sonnet-5" },
@@ -603,6 +616,25 @@ function ensureShell() {
       saveGlobal({ default_model: v });
     },
   });
+
+  // QwenBridge settings (visible only when provider=qwen — see updateProviderChrome).
+  const qwenSave = $("#qwen-save");
+  if (qwenSave) {
+    qwenSave.onclick = async () => {
+      const base = ($("#qwen-upstream")?.value || "").trim();
+      const key = ($("#qwen-api-key")?.value || "").trim();
+      const patch = {};
+      if (base) patch.qwen_upstream = base;
+      // Only send the key when the user typed a new one — the masked sentinel
+      // in state.settings.qwen_api_key is never echoed back.
+      if (key) patch.qwen_api_key = key;
+      if (!Object.keys(patch).length) return;
+      await saveGlobal(patch);
+      const keyInput = $("#qwen-api-key");
+      if (keyInput) keyInput.value = "";
+      await refreshBootstrap(false);
+    };
+  }
 
   // Composer account switcher: click email chip → pick another account
   const accountOpts = () => {
@@ -912,7 +944,7 @@ function paintChrome() {
   const pNow = (state.settings?.provider || "xai").toLowerCase();
   const kimiUI = isKimiProvider(pNow);
   if (providerAuthMode(pNow) !== "auth") {
-    list.innerHTML = `<div class="account empty-hint">Provedor <b>API key</b> — sem pool de contas de sessão.<br/>Credencial direta (Ollie keyless / Gemini ADC).</div>`;
+    list.innerHTML = `<div class="account empty-hint">Provedor <b>API key</b> — sem pool de contas de sessão.<br/>Credencial direta (Ollie keyless / Gemini ADC / QwenBridge local).</div>`;
   } else if (!state.accounts.length) {
     const how = pNow.startsWith("kimi")
       ? "Clique em <b>+ Conta Kimi</b> (Desktop / JWT / sk-kimi)."
@@ -1151,7 +1183,9 @@ function updateProviderChrome() {
   const mode = providerAuthMode(p);
   const el = $("#provider-label");
   if (el) {
-    if (p === "ollie" || p === "olliechat") {
+    if (p === "qwen" || p === "qwenbridge") {
+      el.textContent = `Qwen · API key · ${shortModelLabel(model, model)}`;
+    } else if (p === "ollie" || p === "olliechat") {
       el.textContent = `Ollie · API key · ${shortModelLabel(model, model)}`;
     } else if (p === "gemini" || p === "google" || p === "vertex") {
       const proj = state.settings?.gemini_project || "ADC project";
@@ -1180,7 +1214,10 @@ function updateProviderChrome() {
   }
   const hint = document.querySelector(".tool-hint");
   if (hint) {
-    if (p === "ollie" || p === "olliechat") {
+    if (p === "qwen" || p === "qwenbridge") {
+      hint.textContent = "QwenBridge";
+      hint.title = "QwenBridge local · OpenAI-compatible (chat/completions)";
+    } else if (p === "ollie" || p === "olliechat") {
       hint.textContent = "OllieChat";
       hint.title = "Upstream OllieChat (sem chave)";
     } else if (p === "gemini" || p === "google" || p === "vertex") {
@@ -1209,6 +1246,26 @@ function updateProviderChrome() {
     state.menus["set-api"]?.setValue("chat");
     state.menus["c-api"]?.setValue("chat");
   }
+  // QwenBridge settings block: only for provider=qwen. Base URL prefilled from
+  // settings; the API key comes back masked, so the input stays empty and only
+  // sends a value when the user types a new one.
+  const isQwen = p === "qwen" || p === "qwenbridge";
+  const qwenFields = $("#qwen-fields");
+  if (qwenFields) {
+    qwenFields.style.display = isQwen ? "" : "none";
+    if (isQwen) {
+      const upInput = $("#qwen-upstream");
+      if (upInput && !upInput.value) {
+        upInput.value = state.settings?.qwen_upstream || "http://127.0.0.1:3000/v1";
+      }
+      const keyInput = $("#qwen-api-key");
+      if (keyInput) {
+        keyInput.placeholder = state.settings?.qwen_api_key
+          ? "•••••••• (salva — digite para trocar)"
+          : "API_KEY do QwenBridge";
+      }
+    }
+  }
 }
 
 
@@ -1222,14 +1279,14 @@ function showAddAccountChooser() {
     showAddKimiChooser();
     return;
   }
-  if (p === "ollie" || p === "gemini" || p === "google" || p === "vertex") {
+  if (p === "ollie" || p === "gemini" || p === "google" || p === "vertex" || p === "qwen" || p === "qwenbridge") {
     closeOverlay();
     const overlay = document.createElement("div");
     overlay.className = "overlay overlay-glass";
     overlay.innerHTML = `
       <div class="sheet sheet-choose">
         <h3>Provedor API key</h3>
-        <p>Ollie e Gemini não usam pool de contas de sessão. Configure o provedor em <b>Global</b> — a credencial é direta (keyless / ADC).</p>
+        <p>Ollie, Gemini e Qwen não usam pool de contas de sessão. Configure o provedor em <b>Global</b> — a credencial é direta (keyless / ADC / bridge local).</p>
         <div class="sheet-actions">
           <button class="btn btn-quiet" id="m-cancel">Fechar</button>
         </div>

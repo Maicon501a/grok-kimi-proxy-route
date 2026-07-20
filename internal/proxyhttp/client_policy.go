@@ -49,6 +49,14 @@ func tokenAccountForSettings(
 	settings store.Settings,
 ) (string, *store.Account) {
 	switch {
+	case settings.IsQwen():
+		key := strings.TrimSpace(settings.QwenAPIKey)
+		return key, &store.Account{
+			ID: "qwen", Provider: store.ProviderQwen, Label: "QwenBridge",
+			Email:       settings.EffectiveQwenUpstream(),
+			AccessToken: key,
+			APIKey:      key,
+		}
 	case settings.IsOllie():
 		return store.OllieAPIKey, &store.Account{
 			ID: "ollie", Label: "OllieChat", Email: "keyless@olliechat",
@@ -89,6 +97,9 @@ func tokenAccountForSettings(
 		ctxXAI := WithRouteProvider(ctx, store.ProviderXAI)
 		if tok2, acc2, _, err := s.ensure(ctxXAI); err == nil && tok2 != "" &&
 			tok2 != store.OllieAPIKey && tok2 != store.GeminiCredMarker && !strings.HasPrefix(tok2, "sk-kimi-") {
+			if acc2 != nil {
+				store.TrackInflight(ctxXAI, acc2.ID)
+			}
 			return tok2, acc2
 		}
 		return token, acc

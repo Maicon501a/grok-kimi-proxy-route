@@ -7,6 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
+	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
 )
@@ -32,18 +35,6 @@ type SearchRequest struct {
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
-	if s.store.Settings().IsOllie() {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotImplemented)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": "Native /v1/search (xAI web_search/x_search) is not available on OllieChat. Switch provider to xai or use tools in the client.",
-				"type":    "not_supported_error",
-				"code":    "provider_ollie",
-			},
-		})
-		return
-	}
 	if r.Method != http.MethodPost {
 		// also allow GET ?q=
 		if r.Method == http.MethodGet {
@@ -69,6 +60,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"unauthorized","type":"invalid_request_error"}}`, http.StatusUnauthorized)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxProxyBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -114,22 +106,42 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 		return
 	}
-	// Search is xAI-native; never inherit UI kimi_work global provider.
+	// Route by the CLIENT-sent model, exactly like the chat endpoints — never
+	// inherit the UI global provider. Native search (web_search/x_search) is
+	// xAI-only, so only models that route to xAI may use it; anything else gets
+	// a clear 400 instead of a silent rewrite to the global default model.
+	clientModel := strings.TrimSpace(req.Model)
+	routeSettings := s.store.Settings().WithProviderForModel(clientModel)
+	if routeProv := routeSettings.NormalizedProvider(); routeProv != store.ProviderXAI {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Native /v1/search (xAI web_search/x_search) requires a Grok model; model \"" + clientModel + "\" routes to provider " + routeProv + ". Send a grok model (e.g. grok-4.5) to use search.",
+				"type":    "invalid_request_error",
+				"code":    "search_requires_xai_model",
+			},
+		})
+		return
+	}
 	ctx := WithRouteProvider(r.Context(), store.ProviderXAI)
-	token, acc, settings, err := s.ensure(ctx)
+	ctx = logging.WithRequestID(ctx, uuid.NewString()[:8])
+	srchLog := logging.FromContext(ctx).With("provider", store.ProviderXAI, "path", "/v1/search")
+	// Track accounts Inc'd by ensure (initial + rotation retries) for exact Dec.
+	ctx, inflight := store.WithInflightTracker(ctx)
+	defer inflight.DecAll(s.store)
+	token, acc, _, err := s.ensure(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	settings = settings.WithProvider(store.ProviderXAI)
-	model := strings.TrimSpace(req.Model)
-	if model == "" || !strings.Contains(strings.ToLower(model), "grok") {
-		model = store.DefaultModel
+	if acc != nil {
+		store.TrackInflight(ctx, acc.ID)
 	}
-	// strip -responses suffix if clients pass it
-	if strings.HasSuffix(strings.ToLower(model), "-responses") {
-		model = model[:len(model)-len("-responses")]
-	}
+	settings := routeSettings
+	// Honor the client model 100%: only empty/alias ids resolve to the routed
+	// provider default (which is always a grok model on the xAI route).
+	model := routeSettings.ResolveModelForClient(clientModel)
 	effort := req.ReasoningEffort
 	if effort == "" {
 		effort = "low"
@@ -143,6 +155,29 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 	accountID := ""
 	if acc != nil {
 		accountID = acc.ID
+	}
+	srchLog.Info("proxy.request.start", "model", model, "account_id", accountID)
+	// rotateCreds swaps only token/acc on retry (settings stay pinned to xAI);
+	// returns false when the rotated account is not xAI — fail, don't cross providers.
+	rotateCreds := func(tok2 string, acc2 *store.Account) bool {
+		if acc2 != nil && acc2.NormalizedProvider() != store.ProviderXAI {
+			return false
+		}
+		if acc2 != nil && acc2.ID != accountID {
+			if n := inflight.Remove(accountID); n > 0 {
+				for i := 0; i < n; i++ {
+					s.store.DecAccountRequestCount(accountID)
+				}
+			}
+		}
+		if acc2 != nil {
+			store.TrackInflight(ctx, acc2.ID)
+		}
+		token, acc = tok2, acc2
+		if acc2 != nil {
+			accountID = acc2.ID
+		}
+		return true
 	}
 	t0 := time.Now()
 	var result *upstream.SearchResponse
@@ -164,11 +199,11 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		if quota && accountID != "" {
 			if fn := s.quotaHandler(); fn != nil {
 				if rotated := fn(accountID, msg); rotated {
-					tok2, acc2, settings2, err2 := s.ensure(r.Context())
+					tok2, acc2, _, err2 := s.ensure(ctx)
 					if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
-						token, acc, settings = tok2, acc2, settings2
-						if acc2 != nil {
-							accountID = acc2.ID
+						if !rotateCreds(tok2, acc2) {
+							writeCrossProviderError(w, store.ProviderXAI, acc2)
+							return
 						}
 						continue
 					}
@@ -177,11 +212,11 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 				_, _ = s.store.MarkExhausted(accountID, msg)
 				if next := s.store.NextUsableAccountID(accountID); next != "" {
 					_ = s.store.SetActiveAccount(next)
-					tok2, acc2, settings2, err2 := s.ensure(r.Context())
+					tok2, acc2, _, err2 := s.ensure(ctx)
 					if err2 == nil {
-						token, acc, settings = tok2, acc2, settings2
-						if acc2 != nil {
-							accountID = acc2.ID
+						if !rotateCreds(tok2, acc2) {
+							writeCrossProviderError(w, store.ProviderXAI, acc2)
+							return
 						}
 						continue
 					}
@@ -195,11 +230,11 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 			if !authRetried {
 				authRetried = true
 				if fr := s.forceRefreshFn(); fr != nil {
-					tok2, acc2, settings2, err2 := fr(r.Context(), accountID)
+					tok2, acc2, _, err2 := fr(ctx, accountID)
 					if err2 == nil && tok2 != "" && tok2 != token {
-						token, acc, settings = tok2, acc2, settings2
-						if acc2 != nil {
-							accountID = acc2.ID
+						if !rotateCreds(tok2, acc2) {
+							writeCrossProviderError(w, store.ProviderXAI, acc2)
+							return
 						}
 						continue
 					}
@@ -207,11 +242,11 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 			}
 			if fn := s.authFailHandler(); fn != nil {
 				if rotated := fn(accountID, msg); rotated {
-					tok2, acc2, settings2, err2 := s.ensure(r.Context())
+					tok2, acc2, _, err2 := s.ensure(ctx)
 					if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
-						token, acc, settings = tok2, acc2, settings2
-						if acc2 != nil {
-							accountID = acc2.ID
+						if !rotateCreds(tok2, acc2) {
+							writeCrossProviderError(w, store.ProviderXAI, acc2)
+							return
 						}
 						continue
 					}
@@ -228,6 +263,7 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		} else if strings.Contains(low, "http 403") || strings.Contains(low, "permission-denied") {
 			status = http.StatusForbidden
 		}
+		srchLog.Error("proxy.request.error", "model", model, "account_id", accountID, "status", status, "reason", truncateForLog(msg, 200))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -295,6 +331,7 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		})
 	}
 
+	srchLog.Info("proxy.request.done", "model", model, "account_id", accountID, "duration_ms", time.Since(t0).Milliseconds(), "status", 200)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }

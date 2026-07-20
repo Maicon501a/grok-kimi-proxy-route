@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"grok-desktop/internal/store"
 )
 
 const (
@@ -302,27 +304,14 @@ func TestRefreshToken(refreshToken string) error {
 	return err
 }
 
-// ResolveKimiModel maps Desktop / OpenCode aliases to gateway wire id.
+// ResolveKimiModel maps Desktop / OpenCode aliases to agent-gw wire id.
+// Real wire models from official Kimi Desktop: k3-agent, k2d6-agent, k2p6, k3-agent-swarm.
 func ResolveKimiModel(requested string) string {
-	m := strings.ToLower(strings.TrimSpace(requested))
-	m = strings.TrimSuffix(m, "-responses")
-	m = strings.TrimSuffix(m, "@responses")
-	switch m {
-	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
-		"k3-agent", "k3-max", "k3", "k3-agent-ultra", "k3-swarm",
-		"k2d6-agent", "k2p6", "k2p6-agent":
-		return "kimi-for-coding"
-	default:
-		if m == "" {
-			return "kimi-for-coding"
-		}
-		return requested
-	}
+	return store.Settings{Provider: store.ProviderKimiWork}.ResolveModelForClient(requested)
 }
 
 // StaticModels for ListModels when provider is kimi_work.
-// kimi-for-coding = wire id from agent-gw.kimi.com/coding (Desktop Work always reports this).
-// It is the coding/agent SKU backed by K3-class models on membership; platform list price ≈ K3.
+// Wire ids match agent-gw / Kimi Desktop (not public moonshot kimi-k3 ids).
 func StaticModels() []map[string]string {
 	return []map[string]string{
 		{"id": "k3-agent", "name": "K3 Max (Work)", "api_mode": "responses"},
