@@ -93,6 +93,8 @@ export namespace store {
 	    force_default_model?: boolean;
 	    gemini_project?: string;
 	    gemini_location?: string;
+	    qwen_upstream?: string;
+	    qwen_api_key?: string;
 	    theme_accent?: string;
 	    kimi_stealth_headless: boolean;
 	    google_email?: string;
@@ -119,6 +121,8 @@ export namespace store {
 	        this.force_default_model = source["force_default_model"];
 	        this.gemini_project = source["gemini_project"];
 	        this.gemini_location = source["gemini_location"];
+	        this.qwen_upstream = source["qwen_upstream"];
+	        this.qwen_api_key = source["qwen_api_key"];
 	        this.theme_accent = source["theme_accent"];
 	        this.kimi_stealth_headless = source["kimi_stealth_headless"];
 	        this.google_email = source["google_email"];
