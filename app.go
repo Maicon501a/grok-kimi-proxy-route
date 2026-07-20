@@ -1616,8 +1616,11 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 	}
 
 	// Sync CLI tokens at most once per 30s — Codex fires many parallel /v1 calls.
+	// forceRefresh always re-reads ~/.grok/auth.json: the official CLI rotates
+	// refresh tokens and holds auth.json.lock; without a fresh pull we often hit
+	// invalid_grant on a revoked RT while the CLI still has a valid one.
 	a.lastCLISyncMu.Lock()
-	doSync := time.Since(a.lastCLISync) > 30*time.Second
+	doSync := forceRefresh || time.Since(a.lastCLISync) > 30*time.Second
 	if doSync {
 		a.lastCLISync = time.Now()
 	}
@@ -1657,6 +1660,13 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 	// Track in-flight requests for least-used strategy.
 	a.store.IncAccountRequestCount(acc.ID)
 
+	// After forced CLI sync, re-load — Sync may have replaced AT/RT for this id.
+	if forceRefresh {
+		if latest, ok := a.store.GetAccount(acc.ID); ok && latest != nil {
+			*acc = *latest
+		}
+	}
+
 	// Skip JWT bot-flagged tokens (chat endpoint returns 403 permission-denied).
 	if oauth.BotFlagged(acc.AccessToken) {
 		a.store.DecAccountRequestCount(acc.ID)
@@ -1664,15 +1674,47 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		return "", nil, settings, fmt.Errorf("conta bloqueada (bot flag) — relogue ou use outra conta")
 	}
 
-	needRefresh := forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired()
+	// forceRefresh still triggers OAuth (auth-denied recovery), but only after
+	// SyncFromGrokCLI above so we hold the same RT the official CLI just wrote.
+	needRefresh := forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired() || acc.AccessToken == ""
 	if needRefresh && acc.RefreshToken != "" {
+		refreshedOK := false
 		if err := a.refreshAccountLocked(ctx, acc); err != nil {
-			if forceRefresh || acc.Expired() {
+			// invalid_grant: RT revoked (CLI race, re-login elsewhere, or dead pool row).
+			// Re-sync ~/.grok/auth.json once, then mark denied and rotate — never fail the
+			// whole multi-account pool on one bad RT.
+			if oauth.IsInvalidGrant(err) {
+				logging.Warn("xai.refresh.invalid_grant", "account_id", acc.ID, "err", err.Error())
+				if n, serr := a.store.SyncFromGrokCLI(); serr == nil && n > 0 {
+					if latest, ok := a.store.GetAccount(acc.ID); ok && latest != nil {
+						*acc = *latest
+						if retryErr := a.refreshAccountLocked(ctx, acc); retryErr == nil {
+							refreshedOK = true
+						}
+					}
+				}
+				if !refreshedOK {
+					_, _ = a.store.MarkAuthDenied(acc.ID, "invalid_grant: "+err.Error())
+					a.store.DecAccountRequestCount(acc.ID)
+					if next := a.store.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
+						logging.Info("xai.refresh.rotate_after_invalid_grant", "from", acc.ID, "to", next)
+						return a.ensureCredsInner(ctx, next, false)
+					}
+					return "", nil, settings, fmt.Errorf("token expirado — faça login de novo: %v", err)
+				}
+			} else if forceRefresh || acc.Expired() {
 				a.store.DecAccountRequestCount(acc.ID)
+				if next := a.store.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
+					logging.Info("xai.refresh.rotate_after_fail", "from", acc.ID, "to", next, "err", err.Error())
+					return a.ensureCredsInner(ctx, next, false)
+				}
 				return "", nil, settings, fmt.Errorf("token expirado — faça login de novo: %v", err)
 			}
 			// Soft failure near expiry: keep current token only if not fully expired.
 		} else {
+			refreshedOK = true
+		}
+		if refreshedOK {
 			// Re-check bot flag after refresh.
 			if oauth.BotFlagged(acc.AccessToken) {
 				a.store.DecAccountRequestCount(acc.ID)
@@ -1687,6 +1729,9 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 	}
 	if acc.Expired() && !forceRefresh {
 		a.store.DecAccountRequestCount(acc.ID)
+		if next := a.store.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
+			return a.ensureCredsInner(ctx, next, false)
+		}
 		return "", nil, settings, fmt.Errorf("token expirado — faça login de novo")
 	}
 	return acc.AccessToken, acc, settings, nil
@@ -1698,6 +1743,8 @@ func (a *App) accountRefreshMu(id string) *sync.Mutex {
 }
 
 // refreshAccountLocked performs OAuth refresh with per-account mutex and persists tokens.
+// On success it also mirrors tokens into ~/.grok/auth.json so the official CLI does not
+// keep a revoked refresh_token after we rotate.
 func (a *App) refreshAccountLocked(ctx context.Context, acc *store.Account) error {
 	if acc == nil || acc.RefreshToken == "" {
 		return fmt.Errorf("no refresh token")
@@ -1740,6 +1787,10 @@ func (a *App) refreshAccountLocked(ctx context.Context, acc *store.Account) erro
 		return err
 	}
 	_ = a.store.ClearAuthDenied(acc.ID)
+	// Keep official Grok CLI in lockstep (same OIDC client_id / rotating RT).
+	if err := a.store.WriteAccountToGrokCLI(*acc); err != nil {
+		logging.Warn("xai.refresh.cli_write_failed", "account_id", acc.ID, "err", err.Error())
+	}
 	return nil
 }
 

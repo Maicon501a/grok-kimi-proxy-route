@@ -325,8 +325,9 @@ func ensureCreds(
 	}
 	// Sync CLI tokens at most once per 30s — parallel request storms must not
 	// read ~/.grok/auth.json + write SQLite on every request.
+	// forceRefresh always re-reads: official CLI rotates RTs under auth.json.lock.
 	lastCLISyncMu.Lock()
-	doSync := time.Since(lastCLISync) > 30*time.Second
+	doSync := forceRefresh || time.Since(lastCLISync) > 30*time.Second
 	if doSync {
 		lastCLISync = time.Now()
 	}
@@ -362,12 +363,43 @@ func ensureCreds(
 		}
 		return "", nil, settings, fmt.Errorf("conta bloqueada (bot flag)")
 	}
-	need := forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired()
+	// After a forced CLI sync, re-load the preferred account — Sync may have
+	// replaced AT/RT (or healed flags) for this id.
+	if forceRefresh {
+		if latest, ok := st.GetAccount(acc.ID); ok && latest != nil {
+			*acc = *latest
+		}
+	}
+	// forceRefresh still triggers OAuth (auth-denied recovery), but only after
+	// SyncFromGrokCLI above so we hold the same RT the official CLI just wrote.
+	need := forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired() || acc.AccessToken == ""
 	if need && acc.RefreshToken != "" {
 		if err := refreshXAIAccount(ctx, st, oa, acc, forceRefresh); err != nil {
-			if forceRefresh || acc.Expired() {
+			if oauth.IsInvalidGrant(err) {
+				logging.Warn("xai.refresh.invalid_grant", "account_id", acc.ID, "err", err.Error())
+				// Official CLI may have rotated the RT; pull ~/.grok/auth.json and retry once.
+				recovered := false
+				if n, serr := st.SyncFromGrokCLI(); serr == nil && n > 0 {
+					if latest, ok := st.GetAccount(acc.ID); ok && latest != nil {
+						*acc = *latest
+						if retryErr := refreshXAIAccount(ctx, st, oa, acc, forceRefresh); retryErr == nil {
+							recovered = true
+						}
+					}
+				}
+				if !recovered {
+					_, _ = st.MarkAuthDenied(acc.ID, "invalid_grant: "+err.Error())
+					st.DecAccountRequestCount(acc.ID)
+					if next := st.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
+						logging.Info("xai.refresh.rotate_after_invalid_grant", "from", acc.ID, "to", next)
+						return ensureCreds(ctx, st, oa, next, false)
+					}
+					return "", nil, settings, fmt.Errorf("token expirado: %v", err)
+				}
+			} else if forceRefresh || acc.Expired() {
 				st.DecAccountRequestCount(acc.ID)
-				if next := st.NextUsableAccountID(acc.ID); next != "" {
+				if next := st.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
+					logging.Info("xai.refresh.rotate_after_fail", "from", acc.ID, "to", next, "err", err.Error())
 					return ensureCreds(ctx, st, oa, next, false)
 				}
 				return "", nil, settings, fmt.Errorf("token expirado: %v", err)
@@ -385,6 +417,8 @@ func ensureCreds(
 // refreshXAIAccount performs the OAuth refresh under a per-account mutex and
 // persists rotated tokens. After acquiring the lock it re-reads the account and
 // skips the refresh when another goroutine already rotated the tokens.
+// On success it also mirrors tokens into ~/.grok/auth.json (same OIDC client as
+// the official Grok CLI) so concurrent CLI+proxy use does not revoke each other.
 func refreshXAIAccount(ctx context.Context, st *store.Store, oa *oauth.Client, acc *store.Account, force bool) error {
 	if acc == nil || acc.RefreshToken == "" {
 		return fmt.Errorf("no refresh token")
@@ -402,10 +436,13 @@ func refreshXAIAccount(ctx context.Context, st *store.Store, oa *oauth.Client, a
 		acc.AccessToken = latest.AccessToken
 		acc.ExpiresAt = latest.ExpiresAt
 	}
+	logging.Info("xai.refresh.start", "account_id", acc.ID)
 	tok, err := oa.Refresh(ctx, acc.RefreshToken, acc.ClientID, acc.Issuer)
 	if err != nil {
+		logging.Error("xai.refresh.failed", "account_id", acc.ID, "err", err.Error())
 		return err
 	}
+	logging.Info("xai.refresh.ok", "account_id", acc.ID)
 	acc.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
 		acc.RefreshToken = tok.RefreshToken
@@ -421,5 +458,8 @@ func refreshXAIAccount(ctx context.Context, st *store.Store, oa *oauth.Client, a
 		return err
 	}
 	_ = st.ClearAuthDenied(acc.ID)
+	if err := st.WriteAccountToGrokCLI(*acc); err != nil {
+		logging.Warn("xai.refresh.cli_write_failed", "account_id", acc.ID, "err", err.Error())
+	}
 	return nil
 }

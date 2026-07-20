@@ -19,7 +19,7 @@ import (
 const (
 	AppName              = "GrokDesktop"
 	DefaultUpstream      = "https://cli-chat-proxy.grok.com/v1"
-	DefaultClientVersion = "0.2.101"
+	DefaultClientVersion = "0.2.106"
 	DefaultModel         = "grok-4.5"
 	DefaultEffort        = "high"
 	DefaultClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -899,7 +899,11 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 	defer s.mu.Unlock()
 
 	// Collect usable accounts for this provider.
-	var usable []Account
+	// Prefer non-expired access tokens: expired rows with a refresh_token are
+	// still candidates (ensureCreds will refresh), but round-robin across a
+	// pile of dead RTs was causing intermittent invalid_grant failures while a
+	// healthy CLI-synced account sat unused.
+	var fresh, stale []Account
 	for _, a := range s.accounts {
 		if a.NormalizedProvider() != want || !a.Usable() {
 			continue
@@ -908,7 +912,15 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 		if want != ProviderKimiWork && a.Expired() && a.RefreshToken == "" {
 			continue
 		}
-		usable = append(usable, a)
+		if want != ProviderKimiWork && a.Expired() {
+			stale = append(stale, a)
+			continue
+		}
+		fresh = append(fresh, a)
+	}
+	usable := fresh
+	if len(usable) == 0 {
+		usable = stale
 	}
 	if len(usable) == 0 {
 		return nil
@@ -916,7 +928,8 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 
 	switch strategy {
 	case StrategyActive:
-		// Prefer the global active account if it belongs to this provider.
+		// Prefer the global active account if it belongs to this provider and is
+		// in the preferred (fresh-first) pool.
 		if id := s.settings.ActiveAccountID; id != "" {
 			for _, a := range usable {
 				if a.ID == id {
@@ -924,6 +937,8 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 					return &cp
 				}
 			}
+			// Active is only in the stale pool while fresher accounts exist — still
+			// honour it only when nothing fresh is available (usable already prefers fresh).
 		}
 		// Fall through to round-robin.
 		fallthrough
@@ -944,7 +959,7 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 		idx := state.RRIndex % len(usable)
 		state.RRIndex++
 		cp := usable[idx]
-		logging.Debug("store.account.picked", "provider", want, "account_id", cp.ID, "strategy", string(strategy))
+		logging.Debug("store.account.picked", "provider", want, "account_id", cp.ID, "strategy", string(strategy), "fresh_pool", len(fresh), "stale_pool", len(stale))
 		return &cp
 	case StrategyLeastUsed:
 		// Pick the account with the lowest in-flight request count.
@@ -2101,6 +2116,11 @@ func grokCLIAuthPath() (string, error) {
 
 // SyncFromGrokCLI imports fresher OAuth tokens from the official Grok CLI auth.json.
 // Returns how many accounts were updated or inserted.
+//
+// Important: proxy and official Grok CLI share the same OIDC client_id. xAI refresh
+// tokens rotate/revoke — adopting a STALE CLI refresh_token after the proxy already
+// rotated (or vice-versa) causes intermittent invalid_grant. We only adopt CLI
+// tokens when the CLI access token is strictly fresher by expires_at.
 func (s *Store) SyncFromGrokCLI() (int, error) {
 	path, err := grokCLIAuthPath()
 	if err != nil {
@@ -2164,13 +2184,31 @@ func (s *Store) SyncFromGrokCLI() (int, error) {
 		}
 		if old, ok := s.accounts[id]; ok {
 			sameToken := old.AccessToken == access
+			// CLI is fresher only when its access expiry is clearly ahead of ours.
+			// 30s slack absorbs clock/rounding differences without thrashing.
 			cliFresher := !exp.IsZero() && (old.ExpiresAt.IsZero() || exp.After(old.ExpiresAt.Add(30*time.Second)))
-			oldDead := old.Expired() || old.AuthDenied() || old.Exhausted() || old.AccessToken == ""
-			if sameToken && !oldDead {
+			proxyHasCreds := old.AccessToken != "" && old.RefreshToken != ""
+			// Never clobber a working (or newer) proxy session with a stale CLI
+			// snapshot. Previously AuthDenied/Exhausted forced an overwrite even
+			// when CLI expires_at was older — that re-injected revoked RTs.
+			if sameToken && !old.Expired() {
+				// Access matches; still heal auth-denied/exhausted flags if CLI is healthy.
+				if (old.AuthDenied() || old.Exhausted()) && !cliTokenExpired(exp) {
+					a := old
+					a.ExhaustedAt = time.Time{}
+					a.ExhaustReason = ""
+					a.AuthDeniedAt = time.Time{}
+					a.AuthDeniedReason = ""
+					a.UpdatedAt = time.Now().UTC()
+					s.accounts[id] = a
+					_ = s.saveAccountLocked(a)
+					updated++
+				}
 				continue
 			}
-			if !cliFresher && !oldDead && old.AccessToken != "" {
-				if !old.ExpiresAt.IsZero() && (exp.IsZero() || !exp.After(old.ExpiresAt)) {
+			if !cliFresher {
+				// Proxy is equal/newer, or CLI has no expires_at. Keep proxy tokens.
+				if proxyHasCreds || old.AccessToken != "" {
 					continue
 				}
 			}
@@ -2212,6 +2250,7 @@ func (s *Store) SyncFromGrokCLI() (int, error) {
 			s.accounts[id] = a
 			_ = s.saveAccountLocked(a)
 			updated++
+			logging.Info("store.cli_sync.adopted", "account_id", id, "cli_exp", exp)
 			continue
 		}
 		now := time.Now().UTC()
@@ -2228,6 +2267,7 @@ func (s *Store) SyncFromGrokCLI() (int, error) {
 			Issuer:       issuer,
 			CreatedAt:    now,
 			UpdatedAt:    now,
+			Provider:     ProviderXAI,
 		}
 		if a.Label == "" {
 			a.Label = "Grok CLI"
@@ -2239,8 +2279,140 @@ func (s *Store) SyncFromGrokCLI() (int, error) {
 			_ = s.saveSettingsLocked()
 		}
 		updated++
+		logging.Info("store.cli_sync.inserted", "account_id", id)
 	}
 	return updated, nil
+}
+
+func cliTokenExpired(exp time.Time) bool {
+	if exp.IsZero() {
+		return false
+	}
+	return time.Now().UTC().After(exp)
+}
+
+// WriteAccountToGrokCLI mirrors a rotated xAI session into ~/.grok/auth.json so the
+// official Grok CLI keeps the same refresh_token. Without this, the next CLI refresh
+// (or a SyncFromGrokCLI of a stale file) races the proxy and yields invalid_grant.
+// Best-effort: errors are returned but never fatal for request serving.
+func (s *Store) WriteAccountToGrokCLI(acc Account) error {
+	if acc.AccessToken == "" || acc.RefreshToken == "" {
+		return nil
+	}
+	if acc.NormalizedProvider() != ProviderXAI {
+		return nil
+	}
+	path, err := grokCLIAuthPath()
+	if err != nil {
+		return err
+	}
+	// Serialize writers (CLI also uses auth.json.lock; we use a sibling lock).
+	lockPath := path + ".proxy-write.lock"
+	lockF, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lockF.Close()
+	// Best-effort exclusive section via O_EXCL stamp file is racy on Windows; we
+	// still rewrite atomically via temp+rename below.
+
+	var root map[string]any
+	if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+		if json.Unmarshal(b, &root) != nil {
+			root = map[string]any{}
+		}
+	} else {
+		root = map[string]any{}
+	}
+
+	clientID := acc.ClientID
+	if clientID == "" {
+		clientID = DefaultClientID
+	}
+	issuer := acc.Issuer
+	if issuer == "" {
+		issuer = DefaultIssuer
+	}
+	entryKey := issuer + "::" + clientID
+
+	// Prefer merging into the existing entry for this issuer/client.
+	entry, _ := root[entryKey].(map[string]any)
+	if entry == nil {
+		// Also match by user_id if the CLI used a different key shape.
+		for k, v := range root {
+			m, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			uid := str(m["user_id"])
+			if uid == "" {
+				uid = str(m["principal_id"])
+			}
+			if uid != "" && (uid == acc.ID || uid == acc.UserID) {
+				entry = m
+				entryKey = k
+				break
+			}
+		}
+	}
+	if entry == nil {
+		entry = map[string]any{}
+	}
+
+	// Do not overwrite CLI if its access token is strictly newer than ours.
+	if es := str(entry["expires_at"]); es != "" {
+		var cliExp time.Time
+		if t, e := time.Parse(time.RFC3339Nano, es); e == nil {
+			cliExp = t.UTC()
+		} else if t, e := time.Parse(time.RFC3339, es); e == nil {
+			cliExp = t.UTC()
+		}
+		if !cliExp.IsZero() && !acc.ExpiresAt.IsZero() && cliExp.After(acc.ExpiresAt.Add(30*time.Second)) {
+			return nil
+		}
+	}
+
+	entry["key"] = acc.AccessToken
+	entry["refresh_token"] = acc.RefreshToken
+	entry["auth_mode"] = "oidc"
+	if !acc.ExpiresAt.IsZero() {
+		entry["expires_at"] = acc.ExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	entry["oidc_issuer"] = issuer
+	entry["oidc_client_id"] = clientID
+	if acc.UserID != "" {
+		entry["user_id"] = acc.UserID
+		entry["principal_id"] = acc.UserID
+	} else if acc.ID != "" {
+		entry["user_id"] = acc.ID
+		entry["principal_id"] = acc.ID
+	}
+	if acc.Email != "" {
+		entry["email"] = acc.Email
+	}
+	if acc.TeamID != "" {
+		entry["team_id"] = acc.TeamID
+	}
+	entry["principal_type"] = "User"
+	root[entryKey] = entry
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		// Windows: replace existing
+		_ = os.Remove(path)
+		if err2 := os.Rename(tmp, path); err2 != nil {
+			return err2
+		}
+	}
+	logging.Info("store.cli_write.ok", "account_id", acc.ID, "path", path)
+	return nil
 }
 
 func (s *Store) UpsertAccount(a Account) error {

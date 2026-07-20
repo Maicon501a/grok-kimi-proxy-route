@@ -201,6 +201,20 @@ func (c *Client) Refresh(ctx context.Context, refreshToken, clientID, issuer str
 	return &tok, nil
 }
 
+// IsInvalidGrant reports OAuth invalid_grant / revoked refresh-token errors.
+// These are permanent for the stored refresh_token: mark the account auth-denied
+// and rotate, or re-sync from the official Grok CLI (~/.grok/auth.json).
+func IsInvalidGrant(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "invalid_grant") ||
+		strings.Contains(s, "refresh token has been revoked") ||
+		strings.Contains(s, "token has been revoked") ||
+		strings.Contains(s, "refresh_token is invalid")
+}
+
 func (c *Client) UserInfo(ctx context.Context, accessToken, issuer string) (email, userID string) {
 	if issuer == "" {
 		issuer = c.Issuer
