@@ -318,14 +318,24 @@ function positionMenu(root, menu) {
   const rect = root.getBoundingClientRect();
   const isChip = root.classList.contains("dd-chip");
   if (!isChip) menu.style.width = `${Math.max(120, rect.width)}px`;
+  const edge = 8;
   const menuWidth = menu.getBoundingClientRect().width || rect.width;
-  const left = Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8));
-  const menuHeight = Math.min(menu.offsetHeight || 240, 240);
-  const spaceBelow = window.innerHeight - rect.bottom - 8;
-  const openUp = spaceBelow < Math.min(220, menuHeight) && rect.top > menuHeight + 8;
-  const top = openUp ? rect.top - menuHeight - 6 : rect.bottom + 6;
+  const left = Math.max(edge, Math.min(rect.left, window.innerWidth - menuWidth - edge));
+  const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - edge);
+  const spaceAbove = Math.max(0, rect.top - edge);
+  const naturalHeight = menu.scrollHeight || menu.offsetHeight || 240;
+  // Prefer the side with more room and always constrain the menu to the
+  // viewport, so model lists remain usable on short windows and near the
+  // bottom of the sidebar/composer.
+  const openUp = spaceAbove > spaceBelow && spaceAbove >= 80;
+  const available = Math.max(80, Math.min(240, (openUp ? spaceAbove : spaceBelow) - 6));
+  menu.style.maxHeight = `${available}px`;
+  const menuHeight = Math.min(menu.getBoundingClientRect().height || naturalHeight, available);
+  const preferredTop = openUp ? rect.top - menuHeight - 6 : rect.bottom + 6;
+  const top = Math.max(edge, Math.min(preferredTop, window.innerHeight - menuHeight - edge));
   menu.classList.toggle("drop-up", openUp);
   menu.style.left = `${left}px`;
+  menu.style.bottom = "auto";
   menu.style.top = `${Math.max(8, top)}px`;
 }
 

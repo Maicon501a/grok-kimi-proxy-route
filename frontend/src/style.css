@@ -75,6 +75,9 @@ button {
     var(--bg-rail);
   padding: 18px 14px 14px;
   gap: 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .brand {
