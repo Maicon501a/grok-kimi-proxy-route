@@ -18,9 +18,6 @@ import (
 	"os"
 	"runtime"
 	"strings"
-	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
 // ErrCannotDecrypt is returned when the stored blob cannot be decrypted
@@ -33,18 +30,15 @@ func Encrypt(plaintext string) (string, error) {
 	if plaintext == "" {
 		return "", nil
 	}
-	if runtime.GOOS == "windows" {
-		blob, err := dpapiProtect([]byte(plaintext))
-		if err != nil {
-			return "", err
-		}
-		return "dpapi:" + b64.StdEncoding.EncodeToString(blob), nil
-	}
-	blob, err := aesGCMSeal([]byte(plaintext))
+	blob, err := encryptAtRest([]byte(plaintext))
 	if err != nil {
 		return "", err
 	}
-	return "aes:" + b64.StdEncoding.EncodeToString(blob), nil
+	prefix := "aes:"
+	if runtime.GOOS == "windows" {
+		prefix = "dpapi:"
+	}
+	return prefix + b64.StdEncoding.EncodeToString(blob), nil
 }
 
 // Decrypt reverses Encrypt. Empty input returns an empty string (no error).
@@ -55,14 +49,11 @@ func Decrypt(ciphertext string) (string, error) {
 	}
 	switch {
 	case strings.HasPrefix(ct, "dpapi:"):
-		if runtime.GOOS != "windows" {
-			return "", ErrCannotDecrypt
-		}
 		raw, err := b64.StdEncoding.DecodeString(strings.TrimPrefix(ct, "dpapi:"))
 		if err != nil {
 			return "", ErrCannotDecrypt
 		}
-		out, err := dpapiUnprotect(raw)
+		out, err := decryptDPAPI(raw)
 		if err != nil {
 			return "", fmt.Errorf("%w: %v", ErrCannotDecrypt, err)
 		}
@@ -87,61 +78,6 @@ func Decrypt(ciphertext string) (string, error) {
 func HasCiphertext(value string) bool {
 	v := strings.TrimSpace(value)
 	return strings.HasPrefix(v, "dpapi:") || strings.HasPrefix(v, "aes:")
-}
-
-// ---------- Windows DPAPI ----------
-
-// dpapiProtect encrypts data with CryptProtectData (current-user scope).
-// CRYPTPROTECT_UI_FORBIDDEN prevents any prompt; CRYPTPROTECT_MEMORY_BLOCK
-// semantics are irrelevant here (the blob is persisted, not memory-pinned).
-func dpapiProtect(plain []byte) ([]byte, error) {
-	if len(plain) == 0 {
-		return nil, nil
-	}
-	in := windows.DataBlob{
-		Size: uint32(len(plain)),
-		Data: &plain[0],
-	}
-	var out windows.DataBlob
-	if err := windows.CryptProtectData(
-		&in,
-		nil, // description
-		nil, // optional entropy
-		0,   // reserved
-		nil, // prompt struct
-		windows.CRYPTPROTECT_UI_FORBIDDEN,
-		&out,
-	); err != nil {
-		return nil, fmt.Errorf("secure: CryptProtectData: %w", err)
-	}
-	defer windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
-	// Copy before the deferred LocalFree invalidates the buffer.
-	return append([]byte(nil), unsafe.Slice(out.Data, int(out.Size))...), nil
-}
-
-func dpapiUnprotect(blob []byte) ([]byte, error) {
-	if len(blob) == 0 {
-		return nil, ErrCannotDecrypt
-	}
-	in := windows.DataBlob{
-		Size: uint32(len(blob)),
-		Data: &blob[0],
-	}
-	var out windows.DataBlob
-	if err := windows.CryptUnprotectData(
-		&in,
-		nil, // description
-		nil, // optional entropy
-		0,   // reserved
-		nil, // prompt struct
-		windows.CRYPTPROTECT_UI_FORBIDDEN,
-		&out,
-	); err != nil {
-		return nil, err
-	}
-	defer windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
-	// Copy before the deferred LocalFree invalidates the buffer.
-	return append([]byte(nil), unsafe.Slice(out.Data, int(out.Size))...), nil
 }
 
 // ---------- Non-Windows fallback (AES-256-GCM) ----------
