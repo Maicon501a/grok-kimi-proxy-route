@@ -12,10 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -297,9 +295,7 @@ func (d *sgDaemon) start(ctx context.Context) error {
 	// Never pop a console window for the sidecar (the official app's daemon
 	// also runs headless). Also detach so a parent crash doesn't leave the
 	// terminal behind; the daemon exits when stdin closes (Shutdown).
-	if runtime.GOOS == "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	}
+	hideSecuritySidecarWindow(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
