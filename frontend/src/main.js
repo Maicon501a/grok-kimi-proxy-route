@@ -1139,12 +1139,10 @@ function paintChrome() {
   const kimiUI = isKimiProvider(pNow);
   if (providerAuthMode(pNow) !== "auth") {
     list.innerHTML = `<div class="account empty-hint">Provedor <b>API key</b> — sem pool de contas de sessão.<br/>Credencial direta (Ollie keyless / Gemini ADC / QwenBridge local).</div>`;
-  } else if (pNow === "accio" || pNow === "accio-work" || pNow === "phoenix") {
-    list.innerHTML = state.accounts.length
-      ? ""
-      : `<div class="account empty-hint">Nenhuma conta Accio cadastrada.<br/>Clique em <b>Adicionar conta</b> para autenticar; depois o proxy poderá alternar entre as contas automaticamente.</div>`;
   } else if (!state.accounts.length) {
-    const how = pNow.startsWith("kimi")
+    const how = pNow === "accio" || pNow === "accio-work" || pNow === "phoenix"
+      ? "Clique em <b>Login Accio</b> para autenticar; depois o proxy poderá alternar entre as contas automaticamente."
+      : pNow.startsWith("kimi")
       ? "Clique em <b>+ Conta Kimi</b> (Desktop / JWT / sk-kimi)."
       : "Clique em <b>+ Conta Grok</b> para OAuth xAI.";
     list.innerHTML = `<div class="account empty-hint">Nenhuma conta neste provedor.<br/>${how}</div>`;
@@ -1519,12 +1517,15 @@ function updateProviderChrome() {
   }
   const addBtn = $("#btn-add");
   const accBtn = $("#btn-accounts");
+  const disabled = statusInfo?.status === "disabled";
   if (addBtn) {
-    addBtn.style.display = statusInfo ? "none" : mode === "auth" ? "" : "none";
+    // Accio maintenance is advisory: account login/management remains usable.
+    // Only providers explicitly marked disabled hide these controls.
+    addBtn.style.display = disabled ? "none" : mode === "auth" ? "" : "none";
     addBtn.textContent = p.startsWith("kimi") ? "+ Conta Kimi" : (p === "accio" || p === "accio-work" || p === "phoenix" ? "Login Accio" : "+ Conta Grok");
   }
   if (accBtn) {
-    accBtn.style.display = statusInfo ? "none" : mode === "auth" ? "" : "none";
+    accBtn.style.display = disabled ? "none" : mode === "auth" ? "" : "none";
   }
   const hint = document.querySelector(".tool-hint");
   if (hint) {
