@@ -1,4 +1,4 @@
-# Grok Proxy Plus
+# Grok Proxy kimi Router
 
 <p align="center">
   <strong>Proxy desktop multi-rota</strong><br/>
