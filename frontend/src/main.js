@@ -85,7 +85,7 @@ const messageMarkupCache = new WeakMap();
 
 /** Short label for long model ids (Ollie full paths, aliases, etc.). */
 function shortModelLabel(name, id) {
-  let s = String(name || id || "").trim();
+  let s = normalizeAccioModelLabel(name, id);
   if (!s) return "—";
   // "OllieChat alias → accounts/.../foo" → prefer the id short form
   const arrow = s.indexOf("→");
@@ -100,6 +100,27 @@ function shortModelLabel(name, id) {
   // keep chip readable
   if (s.length > 28) s = s.slice(0, 26) + "…";
   return s;
+}
+
+// Older Accio catalog responses sometimes expose the opaque modelCode as the
+// display name (for example 1Orbit-Q2XN3dX6cP2m). Keep the full ID as the
+// option value, but make the visible fallback readable when the server has
+// not yet supplied modelDisplayName/labelList.
+function normalizeAccioModelLabel(name, id) {
+  const rawId = String(id || "").trim().replace(/^accio\//i, "");
+  const rawName = String(name || id || "").trim();
+  const candidate = rawName.replace(/^accio\//i, "");
+  if (
+    !rawId ||
+    candidate.toLowerCase() !== rawId.toLowerCase() ||
+    !/^1[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]{8,}$/.test(candidate)
+  ) {
+    return rawName;
+  }
+  const dash = candidate.indexOf("-");
+  const family = candidate.slice(0, dash).replace(/^1/, "");
+  const variant = candidate.slice(dash + 1);
+  return variant ? `${family} - ${variant}` : family;
 }
 
 // Keep this at module scope: refreshBootstrap() runs outside ensureShell().

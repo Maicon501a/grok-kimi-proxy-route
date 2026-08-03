@@ -169,6 +169,80 @@ func TestParseModelCatalogAcceptsNestedGatewayShapes(t *testing.T) {
 	}
 }
 
+func TestParseModelCatalogUsesAccioDisplayLabelsWithoutChangingIDs(t *testing.T) {
+	got := parseModelCatalogValue(map[string]any{
+		"data": map[string]any{
+			"providers": []any{
+				map[string]any{
+					"modelList": []any{
+						map[string]any{
+							"modelCode":        "1Orbit-l9eY7YK8bW1f",
+							"modelName":        "1Orbit-l9eY7YK8bW1f",
+							"modelDisplayName": "1Orbit-l9eY7YK8bW1f",
+						},
+						map[string]any{
+							"modelCode": "1Synapse-G5aJ8wL1dV4s",
+							"modelName": "1Synapse-G5aJ8wL1dV4s",
+						},
+					},
+				},
+			},
+		},
+		"ext": map[string]any{
+			"labelList": []any{
+				map[string]any{
+					"labelKey":        "orbit",
+					"displayName":     "Orbit",
+					"targetModelCode": "1Orbit-l9eY7YK8bW1f",
+				},
+				map[string]any{
+					"labelKey":        "synapse",
+					"displayName":     "Synapse Reasoning",
+					"targetModelCode": "accio/1Synapse-G5aJ8wL1dV4s",
+				},
+				map[string]any{
+					"labelKey":        "auto",
+					"displayName":     "Auto",
+					"targetModelCode": "1Orbit-l9eY7YK8bW1f",
+				},
+			},
+		},
+	})
+
+	if len(got) != 2 {
+		t.Fatalf("got %d models: %#v", len(got), got)
+	}
+	want := map[string]string{
+		"accio/1Orbit-l9eY7YK8bW1f":   "Orbit",
+		"accio/1Synapse-G5aJ8wL1dV4s": "Synapse Reasoning",
+	}
+	for _, model := range got {
+		if model.Name != want[model.ID] {
+			t.Fatalf("model %s display name = %q, want %q", model.ID, model.Name, want[model.ID])
+		}
+	}
+}
+
+func TestParseModelCatalogNormalizesOpaqueFallbackName(t *testing.T) {
+	got := parseModelCatalogValue(map[string]any{
+		"models": []any{
+			map[string]any{
+				"modelCode": "1Orbit-Q2XN3dX6cP2m",
+				"modelName": "1Orbit-Q2XN3dX6cP2m",
+			},
+		},
+	})
+	if len(got) != 1 {
+		t.Fatalf("got %d models: %#v", len(got), got)
+	}
+	if got[0].ID != "accio/1Orbit-Q2XN3dX6cP2m" {
+		t.Fatalf("ID = %q", got[0].ID)
+	}
+	if got[0].Name != "Orbit - Q2XN3dX6cP2m" {
+		t.Fatalf("fallback display name = %q", got[0].Name)
+	}
+}
+
 func TestBuildRequestEnablesIncrementalStreaming(t *testing.T) {
 	out := buildRequest(map[string]any{
 		"model":    "accio/1Nova-Q3xM8vJ1rH6z",

@@ -1532,9 +1532,10 @@ func (c *Client) modelRoutingWithToken(ctx context.Context, token string) (Model
 	if name == "" {
 		name = id
 	}
+	modelInfo := catalogModelInfo{id: id, name: name, modelName: name}
 	return Model{
 		ID:          "accio/" + strings.TrimPrefix(id, "accio/"),
-		Name:        name,
+		Name:        normalizeAccioModelDisplayName(modelInfo, nil),
 		Provider:    Provider,
 		Description: "Accio · dynamic routing",
 	}, nil
@@ -1551,6 +1552,7 @@ func parseModelCatalog(root map[string]any) []Model {
 func parseModelCatalogValue(root any) []Model {
 	out := make([]Model, 0)
 	seen := make(map[string]bool)
+	displayLabels := collectAccioDisplayLabels(root)
 	var walk func(any, string)
 	walk = func(value any, providerName string) {
 		switch v := value.(type) {
@@ -1570,7 +1572,7 @@ func parseModelCatalogValue(root any) []Model {
 						seen[id] = true
 						out = append(out, Model{
 							ID:                     id,
-							Name:                   model.name,
+							Name:                   normalizeAccioModelDisplayName(model, displayLabels),
 							Provider:               Provider,
 							Description:            providerName,
 							Context:                model.context,
@@ -1598,6 +1600,8 @@ func parseModelCatalogValue(root any) []Model {
 type catalogModelInfo struct {
 	id                     string
 	name                   string
+	modelName              string
+	description            string
 	context                int64
 	multimodal             bool
 	reasoningEfforts       []string
@@ -1608,20 +1612,27 @@ type catalogModelInfo struct {
 
 func catalogModel(v map[string]any) (catalogModelInfo, bool) {
 	id := firstString(v, "modelCode", "modelId", "model_id", "code")
-	name := firstString(v, "modelDisplayName", "displayName", "modelName", "name", "label")
+	modelName := firstString(v, "modelName")
+	name := firstString(v, "modelDisplayName", "displayName", "name", "label")
+	description := firstString(v, "modelDesc", "hoverDesc", "usageDesc")
 	if name == "" {
-		name = firstString(v, "modelDesc", "hoverDesc")
+		name = modelName
+	}
+	if name == "" {
+		name = description
 	}
 	// modelName is also used as the ID by some catalog versions.
 	if id == "" {
-		id = firstString(v, "modelName")
+		id = modelName
 	}
-	if id == "" || name == "" {
+	if id == "" {
 		return catalogModelInfo{}, false
 	}
 	return catalogModelInfo{
 		id:                     strings.TrimPrefix(id, "accio/"),
 		name:                   name,
+		modelName:              modelName,
+		description:            description,
 		context:                firstInt64(v, "contextWindow", "context_window", "contextLength", "context_length"),
 		multimodal:             firstBool(v, "multimodal", "isMultimodal", "supportsMultimodal"),
 		reasoningEfforts:       stringList(v["reasoningEfforts"]),
@@ -1629,6 +1640,97 @@ func catalogModel(v map[string]any) (catalogModelInfo, bool) {
 		freeUse:                firstBool(v, "freeUse", "free_use"),
 		locked:                 firstBool(v, "locked"),
 	}, true
+}
+
+// collectAccioDisplayLabels mirrors the renderer's labelList mapping. Accio
+// can return an opaque modelCode/modelName pair while putting the human name
+// in ext.labelList[]. The code remains the request ID; only the visible name
+// is replaced here.
+func collectAccioDisplayLabels(root any) map[string]string {
+	labels := make(map[string]string)
+	var walk func(any)
+	walk = func(value any) {
+		switch v := value.(type) {
+		case []any:
+			for _, item := range v {
+				walk(item)
+			}
+		case map[string]any:
+			if list, ok := v["labelList"]; ok {
+				if items, ok := list.([]any); ok {
+					for _, item := range items {
+						label, ok := item.(map[string]any)
+						if !ok || strings.EqualFold(firstString(label, "labelKey"), "auto") {
+							continue
+						}
+						target := accioModelCodeKey(firstString(label, "targetModelCode", "modelCode"))
+						name := firstString(label, "displayName", "name", "label")
+						if target != "" && name != "" {
+							labels[target] = name
+						}
+					}
+				}
+			}
+			for _, child := range v {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return labels
+}
+
+func normalizeAccioModelDisplayName(model catalogModelInfo, labels map[string]string) string {
+	if label := labels[accioModelCodeKey(model.id)]; label != "" {
+		return label
+	}
+	for _, candidate := range []string{model.name, model.modelName} {
+		if candidate != "" && !isOpaqueAccioModelName(candidate, model.id) {
+			return candidate
+		}
+	}
+	if model.description != "" && !isOpaqueAccioModelName(model.description, model.id) {
+		return model.description
+	}
+	return friendlyAccioModelName(model.id)
+}
+
+func accioModelCodeKey(value string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(value), "accio/"))
+}
+
+func isOpaqueAccioModelName(name, id string) bool {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "accio/")
+	id = strings.TrimPrefix(strings.TrimSpace(id), "accio/")
+	if name == "" || id == "" || !strings.EqualFold(name, id) {
+		return false
+	}
+	prefix, suffix, ok := strings.Cut(name, "-")
+	return ok && strings.HasPrefix(prefix, "1") && len(suffix) >= 8
+}
+
+func friendlyAccioModelName(id string) string {
+	raw := strings.TrimPrefix(strings.TrimSpace(id), "accio/")
+	prefix, suffix, found := strings.Cut(raw, "-")
+	family := strings.TrimPrefix(prefix, "1")
+	if family == "" {
+		return "Accio model"
+	}
+	family = titleAccioModelToken(family)
+	if found && suffix != "" {
+		return family + " - " + suffix
+	}
+	return family
+}
+
+func titleAccioModelToken(value string) string {
+	if value == "" {
+		return value
+	}
+	if strings.EqualFold(value, "gpt") {
+		return "GPT"
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
 }
 
 func firstBool(m map[string]any, keys ...string) bool {
