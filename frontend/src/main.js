@@ -666,10 +666,16 @@ function ensureShell() {
     }));
 
   async function switchProvider(v) {
-    if (providerStatusInfo(v)) {
-      state.menus["set-provider"]?.setValue(state.settings?.provider || "xai");
+    const statusInfo = providerStatusInfo(v);
+    if (statusInfo) {
       showProviderStatusModal(v);
-      return;
+      // Maintenance is advisory for Accio: keep the selection and continue
+      // through the normal login/model-loading flow. Disabled providers stay
+      // blocked at the selector.
+      if (statusInfo.status === "disabled") {
+        state.menus["set-provider"]?.setValue(state.settings?.provider || "xai");
+        return;
+      }
     }
     if (v === "deepseek") {
       // Chave já salva → conecta direto (sem modal). Modal só quando não há chave.
@@ -1431,8 +1437,8 @@ function providerStatusInfo(provider) {
       badge: "EM MANUTEN\u00c7\u00c3O",
       label: "Em manuten\u00e7\u00e3o",
       symbol: "A",
-      message: "Sinto muito, mas infelizmente esse provedor se encontra em manuten\u00e7\u00e3o por enquanto. Tente outro.",
-      detail: "A rota Accio est\u00e1 recebendo ajustes e voltar\u00e1 assim que estiver pronta.",
+      message: "Sinto muito, mas infelizmente esse provedor se encontra em manuten\u00e7\u00e3o por enquanto. O uso continua liberado, mas podem ocorrer problemas e erros.",
+      detail: "A rota Accio est\u00e1 recebendo ajustes. Voc\u00ea ainda pode usar o provedor; se uma request falhar, tente novamente ou confira o erro retornado.",
     };
   }
   return null;
@@ -2187,10 +2193,12 @@ async function submit() {
   // Provedores API key (DeepSeek, Qwen, Ollie, Gemini) não usam pool de contas —
   // só provedores de sessão (xAI/Kimi/Accio) exigem conta selecionada.
   const pNow = (state.settings?.provider || "xai").toLowerCase();
-  if (providerStatusInfo(pNow)) {
+  const statusInfo = providerStatusInfo(pNow);
+  if (statusInfo?.status === "disabled") {
     showProviderStatusModal(pNow);
     return;
   }
+  if (statusInfo?.status === "maintenance") showProviderStatusModal(pNow);
   if (providerAuthMode(pNow) === "auth" && !activeAccount()) {
     alert("Adicione e selecione uma conta primeiro.");
     return;

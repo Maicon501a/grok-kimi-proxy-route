@@ -15,6 +15,14 @@ func TestProviderAvailability(t *testing.T) {
 		if got := ProviderAvailability(provider); got != "maintenance" {
 			t.Fatalf("ProviderAvailability(%q) = %q, want maintenance", provider, got)
 		}
+		if ProviderAvailabilityBlocksRequests(provider) {
+			t.Fatalf("ProviderAvailabilityBlocksRequests(%q) = true, want advisory maintenance", provider)
+		}
+	}
+	for _, provider := range []string{ProviderOllie, ProviderGemini, ProviderQwen} {
+		if !ProviderAvailabilityBlocksRequests(provider) {
+			t.Fatalf("ProviderAvailabilityBlocksRequests(%q) = false, want disabled block", provider)
+		}
 	}
 	for _, provider := range []string{ProviderXAI, ProviderKimiWork, ProviderDeepSeek, ProviderOpenCodeZen} {
 		if got := ProviderAvailability(provider); got != "" {

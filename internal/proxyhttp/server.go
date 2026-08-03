@@ -1192,7 +1192,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	baseSettings := s.store.Settings()
 	routeSettings := baseSettings.WithProviderForModel(reqModel)
 	routeProv := routeSettings.NormalizedProvider()
-	if message := store.ProviderAvailabilityMessage(routeProv); message != "" {
+	if message := store.ProviderAvailabilityMessage(routeProv); message != "" && store.ProviderAvailabilityBlocksRequests(routeProv) {
 		typ := "provider_disabled"
 		if store.ProviderAvailability(routeProv) == "maintenance" {
 			typ = "provider_maintenance"

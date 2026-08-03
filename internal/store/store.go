@@ -103,10 +103,17 @@ func ProviderAvailabilityMessage(provider string) string {
 	case "disabled":
 		return "Este provedor está desativado no momento. Tente outro provedor."
 	case "maintenance":
-		return "Este provedor está em manutenção no momento. Tente outro provedor."
+		return "Este provedor está em manutenção. O uso continua liberado, mas podem ocorrer problemas e erros."
 	default:
 		return ""
 	}
+}
+
+// ProviderAvailabilityBlocksRequests keeps maintenance as an advisory state.
+// Disabled providers remain blocked, while Accio can continue serving traffic
+// during maintenance so the user can test the route and see its real errors.
+func ProviderAvailabilityBlocksRequests(provider string) bool {
+	return ProviderAvailability(provider) == "disabled"
 }
 
 type LoadBalancerStrategy string

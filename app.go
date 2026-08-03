@@ -1467,7 +1467,7 @@ func (a *App) CancelChat() {
 // Provider is chosen from the request model (same as HTTP proxy), not the UI global.
 func (a *App) SendChat(req upstream.ChatRequest) error {
 	route := a.store.Settings().WithProviderForModel(req.Model)
-	if message := store.ProviderAvailabilityMessage(route.NormalizedProvider()); message != "" {
+	if message := store.ProviderAvailabilityMessage(route.NormalizedProvider()); message != "" && store.ProviderAvailabilityBlocksRequests(route.NormalizedProvider()) {
 		return errors.New(message)
 	}
 	ctxRoute := proxyhttp.WithRouteProvider(a.ctx, route.NormalizedProvider())
