@@ -91,6 +91,16 @@ func killOtherGrokDesktopProcesses() {
 	time.Sleep(400 * time.Millisecond)
 }
 
+// writeIgnoreErr forwards to w, discarding errors. On a GUI-subsystem exe
+// os.Stdout is an invalid handle; letting that error stop io.MultiWriter
+// would silently kill the file log too.
+type writeIgnoreErr struct{ w io.Writer }
+
+func (t writeIgnoreErr) Write(p []byte) (int, error) {
+	n, _ := t.w.Write(p)
+	return n, nil
+}
+
 func setupFileLog() {
 	dir, err := defaultLogDir()
 	if err != nil {
@@ -102,7 +112,7 @@ func setupFileLog() {
 	if err != nil {
 		return
 	}
-	mw := io.MultiWriter(os.Stdout, f)
+	mw := io.MultiWriter(writeIgnoreErr{w: os.Stdout}, f)
 	log.SetOutput(mw)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	logging.SetOutput(mw)

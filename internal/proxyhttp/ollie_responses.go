@@ -2,6 +2,7 @@ package proxyhttp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,10 +15,12 @@ import (
 
 // pipeOllieChatSSEToResponses translates chat SSE into a minimal Responses SSE stream.
 func pipeOllieChatSSEToResponses(w http.ResponseWriter, body io.Reader, model string) error {
+	return pipeOllieChatSSEToResponsesContext(context.Background(), w, body, model)
+}
+
+func pipeOllieChatSSEToResponsesContext(ctx context.Context, w http.ResponseWriter, body io.Reader, model string) error {
 	flusher, _ := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	setSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	id := "resp_" + uuid.NewString()
@@ -40,7 +43,7 @@ func pipeOllieChatSSEToResponses(w http.ResponseWriter, body io.Reader, model st
 		},
 	})
 
-	sc := bufio.NewScanner(body)
+	sc := bufio.NewScanner(newContextReader(ctx, body))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var content strings.Builder
 	for sc.Scan() {

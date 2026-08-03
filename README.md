@@ -46,6 +46,18 @@
 | **Kimi Work** | **Auth** (pool de sessão) | **Login com Google** (navegador do sistema) → mint `sk-kimi` | **`POST /v1/chat/completions`** | `kimi-for-coding`, `k3-agent`, `k3-agent-{low,medium,high,xhigh}`, `k2d6-agent` |
 | **Qwen** | **API key** (bridge) | UI → provider Qwen → base URL + API key do QwenBridge | **`POST /v1/chat/completions`** (+ conversão responses/messages) | Catálogo dinâmico via probe (`/v1/models` do bridge) |
 
+### OpenCode Zen Free (nativo, sem terminal)
+
+O Grok Proxy chama `https://opencode.ai/zen/v1` diretamente, injeta `Authorization: Bearer public` e remove o prefixo `opencode/` antes de enviar o model ao Zen. Basta selecionar **OpenCode Zen Free** na UI ou usar um model `opencode/*` no proxy local; não é necessário instalar ou manter `opencode serve` rodando.
+
+Modelos free expostos: `opencode/deepseek-v4-flash-free`, `opencode/mimo-v2.5-free`, `opencode/nemotron-3-ultra-free`, `opencode/north-mini-code-free`, `opencode/ling-3.0-flash-free`, `opencode/laguna-s-2.1-free` e `opencode/big-pickle`.
+
+### Failover WARP do Zen
+
+Quando o Zen responde `500 Internal server error` no envelope do gateway, ou `429/502/503/504`, o proxy ativa o WARP automaticamente via `warp-cli` e repete a mesma request uma única vez pelo SOCKS5 local (`127.0.0.1:40000`). Falhas de rede também acionam o mesmo caminho. Erros de autenticação, modelo ou validação não são repetidos cegamente; streams que já começaram não são replayados.
+
+O estado aparece em `GET /health` no campo `warp`. O padrão é ativo; pode ser desativado com `WARP_AUTO_FAILOVER=false`. Ajustes opcionais: `WARP_SOCKS_PORT`, `WARP_SOCKS_HOST`, `WARP_BIN_PATH`, `WARP_COOLDOWN` e `WARP_STARTUP_WAIT`.
+
 ### Regras de roteamento (v1.3+)
 
 - O **modelo escolhido na UI do app** vale **somente no chat interno**. **Não** reescreve o `model` das requests HTTP (OpenCode/Cursor/SDK/Kilo).

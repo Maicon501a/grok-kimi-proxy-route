@@ -16,7 +16,7 @@ import (
 )
 
 // recordUsageFromJSONBody parses OpenAI chat/completions or responses JSON and persists usage/cost.
-func (s *Server) recordUsageFromJSONBody(raw []byte, accountID, model string, latencyMs int64) {
+func (s *Server) recordUsageFromJSONBody(raw []byte, accountID, provider, model string, latencyMs int64) {
 	if s == nil || s.store == nil || len(raw) == 0 {
 		return
 	}
@@ -27,7 +27,7 @@ func (s *Server) recordUsageFromJSONBody(raw []byte, accountID, model string, la
 	if model == "" {
 		model = extractModelFromBody(raw)
 	}
-	s.persistUsage(accountID, model, prompt, completion, reasoning, cached, total, latencyMs, false)
+	s.persistUsage(accountID, provider, model, prompt, completion, reasoning, cached, total, latencyMs, false)
 }
 
 // usageTeeReader copies SSE to the client while capturing the last usage payload.
@@ -81,7 +81,7 @@ func (t *usageTeeReader) inspectSSELine(line []byte) {
 	t.lastJSON = append([]byte(nil), []byte(data)...)
 }
 
-func (s *Server) recordUsageFromSSECapture(raw []byte, accountID, model string, latencyMs int64) {
+func (s *Server) recordUsageFromSSECapture(raw []byte, accountID, provider, model string, latencyMs int64) {
 	if s == nil || s.store == nil || len(raw) == 0 {
 		return
 	}
@@ -96,17 +96,17 @@ func (s *Server) recordUsageFromSSECapture(raw []byte, accountID, model string, 
 	if model == "" {
 		model = extractModelFromBody(raw)
 	}
-	s.persistUsage(accountID, model, prompt, completion, reasoning, cached, total, latencyMs, false)
+	s.persistUsage(accountID, provider, model, prompt, completion, reasoning, cached, total, latencyMs, false)
 }
 
-func (s *Server) persistUsage(accountID, model string, prompt, completion, reasoning, cached, total, latencyMs int64, estimated bool) {
+func (s *Server) persistUsage(accountID, provider, model string, prompt, completion, reasoning, cached, total, latencyMs int64, estimated bool) {
 	if total == 0 {
 		total = prompt + completion + reasoning
 	}
 	if prompt == 0 && completion == 0 && reasoning == 0 {
 		return
 	}
-	cost := pricing.CostUSD(model, prompt, completion, reasoning, cached)
+	cost := pricing.CostUSD(model, provider, prompt, completion, reasoning, cached)
 	sample := store.RequestSample{
 		ID:               "req_" + uuid.NewString(),
 		At:               time.Now().UTC().Format(time.RFC3339),

@@ -141,11 +141,44 @@ export function ensureShell() {
   $("#btn-stats").onclick = openStatsModal;
   $("#btn-stats-top").onclick = openStatsModal;
 
-  const effortOpts = [
+  const fallbackEffortOpts = [
     { value: "low", label: "Low" },
     { value: "medium", label: "Medium" },
     { value: "high", label: "High" },
   ];
+  const selectedModelId = (composer = false) =>
+    composer
+      ? state.picks.cModel || state.settings.default_model
+      : state.picks.model || state.settings.default_model;
+  const effortOptionsForModel = (modelId) => {
+    const model = state.models.find((m) => m.id === modelId);
+    const efforts = Array.isArray(model?.reasoning_efforts)
+      ? model.reasoning_efforts.filter(Boolean)
+      : [];
+    return efforts.length
+      ? efforts.map((value) => ({ value, label: value }))
+      : fallbackEffortOpts;
+  };
+  const syncEffortMenus = () => {
+    const globalOptions = effortOptionsForModel(selectedModelId(false));
+    const composerOptions = effortOptionsForModel(selectedModelId(true));
+    state.menus["set-effort"]?.refresh?.();
+    state.menus["c-effort"]?.refresh?.();
+    const globalCurrent = globalOptions.some((o) => o.value === state.picks.effort)
+      ? state.picks.effort
+      : globalOptions[0]?.value;
+    const composerCurrent = composerOptions.some((o) => o.value === state.picks.cEffort)
+      ? state.picks.cEffort
+      : composerOptions[0]?.value;
+    if (globalCurrent) {
+      state.picks.effort = globalCurrent;
+      state.menus["set-effort"]?.setValue(globalCurrent);
+    }
+    if (composerCurrent) {
+      state.picks.cEffort = composerCurrent;
+      state.menus["c-effort"]?.setValue(composerCurrent);
+    }
+  };
   const apiOpts = [
     { value: "chat", label: "Chat" },
     { value: "responses", label: "Responses" },
@@ -161,7 +194,7 @@ export function ensureShell() {
 
   mountMenu($("#set-effort"), {
     id: "set-effort",
-    options: effortOpts,
+    options: () => effortOptionsForModel(selectedModelId(false)),
     value: state.picks.effort,
     onChange: (v) => {
       state.picks.effort = v;
@@ -189,6 +222,7 @@ export function ensureShell() {
       state.picks.model = v;
       state.picks.cModel = v;
       state.menus["c-model"]?.setValue(v);
+      syncEffortMenus();
       saveGlobal({ default_model: v });
     },
   });
@@ -228,11 +262,12 @@ export function ensureShell() {
     chip: true,
     onChange: (v) => {
       state.picks.cModel = v;
+      syncEffortMenus();
     },
   });
   mountMenu($("#c-effort"), {
     id: "c-effort",
-    options: effortOpts.map((o) => ({ ...o, label: o.value })),
+    options: () => effortOptionsForModel(selectedModelId(true)),
     value: state.picks.cEffort,
     prefix: "think",
     chip: true,
@@ -274,6 +309,16 @@ export function fillModels() {
     state.menus["c-model"].setValue(prefer);
     state.picks.cModel = prefer;
   }
+  const selected = state.models.find((m) => m.id === prefer);
+  const defaultEffort = selected?.default_reasoning_effort;
+  if (defaultEffort) {
+    state.picks.effort = defaultEffort;
+    state.picks.cEffort = defaultEffort;
+  }
+  state.menus["set-effort"]?.refresh?.();
+  state.menus["c-effort"]?.refresh?.();
+  state.menus["set-effort"]?.setValue(state.picks.effort);
+  state.menus["c-effort"]?.setValue(state.picks.cEffort);
 }
 
 function accountBadges(a) {
@@ -527,10 +572,21 @@ export async function refreshBootstrap(full = true) {
     try {
       state.models = await ListModels();
     } catch (_) {
-      state.models = [
-        { id: "grok-4.5", name: "Grok 4.5" },
-        { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
-      ];
+      const p = (state.settings?.provider || "xai").toLowerCase();
+      state.models = ["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)
+        ? [
+            { id: "opencode/deepseek-v4-flash-free", name: "DeepSeek V4 Flash Free" },
+            { id: "opencode/big-pickle", name: "Big Pickle Free" },
+            { id: "opencode/mimo-v2.5-free", name: "MiMo V2.5 Free" },
+            { id: "opencode/nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free" },
+            { id: "opencode/north-mini-code-free", name: "North Mini Code Free" },
+            { id: "opencode/ling-3.0-flash-free", name: "Ling 3.0 Flash Free" },
+            { id: "opencode/laguna-s-2.1-free", name: "Laguna S 2.1 Free" },
+          ]
+        : [
+            { id: "grok-4.5", name: "Grok 4.5" },
+            { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
+          ];
     }
   }
   paintChrome();

@@ -16,17 +16,31 @@ import (
 	"grok-desktop/internal/httperr"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
+	"grok-desktop/internal/warp"
 )
 
 type Client struct {
 	HTTP *http.Client
+	Warp *warp.Manager
 }
 
 func New() *Client {
 	return &Client{
 		HTTP: &http.Client{
 			Timeout: 0, // streaming
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				ForceAttemptHTTP2:     true,
+				DisableCompression:    true,
+				MaxIdleConns:          64,
+				MaxIdleConnsPerHost:   16,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 120 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
 		},
+		Warp: warp.Default(),
 	}
 }
 
@@ -79,11 +93,16 @@ type Usage struct {
 }
 
 type ModelInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
-	APIMode     string `json:"api_mode,omitempty"`
-	Root        string `json:"root,omitempty"`
+	ID                     string   `json:"id"`
+	Name                   string   `json:"name,omitempty"`
+	Description            string   `json:"description,omitempty"`
+	APIMode                string   `json:"api_mode,omitempty"`
+	Root                   string   `json:"root,omitempty"`
+	ContextWindow          int64    `json:"context_window,omitempty"`
+	ReasoningEfforts       []string `json:"reasoning_efforts,omitempty"`
+	DefaultReasoningEffort string   `json:"default_reasoning_effort,omitempty"`
+	FreeUse                *bool    `json:"free_use,omitempty"`
+	Locked                 *bool    `json:"locked,omitempty"`
 }
 
 func (c *Client) baseURL(s store.Settings) string {
@@ -98,6 +117,12 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 	if token == "" && settings.IsQwen() {
 		token = strings.TrimSpace(settings.QwenAPIKey)
 	}
+	if token == "" && settings.IsDeepSeek() {
+		token = settings.DeepSeekAPIKeyPlain()
+	}
+	if token == "" && settings.IsOpenCodeZen() {
+		token = store.OpenCodeZenAPIKey
+	}
 	h.Set("Authorization", "Bearer "+token)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream, application/json")
@@ -107,6 +132,10 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 	switch {
 	case settings.IsQwen():
 		// QwenBridge: bearer only, no provider-specific headers.
+	case settings.IsDeepSeek():
+		// DeepSeek: bearer only, no provider-specific headers.
+	case settings.IsOpenCodeZen():
+		// OpenCode Zen Free: direct bearer-only gateway; no local CLI headers.
 	case settings.IsOllie():
 		h.Set("User-Agent", "grok-desktop-ollie/"+version)
 	case settings.IsKimiWork():
@@ -153,6 +182,14 @@ func (c *Client) ListModels(ctx context.Context, token string, settings store.Se
 	}
 	if settings.IsQwen() {
 		return c.listQwenModels(ctx, token, settings)
+	}
+	if settings.IsDeepSeek() {
+		return c.listDeepSeekModels(ctx, token, settings)
+	}
+	if settings.IsOpenCodeZen() {
+		// Keep the desktop catalog available even if Zen's optional /models
+		// endpoint is temporarily unavailable. Requests still go direct to Zen.
+		return OpenCodeZenFreeModels(), nil
 	}
 	url := c.baseURL(settings) + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -308,6 +345,76 @@ func qwenFallbackModels() []ModelInfo {
 	}
 }
 
+// listDeepSeekModels fetches the official DeepSeek model list (GET /models).
+// Falls back to a minimal static list when the API errors or returns nothing.
+func (c *Client) listDeepSeekModels(ctx context.Context, token string, settings store.Settings) ([]ModelInfo, error) {
+	url := c.baseURL(settings) + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return deepSeekFallbackModels(), err
+	}
+	req.Header = c.authHeaders(token, settings.ClientVersion, settings)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return deepSeekFallbackModels(), err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return deepSeekFallbackModels(), fmt.Errorf("models HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var parsed struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(b, &parsed)
+	seen := map[string]bool{}
+	out := make([]ModelInfo, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		name := m.Name
+		if name == "" {
+			name = m.ID
+		}
+		out = append(out, ModelInfo{
+			ID: m.ID, Name: name, Description: "DeepSeek API · chat/completions", APIMode: "chat",
+		})
+	}
+	if len(out) == 0 {
+		return deepSeekFallbackModels(), nil
+	}
+	return out, nil
+}
+
+func deepSeekFallbackModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: store.DeepSeekDefaultModel, Name: store.DeepSeekDefaultModel, Description: "DeepSeek API · chat/completions", APIMode: "chat"},
+		{ID: store.DeepSeekProModel, Name: store.DeepSeekProModel, Description: "DeepSeek API · reasoning · chat/completions", APIMode: "chat"},
+	}
+}
+
+// OpenCodeZenFreeModels is the native, keyless model catalog used by the
+// Grok proxy route. IDs keep the opencode/ namespace so clients can select
+// Zen unambiguously; ResolveModelForClient strips it on the wire.
+func OpenCodeZenFreeModels() []ModelInfo {
+	free := true
+	return []ModelInfo{
+		{ID: "opencode/deepseek-v4-flash-free", Name: "DeepSeek V4 Flash Free", Description: "OpenCode Zen Â· free Â· chat/completions", APIMode: "chat", FreeUse: &free},
+		{ID: "opencode/big-pickle", Name: "Big Pickle", Description: "OpenCode Zen Â· free Â· chat/completions", APIMode: "chat", FreeUse: &free},
+		{ID: "opencode/mimo-v2.5-free", Name: "MiMo V2.5 Free", Description: "OpenCode Zen Â· free Â· multimodal", APIMode: "chat", FreeUse: &free},
+		{ID: "opencode/nemotron-3-ultra-free", Name: "Nemotron 3 Ultra Free", Description: "OpenCode Zen Â· free Â· chat/completions", APIMode: "chat", FreeUse: &free},
+		{ID: "opencode/north-mini-code-free", Name: "North Mini Code Free", Description: "OpenCode Zen Â· free Â· chat/completions", APIMode: "chat", FreeUse: &free},
+		{ID: "opencode/ling-3.0-flash-free", Name: "Ling 3.0 Flash Free", Description: "OpenCode Zen Â· free Â· chat/completions", APIMode: "chat", FreeUse: &free},
+		{ID: "opencode/laguna-s-2.1-free", Name: "Laguna S 2.1 Free", Description: "OpenCode Zen Â· free Â· chat/completions", APIMode: "chat", FreeUse: &free},
+	}
+}
+
 func ollieFallbackModels() []ModelInfo {
 	ids := []string{
 		"claude-sonnet-5", "claude-opus-4-8", "claude-fable-5",
@@ -387,10 +494,10 @@ func (c *Client) StreamChat(
 	var streamErr error
 	if settings.IsGemini() {
 		streamErr = c.streamGemini(ctx, settings, model, req, emit)
-	} else if settings.IsKimiWork() || settings.IsOllie() || settings.IsQwen() || strings.EqualFold(req.APIMode, "chat") {
+	} else if settings.IsKimiWork() || settings.IsOllie() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || strings.EqualFold(req.APIMode, "chat") {
 		// OllieChat (and explicit chat mode): OpenAI chat/completions.
 		// Kimi Work coding gateway only exposes /chat/completions (no /responses).
-		// Ollie is chat-only. QwenBridge is wired chat-only.
+		// Ollie is chat-only. QwenBridge / DeepSeek are wired chat-only.
 		if settings.IsKimiWork() {
 			model = resolveKimiUpstreamModel(model)
 		}
@@ -614,6 +721,31 @@ func (c *Client) streamChatCompletions(
 	} else if effort != "" && !settings.IsKimiWork() {
 		body["reasoning_effort"] = effort
 	}
+	// DeepSeek thinking mode: official docs accept reasoning_effort
+	// low/high/xhigh/max + thinking toggle; the API maps requested effort
+	// xhigh → max (v4-pro) / high (v4-flash), and "medium" is not accepted.
+	// We translate UI effort levels to the closest accepted value.
+	if settings.IsDeepSeek() {
+		eff := strings.ToLower(strings.TrimSpace(effort))
+		switch eff {
+		case "":
+			// Client sent nothing — no effort, no thinking override.
+		case "off", "none", "disabled":
+			body["thinking"] = map[string]any{"type": "disabled"}
+		case "low":
+			body["reasoning_effort"] = "low"
+			body["thinking"] = map[string]any{"type": "enabled"}
+		case "medium":
+			body["reasoning_effort"] = "high" // medium não existe na API
+			body["thinking"] = map[string]any{"type": "enabled"}
+		case "xhigh", "extra_high", "extra-high", "max":
+			body["reasoning_effort"] = "max"
+			body["thinking"] = map[string]any{"type": "enabled"}
+		default:
+			body["reasoning_effort"] = "high"
+			body["thinking"] = map[string]any{"type": "enabled"}
+		}
+	}
 	if req.Temperature > 0 {
 		body["temperature"] = req.Temperature
 	}
@@ -637,15 +769,21 @@ func (c *Client) streamChatCompletions(
 	}
 	raw, _ := json.Marshal(body)
 	url := c.baseURL(settings) + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	httpReq.Header = c.authHeaders(token, settings.ClientVersion, settings)
 
 	t0 := time.Now()
 	var ttftMs int64
-	resp, err := c.HTTP.Do(httpReq)
+	var resp *http.Response
+	var err error
+	if settings.IsOpenCodeZen() {
+		resp, err = c.doZenChatRequest(ctx, url, raw, token, settings, model)
+	} else {
+		var httpReq *http.Request
+		httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+		if err == nil {
+			httpReq.Header = c.authHeaders(token, settings.ClientVersion, settings)
+			resp, err = c.HTTP.Do(httpReq)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -687,8 +825,6 @@ func (c *Client) streamChatCompletions(
 		}
 		// Detect mid-stream quota error (upstream may embed error inside SSE).
 		if isQuota, qmsg := isQuotaPayload(chunk); isQuota {
-			emit(StreamEvent{Type: "error", Error: qmsg, Model: outModel})
-			emit(StreamEvent{Type: "done", Model: outModel})
 			return fmt.Errorf("sse quota error: %s", qmsg)
 		}
 		if id == "" {
@@ -727,6 +863,12 @@ func (c *Client) streamChatCompletions(
 			usage = parseChatUsage(u)
 		}
 	}
+	if err := sc.Err(); err != nil {
+		// Do not emit usage/done for a truncated stream. The caller can then
+		// surface one clean error instead of a false completion followed by an
+		// error event.
+		return err
+	}
 	lat := time.Since(t0).Milliseconds()
 	estimated := false
 	if usage == nil || (usage.PromptTokens == 0 && usage.CompletionTokens == 0) {
@@ -751,7 +893,77 @@ func (c *Client) streamChatCompletions(
 		Type: "done", ID: id, Model: outModel, Usage: usage,
 		LatencyMs: lat, TTFTMs: ttftMs, Estimated: estimated,
 	})
-	return sc.Err()
+	return nil
+}
+
+// doZenChatRequest makes the normal Zen request first. If the gateway returns
+// an egress-sensitive failure (including its 500 Internal server error
+// envelope), WARP is activated once and the exact request is replayed through
+// the local SOCKS5 endpoint. A request that already started streaming is never
+// replayed here because this function only handles the response headers.
+func (c *Client) doZenChatRequest(
+	ctx context.Context,
+	url string,
+	raw []byte,
+	token string,
+	settings store.Settings,
+	model string,
+) (*http.Response, error) {
+	doRequest := func(viaWarp bool) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = c.authHeaders(token, settings.ClientVersion, settings)
+		client := c.HTTP
+		if viaWarp && c.Warp != nil {
+			client = c.Warp.HTTPClient(c.HTTP)
+		}
+		return client.Do(req)
+	}
+
+	viaWarp := c.Warp != nil && c.Warp.IsActive()
+	resp, err := doRequest(viaWarp)
+	if err != nil {
+		if viaWarp && c.Warp != nil && c.Warp.Enabled() && warp.IsNetworkFailure(err) {
+			c.Warp.MarkInactive(err.Error())
+			logging.Warn("zen.warp.stale_state", "model", model, "error", err.Error())
+			return doRequest(false)
+		}
+		if !viaWarp && c.Warp != nil && c.Warp.Enabled() && warp.IsNetworkFailure(err) {
+			logging.Warn("zen.warp.failover.trigger", "model", model, "reason", "network", "error", err.Error())
+			if activateErr := c.Warp.Activate(ctx); activateErr == nil {
+				viaWarp = true
+				resp, err = doRequest(true)
+			} else {
+				logging.Warn("zen.warp.failover.activation_failed", "model", model, "error", activateErr.Error())
+			}
+		}
+		return resp, err
+	}
+	if resp.StatusCode < 400 || viaWarp || c.Warp == nil || !c.Warp.Enabled() {
+		return resp, nil
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	status := resp.StatusCode
+	contentType := resp.Header.Get("Content-Type")
+	resp.Body.Close()
+	if !warp.ShouldFailover(status, body) {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp, nil
+	}
+	logging.Warn("zen.warp.failover.trigger", "model", model, "reason", "upstream", "status", status)
+	activateErr := c.Warp.Activate(ctx)
+	if activateErr == nil {
+		logging.Info("zen.warp.failover.retry", "model", model, "status", status)
+		return doRequest(true)
+	}
+	logging.Warn("zen.warp.failover.activation_failed", "model", model, "status", status, "error", activateErr.Error())
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.StatusCode = status
+	resp.Header.Set("Content-Type", contentType)
+	return resp, nil
 }
 
 func (c *Client) streamResponses(
@@ -859,8 +1071,6 @@ func (c *Client) streamResponses(
 		}
 		// Detect mid-stream quota error (upstream may embed error inside SSE).
 		if isQuota, qmsg := isQuotaPayload(obj); isQuota {
-			emit(StreamEvent{Type: "error", Error: qmsg, Model: outModel})
-			emit(StreamEvent{Type: "done", Model: outModel})
 			return fmt.Errorf("sse quota error: %s", qmsg)
 		}
 		typ, _ := obj["type"].(string)
@@ -941,6 +1151,9 @@ func (c *Client) streamResponses(
 		}
 		eventName = ""
 	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
 	lat := time.Since(t0).Milliseconds()
 	estimated := false
 	if usage == nil || (usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0) {
@@ -963,7 +1176,7 @@ func (c *Client) streamResponses(
 		Type: "done", ID: id, Model: outModel, Usage: usage,
 		LatencyMs: lat, TTFTMs: ttftMs, Estimated: estimated,
 	})
-	return sc.Err()
+	return nil
 }
 
 func messagesToResponsesInput(msgs []ChatMessage) any {

@@ -57,6 +57,14 @@ func tokenAccountForSettings(
 			AccessToken: key,
 			APIKey:      key,
 		}
+	case settings.IsDeepSeek():
+		key := settings.DeepSeekAPIKeyPlain()
+		return key, &store.Account{
+			ID: "deepseek", Provider: store.ProviderDeepSeek, Label: "DeepSeek",
+			Email:       store.DeepSeekUpstream,
+			AccessToken: key,
+			APIKey:      key,
+		}
 	case settings.IsOllie():
 		return store.OllieAPIKey, &store.Account{
 			ID: "ollie", Label: "OllieChat", Email: "keyless@olliechat",

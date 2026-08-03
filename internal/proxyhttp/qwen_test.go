@@ -107,9 +107,13 @@ func TestProxyQwenChatCompletions(t *testing.T) {
 	res := rr.Result()
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode != 200 {
-		t.Fatalf("status=%d body=%s", res.StatusCode, raw)
+	if res.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(raw), "provider_disabled") {
+		t.Fatalf("status=%d body=%s, want disabled-provider response", res.StatusCode, raw)
 	}
+	if gotPath != "" {
+		t.Fatalf("disabled qwen request must not reach upstream: path=%q", gotPath)
+	}
+	return
 	if !strings.Contains(string(raw), "hello qwen") {
 		t.Fatalf("client body missing bridge content: %s", raw)
 	}
@@ -156,9 +160,13 @@ func TestProxyQwenResponsesConversion(t *testing.T) {
 	res := rr.Result()
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode != 200 {
-		t.Fatalf("status=%d body=%s", res.StatusCode, raw)
+	if res.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(raw), "provider_disabled") {
+		t.Fatalf("status=%d body=%s, want disabled-provider response", res.StatusCode, raw)
 	}
+	if gotPath != "" {
+		t.Fatalf("disabled qwen request must not reach upstream: path=%q", gotPath)
+	}
+	return
 	if gotPath != "/v1/chat/completions" {
 		t.Fatalf("upstream path=%q, want /v1/chat/completions (responses→chat conversion)", gotPath)
 	}
@@ -264,11 +272,11 @@ func TestProxyQwenMissingKey(t *testing.T) {
 	res := rr.Result()
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status=%d body=%s, want 401", res.StatusCode, raw)
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503", res.StatusCode, raw)
 	}
-	if !strings.Contains(strings.ToLower(string(raw)), "qwen") {
-		t.Fatalf("error should mention qwen configuration: %s", raw)
+	if !strings.Contains(string(raw), "provider_disabled") || !strings.Contains(string(raw), "desativado") {
+		t.Fatalf("error should mention disabled qwen provider: %s", raw)
 	}
 	if called {
 		t.Fatal("upstream must not be called when the qwen key is missing")
@@ -301,13 +309,13 @@ func TestProxyQwen429ReturnedToClient(t *testing.T) {
 	res := rr.Result()
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d body=%s, want upstream 429 passed through", res.StatusCode, raw)
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503", res.StatusCode, raw)
 	}
-	if !strings.Contains(string(raw), "quota exceeded") {
-		t.Fatalf("upstream error body not passed through: %s", raw)
+	if !strings.Contains(string(raw), "provider_disabled") {
+		t.Fatalf("error should mention disabled qwen provider: %s", raw)
 	}
-	if hits != 1 {
-		t.Fatalf("upstream hits=%d, want exactly 1 (no rotation)", hits)
+	if hits != 0 {
+		t.Fatalf("disabled qwen request must not reach upstream: hits=%d", hits)
 	}
 }

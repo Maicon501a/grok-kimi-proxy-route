@@ -63,6 +63,15 @@ debug-requests/
 browser-data/
 **/debug-requests/**
 
+# Reverse-engineering scratch / extracted vendor artifacts
+.accio-asar-inspect/
+/index.js
+/security-guard/
+/req*.json
+/tmp_accio_runtime_probe.js
+/tmp_security_test.mjs
+/tmp_sg_test.js
+
 # SQLite local DB (accounts/tokens live here)
 *.db
 *.sqlite

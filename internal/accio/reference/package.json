@@ -1,0 +1,22 @@
+{
+  "name": "accio-proxy",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test-adapter-contract.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^13.0.1",
+    "express": "^5.2.1",
+    "open": "^11.0.0",
+    "sql.js": "^1.14.1",
+    "ws": "^8.21.1"
+  }
+}

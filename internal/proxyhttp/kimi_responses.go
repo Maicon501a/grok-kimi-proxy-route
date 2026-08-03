@@ -2,6 +2,7 @@ package proxyhttp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,10 +22,15 @@ import (
 //   - tool_calls         → response.output_item.added / function_call_arguments.delta / output_item.done
 //   - usage              → attached on response.completed
 func pipeKimiChatSSEToResponses(w http.ResponseWriter, body io.Reader, model string) error {
+	return pipeKimiChatSSEToResponsesContext(context.Background(), w, body, model)
+}
+
+// pipeKimiChatSSEToResponsesContext is the request-scoped variant used by the
+// HTTP proxy. Cancelling the client request must stop the scanner immediately,
+// otherwise a quiet upstream can keep a proxy goroutine alive indefinitely.
+func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWriter, body io.Reader, model string) error {
 	flusher, _ := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
+	setSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	respID := "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -66,7 +72,7 @@ func pipeKimiChatSSEToResponses(w http.ResponseWriter, body io.Reader, model str
 	var sawContent bool
 	var sawToolCall bool
 
-	sc := bufio.NewScanner(body)
+	sc := bufio.NewScanner(newContextReader(ctx, body))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	for sc.Scan() {
@@ -193,10 +199,10 @@ func pipeKimiChatSSEToResponses(w http.ResponseWriter, body io.Reader, model str
 					if fn, ok := tc["function"].(map[string]any); ok {
 						if args, ok := fn["arguments"].(string); ok && args != "" {
 							writeEvent("response.function_call_arguments.delta", map[string]any{
-								"type":     "response.function_call_arguments.delta",
-								"item_id":  t.id,
-								"call_id":  t.id,
-								"delta":    args,
+								"type":    "response.function_call_arguments.delta",
+								"item_id": t.id,
+								"call_id": t.id,
+								"delta":   args,
 							})
 						}
 					}
@@ -323,4 +329,3 @@ func normalizeUsageToResponses(u any) map[string]any {
 	}
 	return out
 }
-

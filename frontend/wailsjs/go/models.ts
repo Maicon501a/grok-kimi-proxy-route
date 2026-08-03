@@ -95,6 +95,7 @@ export namespace store {
 	    gemini_location?: string;
 	    qwen_upstream?: string;
 	    qwen_api_key?: string;
+	    deepseek_api_key?: string;
 	    theme_accent?: string;
 	    kimi_stealth_headless: boolean;
 	    google_email?: string;
@@ -123,6 +124,7 @@ export namespace store {
 	        this.gemini_location = source["gemini_location"];
 	        this.qwen_upstream = source["qwen_upstream"];
 	        this.qwen_api_key = source["qwen_api_key"];
+	        this.deepseek_api_key = source["deepseek_api_key"];
 	        this.theme_accent = source["theme_accent"];
 	        this.kimi_stealth_headless = source["kimi_stealth_headless"];
 	        this.google_email = source["google_email"];
@@ -249,6 +251,11 @@ export namespace upstream {
 	    description?: string;
 	    api_mode?: string;
 	    root?: string;
+	    context_window?: number;
+	    reasoning_efforts?: string[];
+	    default_reasoning_effort?: string;
+	    free_use?: boolean;
+	    locked?: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new ModelInfo(source);
@@ -261,6 +268,11 @@ export namespace upstream {
 	        this.description = source["description"];
 	        this.api_mode = source["api_mode"];
 	        this.root = source["root"];
+	        this.context_window = source["context_window"];
+	        this.reasoning_efforts = source["reasoning_efforts"];
+	        this.default_reasoning_effort = source["default_reasoning_effort"];
+	        this.free_use = source["free_use"];
+	        this.locked = source["locked"];
 	    }
 	}
 

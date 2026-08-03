@@ -14,6 +14,9 @@ import {
   RenameAccount,
   StartDeviceLogin,
   CancelDeviceLogin,
+  StartAccioLogin,
+  AccioStatus,
+  AccioCredits,
   OpenExternal,
   UpdateSettings,
   SendChat,
@@ -60,6 +63,10 @@ const state = {
   sessionCost: 0,
   sessionLat: null,
   logs: [],
+  logsModal: null,
+  lastChatEventLogAt: 0,
+  accioCredits: null,
+  accioPolling: false,
   // custom dropdowns
   picks: {
     effort: "high",
@@ -71,6 +78,10 @@ const state = {
   },
   menus: {},
 };
+
+// Completed turns are immutable. Cache their sanitized markdown so a long
+// streaming answer does not re-parse the whole conversation every frame.
+const messageMarkupCache = new WeakMap();
 
 /** Short label for long model ids (Ollie full paths, aliases, etc.). */
 function shortModelLabel(name, id) {
@@ -89,6 +100,73 @@ function shortModelLabel(name, id) {
   // keep chip readable
   if (s.length > 28) s = s.slice(0, 26) + "…";
   return s;
+}
+
+// Keep this at module scope: refreshBootstrap() runs outside ensureShell().
+function fallbackModels(prov) {
+  const p = (prov || state.settings?.provider || "xai").toLowerCase();
+  if (p === "qwen" || p === "qwenbridge") {
+    return [{ id: "qwen3.8", name: "qwen3.8" }];
+  }
+  if (p === "deepseek") {
+    return [
+      { id: "deepseek-v4-flash", name: "deepseek-v4-flash" },
+      { id: "deepseek-v4-pro", name: "deepseek-v4-pro" },
+    ];
+  }
+  if (p === "accio" || p === "accio-work" || p === "phoenix") {
+    return [{ id: "accio/1Nexus-R36W8qJ5vB6h", name: "Accio Nexus" }];
+  }
+  if (p === "ollie") {
+    return [
+      { id: "claude-sonnet-5", name: "claude-sonnet-5" },
+      { id: "claude-fable-5", name: "claude-fable-5" },
+      { id: "claude-opus-4-8", name: "claude-opus-4-8" },
+      { id: "deepseek-v4-flash-free", name: "deepseek-v4-flash-free" },
+    ];
+  }
+  if (["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
+    return [
+      { id: "opencode/deepseek-v4-flash-free", name: "DeepSeek V4 Flash Free" },
+      { id: "opencode/big-pickle", name: "Big Pickle" },
+      { id: "opencode/mimo-v2.5-free", name: "MiMo V2.5 Free" },
+      { id: "opencode/nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free" },
+      { id: "opencode/north-mini-code-free", name: "North Mini Code Free" },
+      { id: "opencode/ling-3.0-flash-free", name: "Ling 3.0 Flash Free" },
+      { id: "opencode/laguna-s-2.1-free", name: "Laguna S 2.1 Free" },
+    ];
+  }
+  if (p === "gemini" || p === "google" || p === "vertex") {
+    return [
+      { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview" },
+      { id: "gemini-3-flash-preview", name: "gemini-3-flash-preview" },
+      { id: "gemini-3.5-flash", name: "gemini-3.5-flash" },
+      { id: "gemini-3.1-flash-lite", name: "gemini-3.1-flash-lite" },
+      { id: "gemini-3.1-flash-image", name: "gemini-3.1-flash-image" },
+      { id: "gemini-3-pro-image", name: "gemini-3-pro-image" },
+      { id: "gemini-2.5-pro", name: "gemini-2.5-pro" },
+      { id: "gemini-2.5-flash", name: "gemini-2.5-flash" },
+      { id: "gemini-2.5-flash-lite", name: "gemini-2.5-flash-lite" },
+      { id: "gemini-2.0-flash-001", name: "gemini-2.0-flash-001" },
+      { id: "gemini-2.0-flash-lite-001", name: "gemini-2.0-flash-lite-001" },
+      { id: "gemini-1.5-pro-002", name: "gemini-1.5-pro-002" },
+    ];
+  }
+  if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
+    return [
+      { id: "kimi-for-coding", name: "Kimi For Coding" },
+      { id: "k3-agent", name: "K3 Max (Work)" },
+      { id: "k3-agent-low", name: "K3 Max — Low Think" },
+      { id: "k3-agent-medium", name: "K3 Max — Medium Think" },
+      { id: "k3-agent-high", name: "K3 Max — High Think" },
+      { id: "k3-agent-xhigh", name: "K3 Max — Extra High Think" },
+      { id: "k2d6-agent", name: "K2.6 Agent (Work)" },
+    ];
+  }
+  return [
+    { id: "grok-4.5", name: "Grok 4.5" },
+    { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
+  ];
 }
 
 /** Custom dark menu — replaces native <select> (white OS list on Windows). */
@@ -112,14 +190,19 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
       <div class="dd-menu" role="listbox"></div>
     `;
     const menu = root.querySelector(".dd-menu");
+    root._menu = menu;
     opts.forEach((o) => {
       const item = document.createElement("button");
       item.type = "button";
       item.className = "dd-item" + (o.value === root._value ? " active" : "");
+      if (o.status) item.className += ` dd-item-status-${o.status}`;
       item.role = "option";
       const itemTitle = o.value && o.value !== o.label ? o.value : o.label;
       item.title = itemTitle;
-      item.innerHTML = `<span>${escapeHtml(o.label)}</span><span class="check">✓</span>`;
+      const status = o.statusLabel
+        ? `<span class="dd-item-status-label">${escapeHtml(o.statusLabel)}</span>`
+        : "";
+      item.innerHTML = `<span class="dd-item-main"><span class="dd-item-label">${escapeHtml(o.label)}</span>${status}</span><span class="check">✓</span>`;
       item.onclick = (e) => {
         e.stopPropagation();
         root._value = o.value;
@@ -134,11 +217,9 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
       const was = root.classList.contains("open");
       closeAllMenus();
       if (!was) {
-        // open upward if near bottom
-        const rect = root.getBoundingClientRect();
-        const spaceBelow = window.innerHeight - rect.bottom;
-        menu.classList.toggle("drop-up", spaceBelow < 220);
         root.classList.add("open");
+        menu.classList.add("dd-menu-fixed");
+        positionMenu(root, menu);
       }
     };
   };
@@ -171,6 +252,7 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
         <div class="dd-menu" role="listbox"></div>
       `;
       const menu = root.querySelector(".dd-menu");
+      root._menu = menu;
       opts.forEach((o) => {
         const a = state.accounts.find((x) => x.id === o.value);
         const item = document.createElement("button");
@@ -194,10 +276,9 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
         const was = root.classList.contains("open");
         closeAllMenus();
         if (!was) {
-          const rect = root.getBoundingClientRect();
-          const spaceBelow = window.innerHeight - rect.bottom;
-          menu.classList.toggle("drop-up", spaceBelow < 220);
           root.classList.add("open");
+          menu.classList.add("dd-menu-fixed");
+          positionMenu(root, menu);
         }
       };
     };
@@ -211,9 +292,33 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
   return root;
 }
 
+function positionMenu(root, menu) {
+  if (!root || !menu || !root.classList.contains("open")) return;
+  const rect = root.getBoundingClientRect();
+  const isChip = root.classList.contains("dd-chip");
+  if (!isChip) menu.style.width = `${Math.max(120, rect.width)}px`;
+  const menuWidth = menu.getBoundingClientRect().width || rect.width;
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8));
+  const menuHeight = Math.min(menu.offsetHeight || 240, 240);
+  const spaceBelow = window.innerHeight - rect.bottom - 8;
+  const openUp = spaceBelow < Math.min(220, menuHeight) && rect.top > menuHeight + 8;
+  const top = openUp ? rect.top - menuHeight - 6 : rect.bottom + 6;
+  menu.classList.toggle("drop-up", openUp);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${Math.max(8, top)}px`;
+}
+
+function repositionOpenMenus() {
+  document.querySelectorAll(".dd.open").forEach((root) => positionMenu(root, root._menu));
+}
+
 function closeAllMenus() {
   document.querySelectorAll(".dd.open").forEach((el) => el.classList.remove("open"));
+  document.querySelectorAll(".dd-menu-fixed").forEach((el) => el.classList.remove("dd-menu-fixed"));
 }
+
+window.addEventListener("resize", repositionOpenMenus);
+window.addEventListener("scroll", repositionOpenMenus, true);
 
 document.addEventListener("click", () => closeAllMenus());
 document.addEventListener("keydown", (e) => {
@@ -342,6 +447,10 @@ function globalUsage() {
 }
 
 function activeAccount() {
+  // Accio accounts are synchronized into the same store pool as the other
+  // session providers. Never synthesize an "accio" row: it hides the real
+  // account id and prevents the account picker from selecting the token that
+  // the proxy will actually use.
   return state.accounts.find((a) => a.active) || state.accounts[0] || null;
 }
 
@@ -438,6 +547,7 @@ function ensureShell() {
             <span>think <b id="sess-think">0</b></span>
             <span class="cost" id="sess-cost">$0</span>
             <span id="sess-lat" style="display:none"></span>
+            <div id="accio-credit-avatar" class="accio-credit-avatar" style="display:none"></div>
             <button class="icon-btn" id="btn-logs" type="button">Logs</button>
             <button class="icon-btn" id="btn-stats-top" type="button">API</button>
           </div>
@@ -472,68 +582,62 @@ function ensureShell() {
   $("#btn-stats-top").onclick = openStatsModal;
   $("#btn-logs").onclick = openLogsModal;
 
-  const effortOpts = [
+  const fallbackEffortOpts = [
     { value: "low", label: "Low" },
     { value: "medium", label: "Medium" },
     { value: "high", label: "High" },
     { value: "xhigh", label: "xHigh" },
   ];
+  const selectedModelId = (composer = false) =>
+    composer
+      ? state.picks.cModel || state.settings.default_model
+      : state.picks.model || state.settings.default_model;
+  const effortOptionsForModel = (modelId) => {
+    const model = state.models.find((m) => m.id === modelId);
+    const efforts = Array.isArray(model?.reasoning_efforts)
+      ? model.reasoning_efforts.filter(Boolean)
+      : [];
+    return efforts.length
+      ? efforts.map((value) => ({ value, label: value }))
+      : fallbackEffortOpts;
+  };
+  const syncEffortMenus = () => {
+    const globalOptions = effortOptionsForModel(selectedModelId(false));
+    const composerOptions = effortOptionsForModel(selectedModelId(true));
+    state.menus["set-effort"]?.refresh?.();
+    state.menus["c-effort"]?.refresh?.();
+    const globalCurrent = globalOptions.some((o) => o.value === state.picks.effort)
+      ? state.picks.effort
+      : globalOptions[0]?.value;
+    const composerCurrent = composerOptions.some((o) => o.value === state.picks.cEffort)
+      ? state.picks.cEffort
+      : composerOptions[0]?.value;
+    if (globalCurrent) {
+      state.picks.effort = globalCurrent;
+      state.menus["set-effort"]?.setValue(globalCurrent);
+    }
+    if (composerCurrent) {
+      state.picks.cEffort = composerCurrent;
+      state.menus["c-effort"]?.setValue(composerCurrent);
+    }
+  };
   const providerOpts = [
     { value: "xai", label: "Grok · Auth" },
     { value: "kimi_work", label: "Kimi Work · Auth" },
-    { value: "ollie", label: "OllieChat · API key" },
-    { value: "gemini", label: "Gemini · API key" },
-    { value: "qwen", label: "Qwen · API key" },
+    { value: "ollie", label: "OllieChat · API key", status: "disabled", statusLabel: "Indispon\u00edvel" },
+    { value: "gemini", label: "Gemini · API key", status: "disabled", statusLabel: "Indispon\u00edvel" },
+    { value: "qwen", label: "Qwen · API key", status: "disabled", statusLabel: "Indispon\u00edvel" },
+    { value: "deepseek", label: "DeepSeek · API key" },
+    { value: "accio", label: "Accio · Auth", status: "maintenance", statusLabel: "Em manuten\u00e7\u00e3o" },
   ];
+  providerOpts.splice(providerOpts.length - 1, 0, {
+    value: "opencode_zen",
+    label: "OpenCode Zen Free - keyless",
+  });
   const apiOpts = [
     { value: "responses", label: "Responses ★" },
     { value: "chat", label: "Chat" },
   ];
-  const fallbackModels = (prov) => {
-    const p = (prov || state.settings?.provider || "xai").toLowerCase();
-    if (p === "qwen" || p === "qwenbridge") {
-      return [{ id: "qwen3.8", name: "qwen3.8" }];
-    }
-    if (p === "ollie") {
-      return [
-        { id: "claude-sonnet-5", name: "claude-sonnet-5" },
-        { id: "claude-fable-5", name: "claude-fable-5" },
-        { id: "claude-opus-4-8", name: "claude-opus-4-8" },
-        { id: "deepseek-v4-flash-free", name: "deepseek-v4-flash-free" },
-      ];
-    }
-    if (p === "gemini" || p === "google" || p === "vertex") {
-      return [
-        { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview" },
-        { id: "gemini-3-flash-preview", name: "gemini-3-flash-preview" },
-        { id: "gemini-3.5-flash", name: "gemini-3.5-flash" },
-        { id: "gemini-3.1-flash-lite", name: "gemini-3.1-flash-lite" },
-        { id: "gemini-3.1-flash-image", name: "gemini-3.1-flash-image" },
-        { id: "gemini-3-pro-image", name: "gemini-3-pro-image" },
-        { id: "gemini-2.5-pro", name: "gemini-2.5-pro" },
-        { id: "gemini-2.5-flash", name: "gemini-2.5-flash" },
-        { id: "gemini-2.5-flash-lite", name: "gemini-2.5-flash-lite" },
-        { id: "gemini-2.0-flash-001", name: "gemini-2.0-flash-001" },
-        { id: "gemini-2.0-flash-lite-001", name: "gemini-2.0-flash-lite-001" },
-        { id: "gemini-1.5-pro-002", name: "gemini-1.5-pro-002" },
-      ];
-    }
-    if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
-      return [
-        { id: "kimi-for-coding", name: "Kimi For Coding" },
-        { id: "k3-agent", name: "K3 Max (Work)" },
-        { id: "k3-agent-low", name: "K3 Max — Low Think" },
-        { id: "k3-agent-medium", name: "K3 Max — Medium Think" },
-        { id: "k3-agent-high", name: "K3 Max — High Think" },
-        { id: "k3-agent-xhigh", name: "K3 Max — Extra High Think" },
-        { id: "k2d6-agent", name: "K2.6 Agent (Work)" },
-      ];
-    }
-    return [
-      { id: "grok-4.5", name: "Grok 4.5" },
-      { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
-    ];
-  };
   const modelOpts = () =>
     (state.models.length ? state.models : fallbackModels()).map((m) => ({
       value: m.id,
@@ -541,8 +645,43 @@ function ensureShell() {
     }));
 
   async function switchProvider(v) {
-    // One shot: backend resets model+upstream for the provider.
-    await saveGlobal({ provider: v });
+    if (providerStatusInfo(v)) {
+      state.menus["set-provider"]?.setValue(state.settings?.provider || "xai");
+      showProviderStatusModal(v);
+      return;
+    }
+    if (v === "deepseek") {
+      // Chave já salva → conecta direto (sem modal). Modal só quando não há chave.
+      const hasKey = !!state.settings?.deepseek_api_key;
+      if (!hasKey) {
+        const res = await showDeepSeekKeyModal();
+        if (!res) return;
+        const patch = { provider: v };
+        if (res.key != null) patch.deepseek_api_key = res.key;
+        await saveGlobal(patch);
+      } else {
+        await saveGlobal({ provider: v });
+      }
+    } else {
+      // One shot: backend resets model+upstream for the provider.
+      await saveGlobal({ provider: v });
+      if (v === "accio") {
+        try {
+          const status = await AccioStatus();
+          if (!status?.authenticated) {
+            await StartAccioLogin();
+            pollAccioLogin();
+          } else {
+            await refreshAccioCredits();
+          }
+        } catch (e) {
+          console.warn("Accio login", e);
+        }
+      } else {
+        state.accioCredits = null;
+        paintAccioCreditAvatar();
+      }
+    }
     try {
       state.models = (await ListModels()) || [];
     } catch {
@@ -575,6 +714,11 @@ function ensureShell() {
     updateProviderChrome();
     await refreshBootstrap(false);
   }
+
+  const effortOpts = () => {
+    const opts = effortOptionsForModel(selectedModelId(false));
+    return opts.length ? opts : fallbackEffortOpts;
+  };
 
   mountMenu($("#set-provider"), {
     id: "set-provider",
@@ -614,6 +758,7 @@ function ensureShell() {
       state.picks.cModel = v;
       state.menus["c-model"]?.setValue(v);
       saveGlobal({ default_model: v });
+      syncEffortMenus();
     },
   });
 
@@ -676,7 +821,7 @@ function ensureShell() {
   });
   mountMenu($("#c-effort"), {
     id: "c-effort",
-    options: effortOpts.map((o) => ({ ...o, label: o.value })),
+    options: () => effortOpts().map((o) => ({ ...o, label: o.value })),
     value: state.picks.cEffort,
     prefix: "think",
     chip: true,
@@ -812,6 +957,34 @@ function addLog(source, message, detail = null) {
   // update badge if modal is open
   const badge = document.getElementById("logs-badge");
   if (badge) badge.textContent = state.logs.length;
+  // live-update an open Logs modal
+  if (state.logsModal && document.body.contains(state.logsModal)) {
+    const list = $("#logs-list", state.logsModal);
+    const counter = $("#logs-count", state.logsModal);
+    if (list) {
+      const div = document.createElement("div");
+      div.innerHTML = renderLogRow(state.logs.length - 1, entry);
+      list.appendChild(div.firstElementChild);
+      list.scrollTop = list.scrollHeight;
+    }
+    if (counter) counter.textContent = state.logs.length;
+  }
+}
+
+function renderLogRow(i, log) {
+  const detailBlock = log.detail
+    ? `<pre class="log-detail">${escapeLogHtml(log.detail)}</pre>`
+    : "";
+  return `
+    <div class="log-row" data-index="${i}">
+      <div class="log-head">
+        <span class="log-time">${escapeLogHtml(log.time)}</span>
+        <span class="log-source ${escapeLogHtml(log.source)}">${escapeLogHtml(log.source)}</span>
+        <span class="log-msg">${escapeLogHtml(log.message)}</span>
+        <button type="button" class="log-copy-btn" data-index="${i}" title="Copiar este log">Copiar</button>
+      </div>
+      ${detailBlock}
+    </div>`;
 }
 
 function escapeLogHtml(s) {
@@ -840,25 +1013,10 @@ function openLogsModal() {
   const overlay = document.createElement("div");
   overlay.className = "overlay overlay-glass";
   overlay.id = "logs-overlay";
+  state.logsModal = overlay;
 
   const rows = state.logs.length
-    ? state.logs
-        .map((log, i) => {
-          const detailBlock = log.detail
-            ? `<pre class="log-detail">${escapeLogHtml(log.detail)}</pre>`
-            : "";
-          return `
-        <div class="log-row" data-index="${i}">
-          <div class="log-head">
-            <span class="log-time">${escapeLogHtml(log.time)}</span>
-            <span class="log-source ${escapeLogHtml(log.source)}">${escapeLogHtml(log.source)}</span>
-            <span class="log-msg">${escapeLogHtml(log.message)}</span>
-            <button type="button" class="log-copy-btn" data-index="${i}" title="Copiar este log">Copiar</button>
-          </div>
-          ${detailBlock}
-        </div>`;
-        })
-        .join("")
+    ? state.logs.map((log, i) => renderLogRow(i, log)).join("")
     : `<div class="log-empty">Nenhum log nesta sessão ainda.</div>`;
 
   overlay.innerHTML = `
@@ -866,21 +1024,30 @@ function openLogsModal() {
       <div class="sheet-head">
         <div>
           <h3>Logs da sessão</h3>
-          <p>${state.logs.length} evento(s) · perdido ao fechar o app</p>
+          <p><span id="logs-count">${state.logs.length}</span> evento(s) · tempo real · perdido ao fechar o app</p>
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
           <button type="button" class="btn btn-quiet" id="logs-copy-all" ${state.logs.length ? "" : "disabled style=\"opacity:.4\""}>Copiar tudo</button>
           <button type="button" class="btn btn-quiet" id="logs-close">Fechar</button>
         </div>
       </div>
-      <div class="logs-list">${rows}</div>
+      <div class="logs-list" id="logs-list">${rows}</div>
     </div>`;
 
   document.body.appendChild(overlay);
 
-  $("#logs-close", overlay).onclick = () => overlay.remove();
+  const list = $("#logs-list", overlay);
+  if (list) list.scrollTop = list.scrollHeight;
+
+  $("#logs-close", overlay).onclick = () => {
+    state.logsModal = null;
+    overlay.remove();
+  };
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.remove();
+    if (e.target === overlay) {
+      state.logsModal = null;
+      overlay.remove();
+    }
   });
 
   if (state.logs.length) {
@@ -945,6 +1112,10 @@ function paintChrome() {
   const kimiUI = isKimiProvider(pNow);
   if (providerAuthMode(pNow) !== "auth") {
     list.innerHTML = `<div class="account empty-hint">Provedor <b>API key</b> — sem pool de contas de sessão.<br/>Credencial direta (Ollie keyless / Gemini ADC / QwenBridge local).</div>`;
+  } else if (pNow === "accio" || pNow === "accio-work" || pNow === "phoenix") {
+    list.innerHTML = state.accounts.length
+      ? ""
+      : `<div class="account empty-hint">Nenhuma conta Accio cadastrada.<br/>Clique em <b>Adicionar conta</b> para autenticar; depois o proxy poderá alternar entre as contas automaticamente.</div>`;
   } else if (!state.accounts.length) {
     const how = pNow.startsWith("kimi")
       ? "Clique em <b>+ Conta Kimi</b> (Desktop / JWT / sk-kimi)."
@@ -1036,11 +1207,12 @@ function paintChrome() {
   state.menus["c-effort"]?.setValue(state.picks.cEffort);
   state.menus["c-api"]?.setValue(state.picks.cApi);
   state.menus["c-model"]?.setValue(state.picks.cModel);
-  if (acc?.id) state.menus["c-account"]?.setValue(acc.id);
+  if (activeId) state.menus["c-account"]?.setValue(activeId);
 
   paintStatus();
   paintSend();
   paintMessages();
+  paintAccioCreditAvatar();
 }
 
 function paintStatus() {
@@ -1075,6 +1247,33 @@ function paintSend() {
   btn.title = state.streaming ? "Parar" : "Enviar";
 }
 
+function cachedMessageMarkup(message, kind) {
+  const content = String(message.content || "");
+  const key = `${kind}:${message.isError ? "error" : "text"}:${content}`;
+  const hit = messageMarkupCache.get(message);
+  if (hit?.key === key) return hit.html;
+
+  let html;
+  if (kind === "user") {
+    html = content.includes("`") || content.includes("**") || content.includes("\n")
+      ? renderMarkdown(content)
+      : `<p>${escapeHtml(content).replaceAll("\n", "<br>")}</p>`;
+  } else if (message.isError || looksLikeHTML(content)) {
+    html = `<p class="err">${escapeHtml(safeErrorText(content))}</p>`;
+  } else {
+    html = renderMarkdown(content);
+  }
+  messageMarkupCache.set(message, { key, html });
+  return html;
+}
+
+function renderStreamingText(content) {
+  // Markdown parsing + DOMPurify on every token is the main UI bottleneck for
+  // long answers. Escape plain text during the stream, then render markdown
+  // once when the done event arrives.
+  return `<p>${escapeHtml(String(content || "")).replaceAll("\n", "<br>")}</p>`;
+}
+
 function paintMessages() {
   const inner = $("#stream-inner");
   if (!inner) return;
@@ -1094,10 +1293,7 @@ function paintMessages() {
   const html = state.messages
     .map((m, i) => {
       if (m.role === "user") {
-        // User: preserve plain text layout but allow simple md if they paste it
-        const body = m.content?.includes("`") || m.content?.includes("**") || m.content?.includes("\n")
-          ? renderMarkdown(m.content)
-          : `<p>${escapeHtml(m.content).replaceAll("\n", "<br>")}</p>`;
+        const body = cachedMessageMarkup(m, "user");
         return `
           <section class="turn turn-user" data-i="${i}">
             <div class="turn-label">Você</div>
@@ -1111,10 +1307,11 @@ function paintMessages() {
         : "";
       const cursor = m.streaming ? `<span class="cursor" aria-hidden="true"></span>` : "";
       const meta = m.meta ? `<div class="turn-meta">${escapeHtml(m.meta)}</div>` : "";
-      // Errors: plain escaped text only (never markdown/HTML from upstream pages).
-      const answer = (m.isError || looksLikeHTML(m.content)
-        ? `<p class="err">${escapeHtml(safeErrorText(m.content || ""))}</p>`
-        : renderMarkdown(m.content || "")) + cursor;
+      // Keep the live path cheap; sanitize/render markdown after completion.
+      const answerBody = m.streaming
+        ? renderStreamingText(m.content)
+        : cachedMessageMarkup(m, "assistant");
+      const answer = answerBody + cursor;
       const hasAnswer = !!(m.content && m.content.trim());
       const searching =
         m.search?.status === "searching" ||
@@ -1171,9 +1368,89 @@ async function saveGlobal(patch) {
   }
 }
 
+function providerStatusInfo(provider) {
+  const p = (provider || "").toLowerCase();
+  if (p === "ollie" || p === "olliechat") {
+    return {
+      name: "OllieChat",
+      status: "disabled",
+      badge: "PROVEDOR DESATIVADO",
+      label: "Indispon\u00edvel",
+      symbol: "O",
+      message: "Sinto muito, mas infelizmente esse provedor se encontra desabilitado por enquanto. Tente outro.",
+      detail: "OllieChat est\u00e1 temporariamente fora da rota do Grok Desktop.",
+    };
+  }
+  if (p === "gemini" || p === "google" || p === "vertex") {
+    return {
+      name: "Gemini",
+      status: "disabled",
+      badge: "PROVEDOR DESATIVADO",
+      label: "Indispon\u00edvel",
+      symbol: "G",
+      message: "Sinto muito, mas infelizmente esse provedor se encontra desabilitado por enquanto. Tente outro.",
+      detail: "Gemini est\u00e1 temporariamente fora da rota do Grok Desktop.",
+    };
+  }
+  if (p === "qwen" || p === "qwenbridge") {
+    return {
+      name: "Qwen",
+      status: "disabled",
+      badge: "PROVEDOR DESATIVADO",
+      label: "Indispon\u00edvel",
+      symbol: "Q",
+      message: "Sinto muito, mas infelizmente esse provedor se encontra desabilitado por enquanto. Tente outro.",
+      detail: "Qwen est\u00e1 temporariamente fora da rota do Grok Desktop.",
+    };
+  }
+  if (p === "accio" || p === "accio-work" || p === "phoenix") {
+    return {
+      name: "Accio",
+      status: "maintenance",
+      badge: "EM MANUTEN\u00c7\u00c3O",
+      label: "Em manuten\u00e7\u00e3o",
+      symbol: "A",
+      message: "Sinto muito, mas infelizmente esse provedor se encontra em manuten\u00e7\u00e3o por enquanto. Tente outro.",
+      detail: "A rota Accio est\u00e1 recebendo ajustes e voltar\u00e1 assim que estiver pronta.",
+    };
+  }
+  return null;
+}
+
+function showProviderStatusModal(provider) {
+  const info = providerStatusInfo(provider);
+  if (!info) return;
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass provider-status-overlay";
+  overlay.innerHTML = `
+    <div class="sheet sheet-provider-status provider-status-${info.status}" role="dialog" aria-modal="true" aria-labelledby="provider-status-title">
+      <button type="button" class="provider-status-close" id="provider-status-close" aria-label="Fechar">&times;</button>
+      <div class="provider-status-orb"><span>${escapeHtml(info.symbol)}</span></div>
+      <div class="provider-status-kicker">${escapeHtml(info.badge)}</div>
+      <h3 id="provider-status-title">${escapeHtml(info.name)}</h3>
+      <p class="provider-status-message">${escapeHtml(info.message)}</p>
+      <div class="provider-status-note">
+        <span class="provider-status-note-icon">i</span>
+        <span>${escapeHtml(info.detail)}</span>
+      </div>
+      <div class="sheet-actions provider-status-actions">
+        <button type="button" class="btn btn-solid" id="provider-status-ok">Entendi</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  $("#provider-status-close", overlay).onclick = close;
+  $("#provider-status-ok", overlay).onclick = close;
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+}
+
 function providerAuthMode(p) {
   p = (p || state.settings?.provider || "xai").toLowerCase();
-  if (p === "xai" || p === "grok" || p === "kimi_work" || p === "kimi" || p === "kimi-work") return "auth";
+  if (p === "xai" || p === "grok" || p === "kimi_work" || p === "kimi" || p === "kimi-work" || p === "accio" || p === "accio-work" || p === "phoenix") return "auth";
   return "api_key";
 }
 
@@ -1181,10 +1458,19 @@ function updateProviderChrome() {
   const p = (state.settings?.provider || "xai").toLowerCase();
   const model = state.settings?.default_model || state.picks?.model || "—";
   const mode = providerAuthMode(p);
+  const statusInfo = providerStatusInfo(p);
   const el = $("#provider-label");
   if (el) {
-    if (p === "qwen" || p === "qwenbridge") {
+    if (statusInfo) {
+      el.textContent = `${statusInfo.name} · ${statusInfo.label}`;
+    } else if (p === "qwen" || p === "qwenbridge") {
       el.textContent = `Qwen · API key · ${shortModelLabel(model, model)}`;
+    } else if (p === "deepseek") {
+      el.textContent = `DeepSeek · API key ${state.settings?.deepseek_api_key ? "🔒" : "⚠"} · ${shortModelLabel(model, model)}`;
+    } else if (p === "accio" || p === "accio-work" || p === "phoenix") {
+      el.textContent = `Accio · Auth · ${shortModelLabel(model, model)}`;
+    } else if (["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
+      el.textContent = `OpenCode Zen Free - keyless - ${shortModelLabel(model, model)}`;
     } else if (p === "ollie" || p === "olliechat") {
       el.textContent = `Ollie · API key · ${shortModelLabel(model, model)}`;
     } else if (p === "gemini" || p === "google" || p === "vertex") {
@@ -1198,25 +1484,38 @@ function updateProviderChrome() {
   }
   const modeEl = $("#provider-mode");
   if (modeEl) {
-    modeEl.innerHTML =
-      mode === "auth"
+    modeEl.innerHTML = statusInfo
+      ? `<span class="mode-pill mode-status-${statusInfo.status}">${escapeHtml(statusInfo.badge)}</span>`
+      : mode === "auth"
         ? `<span class="mode-pill mode-auth">Auth · multi-conta</span>`
-        : `<span class="mode-pill mode-key">API key · sem pool</span>`;
+        : `<span class="mode-pill mode-key">${["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p) ? "Keyless" : "API key"} - sem pool</span>`;
   }
   const addBtn = $("#btn-add");
   const accBtn = $("#btn-accounts");
   if (addBtn) {
-    addBtn.style.display = mode === "auth" ? "" : "none";
-    addBtn.textContent = p.startsWith("kimi") ? "+ Conta Kimi" : "+ Conta Grok";
+    addBtn.style.display = statusInfo ? "none" : mode === "auth" ? "" : "none";
+    addBtn.textContent = p.startsWith("kimi") ? "+ Conta Kimi" : (p === "accio" || p === "accio-work" || p === "phoenix" ? "Login Accio" : "+ Conta Grok");
   }
   if (accBtn) {
-    accBtn.style.display = mode === "auth" ? "" : "none";
+    accBtn.style.display = statusInfo ? "none" : mode === "auth" ? "" : "none";
   }
   const hint = document.querySelector(".tool-hint");
   if (hint) {
-    if (p === "qwen" || p === "qwenbridge") {
+    if (statusInfo) {
+      hint.textContent = statusInfo.label;
+      hint.title = statusInfo.message;
+    } else if (p === "qwen" || p === "qwenbridge") {
       hint.textContent = "QwenBridge";
       hint.title = "QwenBridge local · OpenAI-compatible (chat/completions)";
+    } else if (p === "deepseek") {
+      hint.textContent = "DeepSeek";
+      hint.title = "DeepSeek API oficial · chat/completions · chave criptografada";
+    } else if (p === "accio" || p === "accio-work" || p === "phoenix") {
+      hint.textContent = "Accio";
+      hint.title = "Accio/Phoenix · login no Accio · chat/completions";
+    } else if (["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
+      hint.textContent = "OpenCode Zen Free";
+      hint.title = "OpenCode Zen direto - sem opencode serve/terminal";
     } else if (p === "ollie" || p === "olliechat") {
       hint.textContent = "OllieChat";
       hint.title = "Upstream OllieChat (sem chave)";
@@ -1275,11 +1574,26 @@ function closeOverlay() {
 
 function showAddAccountChooser() {
   const p = (state.settings?.provider || "xai").toLowerCase();
+  if (p === "accio" || p === "accio-work" || p === "phoenix") {
+    StartAccioLogin().catch((e) => alert("Falha ao iniciar login Accio: " + e));
+    return;
+  }
   if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
     showAddKimiChooser();
     return;
   }
-  if (p === "ollie" || p === "gemini" || p === "google" || p === "vertex" || p === "qwen" || p === "qwenbridge") {
+  if (p === "deepseek") {
+    showDeepSeekKeyModal().then(async (res) => {
+      if (!res) return;
+      const patch = { provider: "deepseek" };
+      if (res.key != null) patch.deepseek_api_key = res.key;
+      await saveGlobal(patch);
+      await refreshBootstrap(false);
+      setStatus(res.key ? "DeepSeek conectado — chave criptografada e salva" : "DeepSeek — chave mantida");
+    });
+    return;
+  }
+  if (p === "ollie" || p === "gemini" || p === "google" || p === "vertex" || p === "qwen" || p === "qwenbridge" || ["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
     closeOverlay();
     const overlay = document.createElement("div");
     overlay.className = "overlay overlay-glass";
@@ -1458,6 +1772,96 @@ function showKimiPasteModal(kind) {
   };
 }
 
+/**
+ * Modal de API key do DeepSeek — aparece ao selecionar o provedor DeepSeek.
+ * A chave é enviada ao backend, que a criptografa (DPAPI/Windows) antes de
+ * persistir. Retorna { key } com a chave nova, { key: null } para manter a
+ * salva, ou null se o usuário cancelou.
+ */
+function showDeepSeekKeyModal() {
+  return new Promise((resolve) => {
+    const hasKey = !!state.settings?.deepseek_api_key;
+    const overlay = document.createElement("div");
+    overlay.className = "overlay overlay-glass";
+    overlay.innerHTML = `
+      <div class="sheet sheet-deepseek">
+        <div class="ds-hero">
+          <div class="ds-logo"><span>DS</span></div>
+          <h3>Conectar ao DeepSeek</h3>
+          <p>API oficial DeepSeek · chat/completions</p>
+        </div>
+        <div class="ds-body">
+          <div class="field" style="margin-bottom:14px">
+            <span class="field-label">API Key</span>
+            <div class="ds-key-wrap">
+              <span class="ds-lock">🔒</span>
+              <input id="ds-key" type="password" spellcheck="false" autocomplete="off"
+                placeholder="${hasKey ? "•••••••••• (chave salva — digite para trocar)" : "sk-…"}"
+                style="flex:1;background:transparent;border:none;outline:none;color:#fff;font-family:ui-monospace,monospace;font-size:13px;padding:0 6px" />
+              <button type="button" id="ds-toggle" class="ds-eye" title="Mostrar/ocultar">👁</button>
+            </div>
+            ${hasKey ? `<p class="ds-saved">✓ Chave salva no cofre do Windows (DPAPI) — deixe vazio para manter.</p>` : ""}
+          </div>
+          <p class="ds-sec">
+            🔒 Sua chave é criptografada com <b>DPAPI do Windows</b> (CryptProtectData)
+            antes de ir para o disco — nunca fica em texto puro e só o seu usuário consegue ler.
+          </p>
+          <p id="ds-error" class="ds-error" style="display:none"></p>
+          <div class="ds-actions">
+            <a href="#" id="ds-link">Criar chave no platform.deepseek.com</a>
+            <div class="sheet-actions" style="margin-top:4px">
+              <button class="btn btn-solid btn-ds" id="ds-save" type="button">Conectar</button>
+              <button class="btn btn-quiet" id="ds-cancel" type="button">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    const keyInput = $("#ds-key", overlay);
+    const errEl = $("#ds-error", overlay);
+    const fail = (msg) => {
+      errEl.textContent = msg;
+      errEl.style.display = "";
+      keyInput?.focus();
+    };
+
+    $("#ds-toggle", overlay).onclick = () => {
+      if (!keyInput) return;
+      const hidden = keyInput.type === "password";
+      keyInput.type = hidden ? "text" : "password";
+      $("#ds-toggle", overlay).textContent = hidden ? "🙈" : "👁";
+    };
+    $("#ds-link", overlay).onclick = (e) => {
+      e.preventDefault();
+      try {
+        OpenExternal("https://platform.deepseek.com/api_keys");
+      } catch (_) {}
+    };
+    const cancel = () => {
+      overlay.remove();
+      resolve(null);
+    };
+    $("#ds-cancel", overlay).onclick = cancel;
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) cancel();
+    });
+    keyInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") $("#ds-save", overlay)?.click();
+    });
+    $("#ds-save", overlay).onclick = async () => {
+      const raw = (keyInput?.value || "").trim();
+      if (!raw && !hasKey) {
+        fail("Cole a API key do DeepSeek (sk-…) para conectar.");
+        return;
+      }
+      overlay.remove();
+      resolve({ key: raw || null });
+    };
+    keyInput?.focus();
+  });
+}
+
 async function showAccountCredsModal(account) {
   closeOverlay();
   const overlay = document.createElement("div");
@@ -1538,8 +1942,10 @@ async function openAccountsModal() {
   try {
     accounts = (await ListAccountsForProvider(p)) || accounts;
   } catch (_) {}
-  const kimiUI = isKimiProvider(p);
-  const title = kimiUI ? "Contas Kimi Work" : "Contas Grok";
+    const kimiUI = isKimiProvider(p);
+    const accioUI = p === "accio" || p === "accio-work" || p === "phoenix";
+    const title = kimiUI ? "Contas Kimi Work" : accioUI ? "Contas Accio" : "Contas Grok";
+
   const overlay = document.createElement("div");
   overlay.className = "overlay overlay-glass";
 
@@ -1558,6 +1964,7 @@ async function openAccountsModal() {
             if (a.exhausted) statusBadges.push(`<span class="badge badge-danger">esgotada</span>`);
             if (a.auth_denied) statusBadges.push(`<span class="badge badge-danger">auth negada</span>`);
             if (kimiUI && a.has_web_session) statusBadges.push(`<span class="badge badge-ok">sessão web</span>`);
+            if (accioUI) statusBadges.push(`<span class="badge badge-ok">pool Accio</span>`);
             if (a.has_google_refresh) statusBadges.push(`<span class="badge badge-ok" title="Google refresh token salvo">google refresh</span>`);
             if (a.api_key_hint) statusBadges.push(`<span class="badge badge-ok" title="sk-kimi salvo">${escapeHtml(a.api_key_hint)}</span>`);
 
@@ -1756,7 +2163,14 @@ async function submit() {
   const promptEl = $("#prompt");
   const text = (promptEl?.value || "").trim();
   if (!text || state.streaming) return;
-  if (!activeAccount()) {
+  // Provedores API key (DeepSeek, Qwen, Ollie, Gemini) não usam pool de contas —
+  // só provedores de sessão (xAI/Kimi/Accio) exigem conta selecionada.
+  const pNow = (state.settings?.provider || "xai").toLowerCase();
+  if (providerStatusInfo(pNow)) {
+    showProviderStatusModal(pNow);
+    return;
+  }
+  if (providerAuthMode(pNow) === "auth" && !activeAccount()) {
     alert("Adicione e selecione uma conta primeiro.");
     return;
   }
@@ -1765,7 +2179,6 @@ async function submit() {
     state.menus["c-model"]?.getValue?.() || state.picks.cModel || state.settings.default_model;
   const effort =
     state.menus["c-effort"]?.getValue?.() || state.picks.cEffort || state.settings.reasoning_effort;
-  const pNow = (state.settings?.provider || "xai").toLowerCase();
   const isKimi =
     pNow === "kimi_work" || pNow === "kimi" || pNow === "kimi-work";
   let apiMode =
@@ -1833,10 +2246,18 @@ async function submit() {
   }
 
   try {
+    addLog("chat-send", "Enviando", {
+      model,
+      effort,
+      api_mode: apiMode,
+      messages: payload.messages.length,
+      streaming: true,
+    });
     await SendChat(payload);
   } catch (e) {
     state.streaming = false;
     const last = state.messages.at(-1);
+    addLog("chat-send", "SendChat rejeitou", { error: String(e) });
     if (last?.role === "assistant") {
       last.content = safeErrorText(e);
       last.isError = true;
@@ -2197,6 +2618,10 @@ function onChatEvent(ev) {
 
   if (onChatEventTool(ev)) return;
 
+  // Surface chat stream activity in the Logs modal (throttled) so the user
+  // sees the request progressing even when the bubble render is stuck.
+  logChatEventThrottled(ev);
+
   if (ev.type === "thinking") {
     last.thinking = (last.thinking || "") + (ev.text || "");
     thinkChars += (ev.text || "").length;
@@ -2236,6 +2661,12 @@ function onChatEvent(ev) {
     if (ev.latency_ms && last.meta && !last.meta.includes("ms") && !last.meta.includes(" s")) {
       last.meta += " · " + fmtMs(ev.latency_ms);
     }
+    if (!last.content && !last.thinking && !last.isError) {
+      addLog("chat-event", "DONE sem conteúdo — resposta vazia do upstream", {
+        model: ev.model,
+        tools: (last.tools || []).length,
+      });
+    }
     paintSend();
     paintStatus();
   } else if (ev.type === "error") {
@@ -2251,6 +2682,104 @@ function onChatEvent(ev) {
   schedulePaintMessages();
 }
 
+// logChatEventThrottled mirrors chat stream events into the Logs modal at a
+// low rate (control events always; content/thinking at most once per second)
+// so a stuck stream is visible instead of silent.
+function logChatEventThrottled(ev) {
+  const now = Date.now();
+  if (ev.type === "content" || ev.type === "thinking") {
+    if (now - (state.lastChatEventLogAt || 0) < 1000) return;
+  }
+  state.lastChatEventLogAt = now;
+  const preview =
+    ev.type === "error"
+      ? String(ev.error || "").slice(0, 200)
+      : ev.type === "usage"
+        ? `${ev.usage?.prompt_tokens || 0} in / ${ev.usage?.completion_tokens || 0} out`
+        : ev.type === "content" || ev.type === "thinking"
+          ? String(ev.text || "").slice(0, 60)
+          : "";
+  addLog("chat-event", `chat:${ev.type}${preview ? " · " + preview : ""}`);
+}
+
+async function pollAccioLogin() {
+  if (state.accioPolling) return;
+  state.accioPolling = true;
+  const deadline = Date.now() + 120000;
+  const tick = async () => {
+    if (!state.accioPolling) return;
+    if (Date.now() > deadline) {
+      state.accioPolling = false;
+      const st = $("#status-text");
+      if (st) st.textContent = "Login Accio: tempo esgotado — tente novamente";
+      return;
+    }
+    try {
+      const status = await AccioStatus();
+      if (status?.authenticated) {
+        state.accioPolling = false;
+        await refreshBootstrap(true);
+        await refreshAccioCredits();
+        return;
+      }
+    } catch (_) {}
+    setTimeout(tick, 2000);
+  };
+  setTimeout(tick, 1500);
+}
+
+async function refreshAccioCredits() {
+  const p = (state.settings?.provider || "xai").toLowerCase();
+  if (p !== "accio" && p !== "accio-work" && p !== "phoenix") {
+    state.accioCredits = null;
+    return;
+  }
+  try {
+    const credits = await AccioCredits();
+    state.accioCredits = credits;
+  } catch (e) {
+    state.accioCredits = null;
+    console.warn("Accio credits", e);
+  }
+  paintAccioCreditAvatar();
+}
+
+function paintAccioCreditAvatar() {
+  const host = $("#accio-credit-avatar");
+  if (!host) return;
+  const p = (state.settings?.provider || "xai").toLowerCase();
+  const isAccio = p === "accio" || p === "accio-work" || p === "phoenix";
+  if (!isAccio) {
+    host.style.display = "none";
+    return;
+  }
+  host.style.display = "";
+  const c = state.accioCredits || {};
+  const total = Number(c.total || 0);
+  const remaining = Number(c.remaining || 0);
+  const used = Number(c.used || 0);
+  const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+  const remainingPct = total > 0 ? 100 - pct : 0;
+  const status = state.accioCredits == null ? "loading" : (total > 0 ? "ok" : "none");
+  const statusLabel = c.type || "Accio";
+  const initials = "A";
+  host.innerHTML = `
+    <div class="accio-ring accio-ring--${status}" title="${escapeHtml(statusLabel)} · ${remaining}/${total} créditos restantes">
+      <svg viewBox="0 0 36 36" class="accio-ring-svg">
+        <circle class="accio-ring-bg" cx="18" cy="18" r="16"></circle>
+        <circle class="accio-ring-fg" cx="18" cy="18" r="16"
+          stroke-dasharray="${2 * Math.PI * 16}"
+          stroke-dashoffset="${2 * Math.PI * 16 * (1 - remainingPct / 100)}"></circle>
+      </svg>
+      <span class="accio-ring-label">${escapeHtml(initials)}</span>
+    </div>
+    <div class="accio-credit-meta">
+      <span class="accio-credit-plan">${escapeHtml(statusLabel)}</span>
+      <span class="accio-credit-val">${total > 0 ? `${remaining}/${total}` : "—"}</span>
+    </div>
+  `;
+}
+
 async function refreshBootstrap(full = true) {
   const b = await GetBootstrap();
   state.settings = b.settings || {};
@@ -2263,20 +2792,44 @@ async function refreshBootstrap(full = true) {
     try {
       state.models = await ListModels();
     } catch (_) {
-      state.models = [
-        { id: "grok-4.5", name: "Grok 4.5" },
-        { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
-      ];
+      // Keep the fallback aligned with the selected provider. Showing Grok
+      // here made a failed Accio catalog look like a successful model load.
+      state.models = fallbackModels(state.settings?.provider);
     }
   }
   paintChrome();
 }
 
 function wireEvents() {
+  // Structured proxy/app logs streamed in real time from the Go side.
+  EventsOn("log", (p) => {
+    const level = String(p?.level || "INFO").toLowerCase();
+    const msg = p?.msg || "log";
+    const fields = p?.fields || null;
+    addLog(level, msg, fields);
+  });
+
   EventsOn("kimi:login", (p) => {
     const phase = p?.phase || "unknown";
     const msg = p?.message || String(p || "");
     addLog("kimi-login", msg, { phase, error: p?.error || null });
+  });
+
+  EventsOn("accio:login", async (p) => {
+    addLog("accio-login", "Login capturado", p);
+    state.accioPolling = false;
+    await refreshBootstrap(true);
+    const st = $("#status-text");
+    if (st) {
+      st.innerHTML = `Accio conectado · <strong>${escapeHtml(p?.email || p?.label || "ok")}</strong>`;
+    }
+    await refreshAccioCredits();
+  });
+  EventsOn("accio:error", (p) => {
+    const raw = p?.raw || p?.error || "erro Accio sem payload";
+    addLog("accio-gateway", `Erro bruto · conta ${p?.account_id || "?"} · tentativa ${p?.attempt || "?"}`, raw);
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Accio · <strong>erro do gateway</strong> · ${escapeHtml(String(raw).slice(0, 160))}`;
   });
 
   EventsOn("chat:event", onChatEvent);
@@ -2411,6 +2964,10 @@ function wireEvents() {
 async function main() {
   wireEvents();
   await refreshBootstrap(true);
+  const p = (state.settings?.provider || "xai").toLowerCase();
+  if (p === "accio" || p === "accio-work" || p === "phoenix") {
+    await refreshAccioCredits();
+  }
 }
 
 main().catch((e) => {

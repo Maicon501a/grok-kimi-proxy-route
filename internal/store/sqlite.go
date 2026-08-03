@@ -284,8 +284,21 @@ func (s *Store) saveAccountDB(a Account) error {
 }
 
 func (s *Store) deleteAccountDB(id string) error {
-	_, err := s.db.Exec(`DELETE FROM accounts WHERE id = ?`, id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM history WHERE account_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM usage WHERE account_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) saveUsageDB(usage map[string]UsageTotals) error {

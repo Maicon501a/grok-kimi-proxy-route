@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"grok-desktop/internal/logging"
+	"grok-desktop/internal/secure"
 )
 
 const (
@@ -27,11 +28,14 @@ const (
 	DefaultScopes        = "openid profile email offline_access api:access grok-cli:access conversations:read conversations:write"
 
 	// Upstream providers (local proxy can fan-out to any of these).
-	ProviderXAI      = "xai"
-	ProviderKimiWork = "kimi_work"
-	ProviderOllie    = "ollie"
-	ProviderGemini   = "gemini"
-	ProviderQwen     = "qwen"
+	ProviderXAI         = "xai"
+	ProviderKimiWork    = "kimi_work"
+	ProviderOllie       = "ollie"
+	ProviderGemini      = "gemini"
+	ProviderQwen        = "qwen"
+	ProviderDeepSeek    = "deepseek"
+	ProviderAccio       = "accio"
+	ProviderOpenCodeZen = "opencode_zen"
 
 	// AuthMode: how credentials are obtained for a provider.
 	AuthModeSession = "auth"    // multi-account session flow (xAI OAuth, Kimi Work mint)
@@ -49,7 +53,7 @@ const (
 	GeminiCredMarker = "adc:google"
 
 	// Kimi Work / Kimi Code (Desktop) — coding gateway with sk-kimi keys.
-	KimiWorkUpstream     = "https://agent-gw.kimi.com/coding/v1"
+	KimiWorkUpstream = "https://agent-gw.kimi.com/coding/v1"
 	// Wire model ids observed from official Kimi Desktop (agent-gw): k3-agent, k2d6-agent, k2p6.
 	// "kimi-for-coding" is product branding / legacy alias, not the chat model field.
 	KimiWorkDefaultModel = "k3-agent"
@@ -60,7 +64,50 @@ const (
 	// is discovered dynamically via GET {base}/models.
 	QwenDefaultUpstream = "http://127.0.0.1:3000/v1"
 	QwenDefaultModel    = "qwen3.8"
+
+	// DeepSeek — official OpenAI-compatible API (api.deepseek.com).
+	// The API key is stored encrypted (DPAPI on Windows) inside Settings.
+	DeepSeekUpstream     = "https://api.deepseek.com/v1"
+	DeepSeekDefaultModel = "deepseek-v4-flash"
+	// DeepSeekProModel is the flagship reasoning model (deepseek-v4-pro);
+	// both ids are exposed in catalogs and the proxy forwards whatever the
+	// client sends.
+	DeepSeekProModel = "deepseek-v4-pro"
+	// DeepSeekReasonerModel is the legacy reasoning id, kept for compat.
+	DeepSeekReasonerModel = "deepseek-reasoner"
+
+	AccioDefaultModel = "accio/1Nexus-R36W8qJ5vB6h"
+
+	// OpenCode Zen Free — direct OpenAI-compatible gateway. The public bearer
+	// token unlocks Zen's free tier; no local opencode process is required.
+	OpenCodeZenUpstream     = "https://opencode.ai/zen/v1"
+	OpenCodeZenAPIKey       = "public"
+	OpenCodeZenDefaultModel = "opencode/deepseek-v4-flash-free"
 )
+
+// ProviderAvailability returns the product-level availability gate used by
+// both the desktop chat and the embedded HTTP proxy. Empty means available.
+func ProviderAvailability(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case ProviderOllie, "olliechat", ProviderGemini, "google", "vertex", ProviderQwen, "qwenbridge":
+		return "disabled"
+	case ProviderAccio, "accio-work", "phoenix":
+		return "maintenance"
+	default:
+		return ""
+	}
+}
+
+func ProviderAvailabilityMessage(provider string) string {
+	switch ProviderAvailability(provider) {
+	case "disabled":
+		return "Este provedor está desativado no momento. Tente outro provedor."
+	case "maintenance":
+		return "Este provedor está em manutenção no momento. Tente outro provedor."
+	default:
+		return ""
+	}
+}
 
 type LoadBalancerStrategy string
 
@@ -85,7 +132,7 @@ type ProviderState struct {
 }
 
 type Account struct {
-	ID       string `json:"id"`
+	ID string `json:"id"`
 	// Provider: xai | kimi_work | … Empty means xai (legacy accounts).
 	Provider string `json:"provider,omitempty"`
 	Label    string `json:"label"`
@@ -163,6 +210,12 @@ func (a *Account) NormalizedProvider() string {
 		return ProviderGemini
 	case ProviderQwen, "qwenbridge", "qwen-bridge":
 		return ProviderQwen
+	case ProviderDeepSeek, "deep-seek", "ds":
+		return ProviderDeepSeek
+	case ProviderAccio, "accio-work", "phoenix":
+		return ProviderAccio
+	case ProviderOpenCodeZen, "opencode-zen", "opencode", "zen", "zen-free", "opencode-zen-free", "opencode zen", "opencode zen free":
+		return ProviderOpenCodeZen
 	case "", ProviderXAI, "grok", "x.ai":
 		return ProviderXAI
 	default:
@@ -251,7 +304,7 @@ func decodeB64URL(s string) ([]byte, error) {
 
 type Settings struct {
 	ActiveAccountID string `json:"active_account_id"`
-	// Provider: xai | kimi_work | ollie | gemini | qwen
+	// Provider: xai | kimi_work | ollie | gemini | qwen | deepseek | opencode_zen
 	Provider        string `json:"provider,omitempty"`
 	DefaultModel    string `json:"default_model"`
 	ReasoningEffort string `json:"reasoning_effort"`
@@ -270,10 +323,14 @@ type Settings struct {
 	// QwenBridge local bridge: base URL (with or without /v1) + its API_KEY.
 	QwenUpstream string `json:"qwen_upstream,omitempty"`
 	QwenAPIKey   string `json:"qwen_api_key,omitempty"`
-	ThemeAccent    string `json:"theme_accent,omitempty"`
-	KimiStealthHeadless bool `json:"kimi_stealth_headless"`
-	GoogleEmail    string `json:"google_email,omitempty"`
-	GooglePassword string `json:"google_password,omitempty"`
+	// DeepSeekAPIKey stores the DeepSeek API key as an ENCRYPTED blob
+	// (internal/secure — DPAPI on Windows). Never plaintext on disk; the
+	// frontend only ever sees a masked sentinel.
+	DeepSeekAPIKey      string `json:"deepseek_api_key,omitempty"`
+	ThemeAccent         string `json:"theme_accent,omitempty"`
+	KimiStealthHeadless bool   `json:"kimi_stealth_headless"`
+	GoogleEmail         string `json:"google_email,omitempty"`
+	GooglePassword      string `json:"google_password,omitempty"`
 	// LoadBalancerStrategies maps provider → strategy (active | round_robin | least_used | random).
 	LoadBalancerStrategies map[string]string `json:"load_balancer_strategies,omitempty"`
 }
@@ -346,6 +403,11 @@ func (s Settings) resolveModel(requested string, force bool) string {
 	if s.IsOllie() {
 		req = normalizeOllieModelAlias(req)
 	}
+	// Zen's provider prefix is a client-facing namespace. The gateway expects
+	// the bare model id (e.g. deepseek-v4-flash-free).
+	if s.IsOpenCodeZen() {
+		req = resolveOpenCodeZenModel(req)
+	}
 	// Kimi Work: Desktop aliases → gateway wire id
 	if s.IsKimiWork() {
 		req = resolveKimiWorkModel(req)
@@ -404,6 +466,8 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 	id = normalizeOllieModelAlias(id)
 	id = NormalizeKimiModelAlias(id)
 	switch {
+	case looksLikeAccioModel(id):
+		return s.WithProvider(ProviderAccio)
 	case looksLikeKimiWorkModel(id):
 		return s.WithProvider(ProviderKimiWork)
 	case looksLikeGeminiModel(id):
@@ -411,6 +475,11 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 	case looksLikeQwenModel(id):
 		// Before Ollie: its catalog hints contain "qwen-".
 		return s.WithProvider(ProviderQwen)
+	case looksLikeOpenCodeZenModel(id):
+		return s.WithProvider(ProviderOpenCodeZen)
+	case looksLikeDeepSeekModel(id):
+		// Before Ollie: its catalog hints contain "deepseek-".
+		return s.WithProvider(ProviderDeepSeek)
 	case looksLikeOllieModel(id):
 		return s.WithProvider(ProviderOllie)
 	case looksLikeXAIModel(id):
@@ -456,7 +525,29 @@ func (s Settings) WithProvider(provider string) Settings {
 		if out.DefaultModel == "" || looksLikeXAIModel(out.DefaultModel) || looksLikeKimiWorkModel(out.DefaultModel) || looksLikeGeminiModel(out.DefaultModel) {
 			out.DefaultModel = QwenDefaultModel
 		}
+	case ProviderDeepSeek, "deep-seek", "ds":
+		out.Provider = ProviderDeepSeek
+		out.UpstreamBase = DeepSeekUpstream
+		out.APIMode = "chat"
+		if out.DefaultModel == "" || !looksLikeDeepSeekModel(out.DefaultModel) {
+			out.DefaultModel = DeepSeekDefaultModel
+		}
+	case ProviderAccio, "accio-work", "phoenix":
+		out.Provider = ProviderAccio
+		out.UpstreamBase = "https://phoenix-gw.alibaba.com/api/adk/llm"
+		out.APIMode = "chat"
+		if out.DefaultModel == "" || !looksLikeAccioModel(out.DefaultModel) {
+			out.DefaultModel = AccioDefaultModel
+		}
+	case ProviderOpenCodeZen, "opencode-zen", "opencode", "zen", "zen-free", "opencode-zen-free", "opencode zen", "opencode zen free":
+		out.Provider = ProviderOpenCodeZen
+		out.UpstreamBase = OpenCodeZenUpstream
+		out.APIMode = "chat"
+		if out.DefaultModel == "" || !looksLikeOpenCodeZenModel(out.DefaultModel) {
+			out.DefaultModel = OpenCodeZenDefaultModel
+		}
 	case ProviderXAI, "grok", "x.ai":
+
 		out.Provider = ProviderXAI
 		out.UpstreamBase = DefaultUpstream
 		out.APIMode = "responses"
@@ -493,6 +584,10 @@ func (s Settings) isNativeModelForProvider(requested string) bool {
 		return looksLikeGeminiModel(id)
 	case ProviderQwen:
 		return looksLikeQwenModel(id)
+	case ProviderDeepSeek:
+		return looksLikeDeepSeekModel(id)
+	case ProviderOpenCodeZen:
+		return looksLikeOpenCodeZenModel(id)
 	case ProviderKimiWork:
 		return looksLikeKimiWorkModel(id) || looksLikeKimiWorkModel(NormalizeKimiModelAlias(id))
 	default:
@@ -534,6 +629,11 @@ func NormalizeKimiModelAlias(id string) string {
 	}
 }
 
+func looksLikeAccioModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "accio/") || strings.HasPrefix(m, "accio-") || strings.Contains(m, "nexus-") || strings.Contains(m, "phoenix")
+}
+
 func (s Settings) ProviderDefaultModel() string {
 	switch s.NormalizedProvider() {
 	case ProviderOllie:
@@ -542,6 +642,12 @@ func (s Settings) ProviderDefaultModel() string {
 		return GeminiDefaultModel
 	case ProviderQwen:
 		return QwenDefaultModel
+	case ProviderDeepSeek:
+		return DeepSeekDefaultModel
+	case ProviderAccio:
+		return AccioDefaultModel
+	case ProviderOpenCodeZen:
+		return OpenCodeZenDefaultModel
 	case ProviderKimiWork:
 		return KimiWorkDefaultModel
 	default:
@@ -552,7 +658,7 @@ func (s Settings) ProviderDefaultModel() string {
 // ProviderAuthMode returns "auth" (session/account pool) or "api_key" (direct key/ADC).
 func (s Settings) ProviderAuthMode() string {
 	switch s.NormalizedProvider() {
-	case ProviderXAI, ProviderKimiWork:
+	case ProviderXAI, ProviderKimiWork, ProviderAccio:
 		return AuthModeSession
 	default:
 		return AuthModeAPIKey
@@ -571,6 +677,12 @@ func (s Settings) NormalizedProvider() string {
 		return ProviderKimiWork
 	case ProviderQwen, "qwenbridge", "qwen-bridge":
 		return ProviderQwen
+	case ProviderDeepSeek, "deep-seek", "ds":
+		return ProviderDeepSeek
+	case ProviderAccio, "accio-work", "phoenix":
+		return ProviderAccio
+	case ProviderOpenCodeZen, "opencode-zen", "opencode", "zen", "zen-free", "opencode-zen-free", "opencode zen", "opencode zen free":
+		return ProviderOpenCodeZen
 	case "", ProviderXAI, "grok", "x.ai", "cli":
 		return ProviderXAI
 	default:
@@ -585,16 +697,41 @@ func (s Settings) NormalizedProvider() string {
 			strings.Contains(strings.ToLower(s.UpstreamBase), "generativelanguage") {
 			return ProviderGemini
 		}
+		if strings.Contains(strings.ToLower(s.UpstreamBase), "opencode.ai/zen") {
+			return ProviderOpenCodeZen
+		}
 		return ProviderXAI
 	}
 }
 
-func (s Settings) IsOllie() bool     { return s.NormalizedProvider() == ProviderOllie }
-func (s Settings) IsXAI() bool       { return s.NormalizedProvider() == ProviderXAI }
-func (s Settings) IsGemini() bool    { return s.NormalizedProvider() == ProviderGemini }
-func (s Settings) IsKimiWork() bool  { return s.NormalizedProvider() == ProviderKimiWork }
-func (s Settings) IsQwen() bool      { return s.NormalizedProvider() == ProviderQwen }
+func (s Settings) IsOllie() bool       { return s.NormalizedProvider() == ProviderOllie }
+func (s Settings) IsXAI() bool         { return s.NormalizedProvider() == ProviderXAI }
+func (s Settings) IsGemini() bool      { return s.NormalizedProvider() == ProviderGemini }
+func (s Settings) IsKimiWork() bool    { return s.NormalizedProvider() == ProviderKimiWork }
+func (s Settings) IsQwen() bool        { return s.NormalizedProvider() == ProviderQwen }
+func (s Settings) IsDeepSeek() bool    { return s.NormalizedProvider() == ProviderDeepSeek }
+func (s Settings) IsAccio() bool       { return s.NormalizedProvider() == ProviderAccio }
+func (s Settings) IsOpenCodeZen() bool { return s.NormalizedProvider() == ProviderOpenCodeZen }
 func (s Settings) IsSessionAuth() bool { return s.ProviderAuthMode() == AuthModeSession }
+
+// HasDeepSeekKey reports whether a DeepSeek API key is configured. The stored
+// value is an encrypted blob (or legacy plaintext) — never echo it out.
+func (s Settings) HasDeepSeekKey() bool {
+	return strings.TrimSpace(s.DeepSeekAPIKey) != ""
+}
+
+// DeepSeekAPIKeyPlain decrypts the stored DeepSeek API key. Returns "" when
+// nothing is stored or the blob cannot be decrypted (different user/machine).
+func (s Settings) DeepSeekAPIKeyPlain() string {
+	if !s.HasDeepSeekKey() {
+		return ""
+	}
+	out, err := secure.Decrypt(s.DeepSeekAPIKey)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
 
 // EffectiveUpstream returns the base URL including /v1 used for OpenAI-style paths.
 // Gemini does not use this HTTP reverse-proxy base (it uses Vertex REST + ADC).
@@ -627,6 +764,23 @@ func (s Settings) EffectiveUpstream() string {
 		return fmt.Sprintf("https://aiplatform.googleapis.com/v1beta1/projects/%s/locations/%s", proj, loc)
 	case ProviderQwen:
 		return s.EffectiveQwenUpstream()
+	case ProviderDeepSeek:
+		// Official DeepSeek API; custom UpstreamBase honored as override.
+		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
+		if b == "" || strings.Contains(strings.ToLower(b), "cli-chat-proxy") ||
+			strings.Contains(strings.ToLower(b), "olliechat") ||
+			strings.Contains(strings.ToLower(b), "aiplatform") ||
+			strings.Contains(strings.ToLower(b), "agent-gw") {
+			return DeepSeekUpstream
+		}
+		if !strings.HasSuffix(b, "/v1") {
+			return b + "/v1"
+		}
+		return b
+	case ProviderAccio:
+		return "https://phoenix-gw.alibaba.com/api/adk/llm"
+	case ProviderOpenCodeZen:
+		return OpenCodeZenUpstream
 	default:
 		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
 		if b == "" || strings.Contains(strings.ToLower(b), "olliechat") ||
@@ -718,6 +872,22 @@ func (s *Settings) ApplyProviderDefaults(provider string) {
 		// the proxy wires qwen through chat/completions like Ollie/Kimi).
 		s.APIMode = "chat"
 		s.DefaultModel = QwenDefaultModel
+	case ProviderDeepSeek:
+		s.Provider = ProviderDeepSeek
+		s.UpstreamBase = DeepSeekUpstream
+		// DeepSeek API is OpenAI chat/completions only (no /responses).
+		s.APIMode = "chat"
+		s.DefaultModel = DeepSeekDefaultModel
+	case ProviderAccio:
+		s.Provider = ProviderAccio
+		s.UpstreamBase = "https://phoenix-gw.alibaba.com/api/adk/llm"
+		s.APIMode = "chat"
+		s.DefaultModel = AccioDefaultModel
+	case ProviderOpenCodeZen:
+		s.Provider = ProviderOpenCodeZen
+		s.UpstreamBase = OpenCodeZenUpstream
+		s.APIMode = "chat"
+		s.DefaultModel = OpenCodeZenDefaultModel
 	default:
 		s.Provider = ProviderXAI
 		s.UpstreamBase = DefaultUpstream
@@ -819,6 +989,67 @@ func looksLikeQwenModel(model string) bool {
 	return strings.HasPrefix(m, "qwen")
 }
 
+// looksLikeDeepSeekModel reports whether the id belongs to the DeepSeek API
+// (deepseek-chat, deepseek-reasoner, deepseek-v4-*, …).
+func looksLikeDeepSeekModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	return strings.HasPrefix(m, "deepseek")
+}
+
+// looksLikeOpenCodeZenModel reports the public/free OpenCode Zen namespace.
+// The opencode/ prefix is preferred because names such as deepseek-v4-flash
+// are also used by other providers. Short aliases are kept for compatibility
+// with the standalone D:\proxy opencode adapter.
+func looksLikeOpenCodeZenModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	for _, suffix := range []string{"-responses", "@responses", "/responses"} {
+		m = strings.TrimSuffix(m, suffix)
+	}
+	if strings.HasPrefix(m, "opencode/") {
+		return true
+	}
+	switch m {
+	case "deepseek-v4-flash-free", "deepseek-v4-flash",
+		"big-pickle", "mimo-v2.5-free", "mimo-v2.5",
+		"nemotron-3-ultra-free", "nemotron-3-ultra",
+		"north-mini-code-free", "north-mini-code",
+		"ling-3.0-flash-free", "ling-3.0-flash",
+		"laguna-s-2.1-free", "laguna-s-2.1":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveOpenCodeZenModel(model string) string {
+	m := strings.TrimSpace(model)
+	if strings.HasPrefix(strings.ToLower(m), "opencode/") {
+		m = m[len("opencode/"):]
+	}
+	switch strings.ToLower(m) {
+	case "deepseek-v4-flash":
+		return "deepseek-v4-flash-free"
+	case "mimo-v2.5":
+		return "mimo-v2.5-free"
+	case "nemotron-3-ultra":
+		return "nemotron-3-ultra-free"
+	case "north-mini-code":
+		return "north-mini-code-free"
+	case "ling-3.0-flash":
+		return "ling-3.0-flash-free"
+	case "laguna-s-2.1":
+		return "laguna-s-2.1-free"
+	default:
+		return m
+	}
+}
+
 func looksLikeXAIModel(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	return strings.HasPrefix(m, "grok-") || strings.Contains(m, "grok-")
@@ -866,6 +1097,26 @@ func (s *Settings) SanitizeModelForProvider() {
 		}
 		s.UpstreamBase = s.EffectiveQwenUpstream()
 		s.APIMode = "chat"
+	case ProviderDeepSeek:
+		if s.DefaultModel == "" || !looksLikeDeepSeekModel(s.DefaultModel) {
+			s.DefaultModel = DeepSeekDefaultModel
+		}
+		s.UpstreamBase = DeepSeekUpstream
+		s.APIMode = "chat"
+	case ProviderAccio:
+		s.Provider = ProviderAccio
+		if s.DefaultModel == "" || !looksLikeAccioModel(s.DefaultModel) {
+			s.DefaultModel = AccioDefaultModel
+		}
+		s.UpstreamBase = "https://phoenix-gw.alibaba.com/api/adk/llm"
+		s.APIMode = "chat"
+	case ProviderOpenCodeZen:
+		s.Provider = ProviderOpenCodeZen
+		if s.DefaultModel == "" || !looksLikeOpenCodeZenModel(s.DefaultModel) {
+			s.DefaultModel = OpenCodeZenDefaultModel
+		}
+		s.UpstreamBase = OpenCodeZenUpstream
+		s.APIMode = "chat"
 	default:
 		if s.DefaultModel == "" || looksLikeOllieModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) {
 			s.DefaultModel = DefaultModel
@@ -885,8 +1136,9 @@ func (s *Settings) SanitizeModelForProvider() {
 func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStrategy) *Account {
 	want := s.normalizeProviderFilter(provider)
 
-	// API-key providers don't have account pools.
-	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen {
+	// API-key providers don't have account pools. Accio sessions are stored as
+	// normal provider accounts and are selected by the same load balancer.
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen {
 		return nil
 	}
 
@@ -989,7 +1241,7 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 // Use this in pollers/readiness checks; PickAccountForProvider advances RR.
 func (s *Store) HasUsableAccountForProvider(provider string) bool {
 	want := s.normalizeProviderFilter(provider)
-	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen {
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen {
 		return false
 	}
 	s.mu.RLock()
@@ -1056,28 +1308,43 @@ func ProviderCatalog() []map[string]any {
 	return []map[string]any{
 		{
 			"id": ProviderXAI, "name": "Grok (xAI)", "auth_mode": AuthModeSession,
-			"description": "OAuth device login · multi-conta",
+			"description":   "OAuth device login · multi-conta",
 			"default_model": DefaultModel, "default_api": "responses",
 		},
 		{
 			"id": ProviderKimiWork, "name": "Kimi Work", "auth_mode": AuthModeSession,
-			"description": "Google login → sk-kimi · até 3 contas · rotação + re-login HTTP",
+			"description":   "Google login → sk-kimi · até 3 contas · rotação + re-login HTTP",
 			"default_model": KimiWorkDefaultModel, "default_api": "chat",
 		},
 		{
 			"id": ProviderOllie, "name": "OllieChat", "auth_mode": AuthModeAPIKey,
-			"description": "API keyless · sem pool de contas",
+			"description":   "API keyless · sem pool de contas",
 			"default_model": OllieDefaultModel, "default_api": "chat",
 		},
 		{
 			"id": ProviderGemini, "name": "Gemini (ADC)", "auth_mode": AuthModeAPIKey,
-			"description": "Google ADC / projeto · sem pool de contas",
+			"description":   "Google ADC / projeto · sem pool de contas",
 			"default_model": GeminiDefaultModel, "default_api": "chat",
 		},
 		{
 			"id": ProviderQwen, "name": "Qwen (QwenBridge)", "auth_mode": AuthModeAPIKey,
-			"description": "QwenBridge local · base URL + API key · sem pool de contas",
+			"description":   "QwenBridge local · base URL + API key · sem pool de contas",
 			"default_model": QwenDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderDeepSeek, "name": "DeepSeek", "auth_mode": AuthModeAPIKey,
+			"description":   "DeepSeek API oficial · API key criptografada (DPAPI) · sem pool de contas",
+			"default_model": DeepSeekDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderOpenCodeZen, "name": "OpenCode Zen Free", "auth_mode": AuthModeAPIKey,
+			"description":   "Zen direto - bearer publico - sem terminal/opencode serve - modelos free",
+			"default_model": OpenCodeZenDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderAccio, "name": "Accio", "auth_mode": AuthModeSession,
+			"description":   "Accio/Phoenix · login OAuth · refresh automático",
+			"default_model": AccioDefaultModel, "default_api": "chat",
 		},
 	}
 }
@@ -1202,6 +1469,8 @@ func Open(root string) (*Store, error) {
 	if err := s.loadFromSQLite(); err != nil {
 		return nil, fmt.Errorf("sqlite load: %w", err)
 	}
+	// DeepSeek key vault: file is source of truth, settings blob is a mirror.
+	s.syncDeepSeekKeyVault()
 	// One-time migrations from older app formats
 	_ = s.migrateFromLegacy()
 	// Bump stale client version baked into older installs.
@@ -1280,6 +1549,52 @@ func defaultSettings() Settings {
 }
 
 func (s *Store) Root() string { return s.root }
+
+// ---------- DeepSeek key vault ----------
+//
+// The encrypted DeepSeek key lives in its own file under secrets/ (the vault).
+// The Settings blob field is only a mirror: if a legacy binary re-saves
+// settings.json without the field, the vault survives and is re-injected on
+// the next Open.
+
+func (s *Store) secretsDir() string { return filepath.Join(s.root, "secrets") }
+
+func (s *Store) deepSeekKeyPath() string { return filepath.Join(s.secretsDir(), "deepseek.key") }
+
+// WriteDeepSeekKeyFile atomically persists the encrypted blob (0600, dir 0700).
+func (s *Store) WriteDeepSeekKeyFile(encryptedBlob string) error {
+	if encryptedBlob == "" {
+		return os.Remove(s.deepSeekKeyPath())
+	}
+	if err := os.MkdirAll(s.secretsDir(), 0o700); err != nil {
+		return err
+	}
+	tmp := s.deepSeekKeyPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(encryptedBlob), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.deepSeekKeyPath())
+}
+
+func (s *Store) readDeepSeekKeyFile() string {
+	b, err := os.ReadFile(s.deepSeekKeyPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// syncDeepSeekKeyVault runs on Open: the vault file is the source of truth.
+// A legacy blob left in settings is migrated into the vault (one-way).
+func (s *Store) syncDeepSeekKeyVault() {
+	if b := s.readDeepSeekKeyFile(); b != "" {
+		s.settings.DeepSeekAPIKey = b
+		return
+	}
+	if secure.HasCiphertext(s.settings.DeepSeekAPIKey) {
+		_ = s.WriteDeepSeekKeyFile(s.settings.DeepSeekAPIKey)
+	}
+}
 
 func (s *Store) settingsPath() string { return filepath.Join(s.root, "settings.json") }
 func (s *Store) usagePath() string    { return filepath.Join(s.root, "usage.json") }
@@ -1409,6 +1724,12 @@ func mergeSettings(base, over Settings) Settings {
 	if over.GeminiLocation != "" {
 		base.GeminiLocation = over.GeminiLocation
 	}
+	if over.QwenAPIKey != "" {
+		base.QwenAPIKey = over.QwenAPIKey
+	}
+	if over.DeepSeekAPIKey != "" {
+		base.DeepSeekAPIKey = over.DeepSeekAPIKey
+	}
 	if over.ActiveAccountID != "" {
 		base.ActiveAccountID = over.ActiveAccountID
 	}
@@ -1495,8 +1816,8 @@ func (s *Store) migrateFromLegacy() error {
 	oldState := filepath.Join(home, ".grok-openai-proxy", "desktop", "state.json")
 	if b, err := os.ReadFile(oldState); err == nil {
 		var d struct {
-			Accounts []Account             `json:"accounts"`
-			Settings Settings              `json:"settings"`
+			Accounts []Account              `json:"accounts"`
+			Settings Settings               `json:"settings"`
 			Usage    map[string]UsageTotals `json:"usage"`
 		}
 		if json.Unmarshal(b, &d) == nil {
@@ -1641,8 +1962,9 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 	case "grok", "x.ai":
 		want = ProviderXAI
 	}
-	// API-key providers have no session account pool.
-	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen {
+	// API-key providers have no session account pool. Accio accounts are
+	// synchronized from the independent native client into this same UI pool.
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen {
 		return []map[string]any{}
 	}
 	out := make([]map[string]any, 0, len(s.accounts))
@@ -1663,28 +1985,28 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 			(strings.TrimSpace(a.RefreshToken) != "" ||
 				(strings.TrimSpace(a.AccessToken) != "" && !strings.HasPrefix(strings.TrimSpace(a.AccessToken), "sk-kimi-")))
 		out = append(out, map[string]any{
-			"id":                 a.ID,
-			"provider":           a.NormalizedProvider(),
-			"label":              a.Label,
-			"email":              a.Email,
-			"user_id":            a.UserID,
-			"team_id":            a.TeamID,
-			"source":             a.Source,
-			"api_key_hint":       keyHint,
-			"has_web_session":    hasWeb,
-		"has_refresh":        strings.TrimSpace(a.RefreshToken) != "",
-		"has_google_refresh": strings.TrimSpace(a.GoogleRefreshToken) != "",
-		"google_email":         a.GoogleEmail,
-		"has_google_password":  a.GooglePassword != "",
-		"expires_at":         a.ExpiresAt,
-		"expired":            a.Expired(),
-		"exhausted":          a.Exhausted(),
-			"exhausted_at":       a.ExhaustedAt,
-			"exhaust_reason":     a.ExhaustReason,
-			"auth_denied":        a.AuthDenied(),
-			"auth_denied_at":     a.AuthDeniedAt,
-			"auth_denied_reason": a.AuthDeniedReason,
-			"active":             a.ID == s.settings.ActiveAccountID,
+			"id":                  a.ID,
+			"provider":            a.NormalizedProvider(),
+			"label":               a.Label,
+			"email":               a.Email,
+			"user_id":             a.UserID,
+			"team_id":             a.TeamID,
+			"source":              a.Source,
+			"api_key_hint":        keyHint,
+			"has_web_session":     hasWeb,
+			"has_refresh":         strings.TrimSpace(a.RefreshToken) != "",
+			"has_google_refresh":  strings.TrimSpace(a.GoogleRefreshToken) != "",
+			"google_email":        a.GoogleEmail,
+			"has_google_password": a.GooglePassword != "",
+			"expires_at":          a.ExpiresAt,
+			"expired":             a.Expired(),
+			"exhausted":           a.Exhausted(),
+			"exhausted_at":        a.ExhaustedAt,
+			"exhaust_reason":      a.ExhaustReason,
+			"auth_denied":         a.AuthDenied(),
+			"auth_denied_at":      a.AuthDeniedAt,
+			"auth_denied_reason":  a.AuthDeniedReason,
+			"active":              a.ID == s.settings.ActiveAccountID,
 			"usage": map[string]any{
 				"prompt_tokens":     u.PromptTokens,
 				"completion_tokens": u.CompletionTokens,
@@ -2478,6 +2800,14 @@ func (s *Store) RemoveAccount(id string) error {
 	}
 	delete(s.usage, id)
 	_ = s.saveUsageLocked()
+	filtered := s.history[:0]
+	for _, h := range s.history {
+		if h.AccountID != id {
+			filtered = append(filtered, h)
+		}
+	}
+	s.history = filtered
+	_ = s.saveHistoryLocked()
 	return nil
 }
 

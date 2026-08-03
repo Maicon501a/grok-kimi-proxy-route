@@ -200,6 +200,40 @@ func (l *Logger) log(level Level, msg string, kv []any) {
 	b.WriteByte('\n')
 
 	_, _ = io.WriteString(l.out, b.String())
+	notifySink(level, msg, fields)
+}
+
+// ---- UI sink ----
+
+// SinkFunc receives every structured log line emitted by any Logger.
+// Fields are pre-masked (secrets redacted) and safe to render.
+type SinkFunc func(level Level, msg string, fields map[string]any)
+
+var (
+	sinkMu sync.RWMutex
+	sinkFn SinkFunc
+)
+
+// SetSink installs a global sink (e.g. the Wails app emitting UI events).
+// Pass nil to remove. Only one sink is supported.
+func SetSink(fn SinkFunc) {
+	sinkMu.Lock()
+	defer sinkMu.Unlock()
+	sinkFn = fn
+}
+
+func notifySink(level Level, msg string, fields map[string]any) {
+	sinkMu.RLock()
+	fn := sinkFn
+	sinkMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	out := make(map[string]any, len(fields))
+	for k, v := range fields {
+		out[k] = formatValue(k, v)
+	}
+	fn(level, msg, out)
 }
 
 func formatValue(key string, v any) string {

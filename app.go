@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,12 +16,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"grok-desktop/internal/accio"
+	"grok-desktop/internal/accmgr"
 	"grok-desktop/internal/kimi"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/mcpconfig"
 	"grok-desktop/internal/oauth"
 	"grok-desktop/internal/pricing"
 	"grok-desktop/internal/proxyhttp"
+	"grok-desktop/internal/secure"
 	"grok-desktop/internal/signup"
 	"grok-desktop/internal/skills"
 	"grok-desktop/internal/store"
@@ -32,6 +38,8 @@ type App struct {
 	oauth    *oauth.Client
 	upstream *upstream.Client
 	proxy    *proxyhttp.Server
+	accio    *accio.Client
+	accMgr   *accmgr.Manager
 	skills   *skills.Store
 	mcp      *mcpconfig.Store
 
@@ -103,6 +111,15 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	// Stream every structured log line to the UI in real time (Logs modal).
+	logging.SetSink(func(level logging.Level, msg string, fields map[string]any) {
+		a.safeEmit("log", map[string]any{
+			"ts":     time.Now().UnixMilli(),
+			"level":  level.String(),
+			"msg":    msg,
+			"fields": fields,
+		})
+	})
 	st, err := store.Open("")
 	if err != nil {
 		runtime.LogErrorf(ctx, "store open: %v", err)
@@ -115,8 +132,51 @@ func (a *App) startup(ctx context.Context) {
 		a.oauth.CLIVersion = v
 	}
 	a.upstream = upstream.New()
+	if ac, err := accio.New(filepath.Join(st.Root(), "accio")); err == nil {
+		a.accio = ac
+		for _, t := range ac.Accounts() {
+			a.syncAccioAccount(t)
+		}
+		// Wire login callback → Wails event so the UI can poll/refresh.
+		ac.OnLogin(func(t accio.TokenRecord) {
+			a.syncAccioAccount(t)
+			a.safeEmit("accio:login", map[string]any{
+				"id":    t.ID,
+				"email": t.Email,
+				"label": t.Label,
+			})
+		})
+		// Account manager: keeps the pool topped up so requests never die on an
+		// exhausted quota. Started below (after the store is ready).
+		a.accMgr = accmgr.New(ac, accmgr.Config{
+			MinCredits:     envInt("ACCIO_MIN_CREDITS", 300),
+			MaxAccounts:    envInt("ACCIO_MAX_ACCOUNTS", 10),
+			CreateCooldown: envDur("ACCIO_CREATE_COOLDOWN", 3*time.Minute),
+			CheckEvery:     envDur("ACCIO_CHECK_EVERY", 2*time.Minute),
+			WARP:           os.Getenv("ACCIO_USE_WARP") != "0",
+			Headless:       os.Getenv("ACCIO_SIGNUP_VISIBLE") != "1",
+		})
+		// Import the existing standalone proxy credential once, without logging it.
+		standalone := filepath.Join(filepath.Dir(st.Root()), "accio-proxy", "token.json")
+		if _, err := os.Stat(filepath.Join(st.Root(), "accio", "token.json")); os.IsNotExist(err) {
+			if err := ac.ImportTokenFile(standalone); err == nil {
+				// ImportTokenFile writes the private Accio credential but does not
+				// fire the login callback. Sync it explicitly or the proxy pool
+				// will not see the imported account until the next app restart.
+				if t, readErr := ac.CurrentAccount(); readErr == nil {
+					a.syncAccioAccount(t)
+				}
+			}
+		}
+	}
 	a.proxy = proxyhttp.New(st, a.upstream, a.ensureCreds)
+	a.proxy.SetAccio(a.accio)
 	a.proxy.SetForceRefresh(a.forceRefreshAccount)
+	// Start the Accio account top-up loop (no-op unless accounts exist and
+	// the aggregate balance drops below the configured floor).
+	if a.accMgr != nil {
+		a.accMgr.Start()
+	}
 	a.proxy.SetQuotaHandler(func(accountID, reason string) bool {
 		// Blocks when needed until re-login refills a usable Kimi account; never requires min-3.
 		a.markAccountExhausted(accountID, reason)
@@ -165,6 +225,10 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	accio.ShutdownSGDaemon()
+	if a.accMgr != nil {
+		a.accMgr.Stop()
+	}
 	if a.proxy != nil {
 		_ = a.proxy.Stop(context.Background())
 	}
@@ -190,6 +254,10 @@ func (a *App) GetBootstrap() map[string]any {
 		active = map[string]any{
 			"id": "qwen", "email": s.EffectiveQwenUpstream(), "label": "QwenBridge", "provider": store.ProviderQwen, "auth_mode": store.AuthModeAPIKey,
 		}
+	} else if s.IsDeepSeek() {
+		active = map[string]any{
+			"id": "deepseek", "email": store.DeepSeekUpstream, "label": "DeepSeek", "provider": store.ProviderDeepSeek, "auth_mode": store.AuthModeAPIKey,
+		}
 	} else if s.IsOllie() {
 		active = map[string]any{
 			"id": "ollie", "email": "keyless@olliechat", "label": "OllieChat", "provider": store.ProviderOllie, "auth_mode": store.AuthModeAPIKey,
@@ -197,6 +265,10 @@ func (a *App) GetBootstrap() map[string]any {
 	} else if s.IsGemini() {
 		active = map[string]any{
 			"id": "gemini-adc", "email": s.EffectiveGeminiProject(), "label": "Gemini ADC", "provider": store.ProviderGemini, "auth_mode": store.AuthModeAPIKey,
+		}
+	} else if s.IsOpenCodeZen() {
+		active = map[string]any{
+			"id": "opencode-zen-free", "email": "keyless@opencode.ai", "label": "OpenCode Zen Free", "provider": store.ProviderOpenCodeZen, "auth_mode": store.AuthModeAPIKey,
 		}
 	} else if acc, ok := a.store.ActiveAccount(); ok && acc != nil {
 		active = map[string]any{
@@ -224,6 +296,7 @@ func (a *App) GetBootstrap() map[string]any {
 	}
 	masked := s
 	masked.QwenAPIKey = maskQwenAPIKey(s.QwenAPIKey)
+	masked.DeepSeekAPIKey = maskDeepSeekAPIKey(s.DeepSeekAPIKey)
 	return map[string]any{
 		"settings":       masked,
 		"accounts":       a.store.PublicAccountsForProvider(s.NormalizedProvider()),
@@ -255,20 +328,61 @@ func maskQwenAPIKey(key string) string {
 	return qwenKeyMask
 }
 
+// maskDeepSeekAPIKey hides the stored DeepSeek key (an encrypted blob) behind
+// the same sentinel the frontend treats as "unchanged".
+func maskDeepSeekAPIKey(key string) string {
+	if strings.TrimSpace(key) == "" {
+		return ""
+	}
+	return qwenKeyMask
+}
+
 func (a *App) GetSettings() store.Settings {
 	if a.store == nil {
 		return store.Settings{}
 	}
 	s := a.store.Settings()
 	s.QwenAPIKey = maskQwenAPIKey(s.QwenAPIKey)
+	s.DeepSeekAPIKey = maskDeepSeekAPIKey(s.DeepSeekAPIKey)
 	return s
 }
 
 func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
+	// DeepSeek API key: encrypt BEFORE persisting so the on-disk blob is always
+	// ciphertext (DPAPI on Windows). The masked sentinel means "unchanged" and
+	// an explicit empty string clears the stored key. The encrypted blob is
+	// written to the secrets vault file (survives legacy settings re-saves);
+	// the Settings field keeps a mirror copy.
+	var deepSeekKeyEnc string
+	var hasDeepSeekKeyPatch bool
+	if v, ok := patch["deepseek_api_key"].(string); ok {
+		hasDeepSeekKeyPatch = true
+		switch {
+		case v == qwenKeyMask:
+			// unchanged
+		case strings.TrimSpace(v) == "":
+			deepSeekKeyEnc = ""
+			if err := a.store.WriteDeepSeekKeyFile(""); err != nil {
+				return store.Settings{}, fmt.Errorf("deepseek: falha ao limpar API key: %w", err)
+			}
+		default:
+			enc, err := secure.Encrypt(strings.TrimSpace(v))
+			if err != nil {
+				return store.Settings{}, fmt.Errorf("deepseek: falha ao criptografar API key: %w", err)
+			}
+			if err := a.store.WriteDeepSeekKeyFile(enc); err != nil {
+				return store.Settings{}, fmt.Errorf("deepseek: falha ao salvar API key: %w", err)
+			}
+			deepSeekKeyEnc = enc
+		}
+	}
 	err := a.store.UpdateSettings(func(s *store.Settings) {
 		if v, ok := patch["provider"].(string); ok && v != "" {
 			// Full switch: resets model + upstream for that provider (no leftover ids).
 			s.ApplyProviderDefaults(v)
+		}
+		if hasDeepSeekKeyPatch {
+			s.DeepSeekAPIKey = deepSeekKeyEnc
 		}
 		if v, ok := patch["default_model"].(string); ok && v != "" {
 			s.DefaultModel = v
@@ -333,6 +447,7 @@ func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
 	s := a.store.Settings()
 	a.reconcileProxy(s)
 	s.QwenAPIKey = maskQwenAPIKey(s.QwenAPIKey)
+	s.DeepSeekAPIKey = maskDeepSeekAPIKey(s.DeepSeekAPIKey)
 	return s, nil
 }
 
@@ -400,10 +515,35 @@ func (a *App) ListProviders() []map[string]any {
 }
 
 func (a *App) SetActiveAccount(id string) error {
-	return a.store.SetActiveAccount(id)
+	if a.store == nil {
+		return fmt.Errorf("store not ready")
+	}
+	if err := a.store.SetActiveAccount(id); err != nil {
+		return err
+	}
+	if a.accio != nil {
+		if acc, ok := a.store.GetAccount(id); ok && acc != nil && acc.NormalizedProvider() == store.ProviderAccio {
+			if err := a.accio.SetActiveAccount(id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (a *App) RemoveAccount(id string) error {
+	if a.store == nil {
+		return fmt.Errorf("store not ready")
+	}
+	acc, ok := a.store.GetAccount(id)
+	if !ok || acc == nil {
+		return fmt.Errorf("account not found")
+	}
+	if acc.NormalizedProvider() == store.ProviderAccio && a.accio != nil {
+		if err := a.accio.RemoveAccount(id); err != nil {
+			return fmt.Errorf("remove Accio account: %w", err)
+		}
+	}
 	return a.store.RemoveAccount(id)
 }
 
@@ -591,7 +731,6 @@ func (a *App) startKimiStealthLoginForAccount(accountID string, autoClose bool, 
 	})
 	return a.startKimiStealthLoginNewAccount(autoClose, background)
 }
-
 
 // pickGoogleRefreshTokenFor returns a stored Google OAuth refresh_token for HTTP re-login.
 // Prefers the given accountID, then active Kimi account, then any Kimi account that has one.
@@ -846,13 +985,13 @@ func (a *App) addKimiSession(accessToken, refreshToken, googleRefreshToken strin
 	return map[string]any{
 		"id": acc.ID, "label": acc.Label, "email": email, "user_id": userID, "provider": store.ProviderKimiWork,
 		"api_key_hint": hint, "source": source,
-		"has_refresh":            refreshToken != "",
-		"refresh_tested":         true,
-		"has_google_refresh":     googleRefreshToken != "",
-		"google_refresh_tested":  googleRefreshToken != "",
-		"upstream_tested":        true,
-		"expires_at":             minted.ExpiresAt,
-		"expires_in_seconds":     int(time.Until(minted.ExpiresAt).Seconds()),
+		"has_refresh":           refreshToken != "",
+		"refresh_tested":        true,
+		"has_google_refresh":    googleRefreshToken != "",
+		"google_refresh_tested": googleRefreshToken != "",
+		"upstream_tested":       true,
+		"expires_at":            minted.ExpiresAt,
+		"expires_in_seconds":    int(time.Until(minted.ExpiresAt).Seconds()),
 	}, nil
 }
 
@@ -972,8 +1111,136 @@ func (a *App) OpenExternal(url string) {
 	runtime.BrowserOpenURL(a.ctx, url)
 }
 
+// StartAccioLogin starts the native Accio browser callback flow. Tokens stay in
+// the private AppData store and are never returned to the webview.
+func (a *App) StartAccioLogin() (string, error) {
+	if a.accio == nil {
+		return "", fmt.Errorf("accio provider is not initialized")
+	}
+	// Let the native client choose an available loopback port so a stale
+	// callback listener cannot make login appear to start without receiving it.
+	loginURL, err := a.accio.StartLogin(a.ctx, 0)
+	if err != nil {
+		return "", err
+	}
+	runtime.BrowserOpenURL(a.ctx, loginURL)
+	return loginURL, nil
+}
+
+func (a *App) syncAccioAccount(t accio.TokenRecord) {
+	if a.store == nil || strings.TrimSpace(t.AccessToken) == "" {
+		return
+	}
+	id := t.ID
+	if id == "" {
+		id = "accio-" + fmt.Sprintf("%x", md5.Sum([]byte(t.AccessToken)))[:16]
+	}
+	if err := a.store.UpsertAccount(store.Account{
+		ID: id, Provider: store.ProviderAccio, Label: firstNonEmpty(t.Label, "Accio"), Email: t.Email,
+		AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, Source: "accio-login",
+		ClientID: "accio-work", Issuer: "https://www.accio.com", UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		logging.Warn("accio.account.sync_failed", "account_id", id, "err", err.Error())
+		return
+	}
+	// Login completion should make the newly captured account active only when
+	// Accio is the selected route; this avoids unexpectedly switching providers.
+	if a.store.Settings().IsAccio() {
+		_ = a.store.SetActiveAccount(id)
+		if a.accio != nil {
+			_ = a.accio.SetActiveAccount(id)
+		}
+	}
+}
+
+func (a *App) AccioStatus() map[string]any {
+	if a.accio == nil {
+		return map[string]any{"authenticated": false, "error": "not initialized"}
+	}
+	return a.accio.Status()
+}
+
+// AccioCredits queries the entitlement/quota endpoint and returns total,
+// remaining, used, and plan type for the avatar progress indicator.
+func (a *App) AccioCredits() (map[string]any, error) {
+	if a.accio == nil {
+		return nil, fmt.Errorf("accio provider is not initialized")
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
+	defer cancel()
+	return a.accio.Credits(ctx)
+}
+
+// AccioManagerStatus exposes the account top-up manager state for the UI.
+func (a *App) AccioManagerStatus() map[string]any {
+	if a.accMgr == nil {
+		return map[string]any{"enabled": false, "error": "not initialized"}
+	}
+	return a.accMgr.Status()
+}
+
+// SetAccioManagerConfig reconfigures the top-up manager at runtime.
+// enabled=false pauses creation; minCredits/maxAccounts are validated to sane
+// bounds before being applied.
+func (a *App) SetAccioManagerConfig(enabled bool, minCredits, maxAccounts int) {
+	if a.accMgr == nil {
+		return
+	}
+	if minCredits < 0 {
+		minCredits = 0
+	}
+	if maxAccounts < 1 {
+		maxAccounts = 1
+	}
+	if maxAccounts > 50 {
+		maxAccounts = 50
+	}
+	a.accMgr.SetEnabled(enabled)
+	a.accMgr.SetConfig(accmgr.Config{
+		MinCredits:     minCredits,
+		MaxAccounts:    maxAccounts,
+		CreateCooldown: envDur("ACCIO_CREATE_COOLDOWN", 3*time.Minute),
+		CheckEvery:     envDur("ACCIO_CHECK_EVERY", 2*time.Minute),
+		WARP:           os.Getenv("ACCIO_USE_WARP") != "0",
+		Headless:       os.Getenv("ACCIO_SIGNUP_VISIBLE") != "1",
+	})
+	logging.Info("app.accmgr.config", "enabled", enabled, "min_credits", minCredits, "max_accounts", maxAccounts)
+}
+
+// AccioTopUpNow forces one account creation immediately (UI button / testing).
+func (a *App) AccioTopUpNow() (map[string]any, error) {
+	if a.accMgr == nil {
+		return nil, fmt.Errorf("accio manager is not initialized")
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 7*time.Minute)
+	defer cancel()
+	if err := a.accMgr.TopUpNow(ctx); err != nil {
+		return nil, err
+	}
+	return a.accMgr.Status(), nil
+}
+
 func (a *App) ListModels() ([]upstream.ModelInfo, error) {
 	settings := a.store.Settings()
+	if settings.IsAccio() {
+		if a.accio == nil {
+			return nil, fmt.Errorf("accio provider is not initialized")
+		}
+		models, err := a.accio.Models(a.ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]upstream.ModelInfo, 0, len(models))
+		for _, m := range models {
+			freeUse, locked := m.FreeUse, m.Locked
+			out = append(out, upstream.ModelInfo{
+				ID: m.ID, Name: m.Name, Description: m.Description, APIMode: "chat",
+				ContextWindow: m.Context, ReasoningEfforts: m.ReasoningEfforts,
+				DefaultReasoningEffort: m.DefaultReasoningEffort, FreeUse: &freeUse, Locked: &locked,
+			})
+		}
+		return out, nil
+	}
 	if settings.IsKimiWork() {
 		out := make([]upstream.ModelInfo, 0)
 		for _, m := range kimi.StaticModels() {
@@ -1044,7 +1311,7 @@ func (a *App) GetStats() map[string]any {
 	}
 	providerName := "Grok Proxy Plus"
 
-	// OpenCode: same baseURL lists Grok + Kimi; client picks model id.
+	// OpenCode: same baseURL lists Grok + Kimi + OpenCode Zen Free; client picks model id.
 	openCodeJSON := fmt.Sprintf(`{
   "provider": {
     "grok-proxy-plus": {
@@ -1065,7 +1332,14 @@ func (a *App) GetStats() map[string]any {
         "k2d6-agent-low": { "name": "K2.6 Agent Low Think" },
         "k2d6-agent-medium": { "name": "K2.6 Agent Medium Think" },
         "k2d6-agent-high": { "name": "K2.6 Agent High Think" },
-        "k2d6-agent-xhigh": { "name": "K2.6 Agent Extra High Think" }
+		"k2d6-agent-xhigh": { "name": "K2.6 Agent Extra High Think" },
+		"opencode/deepseek-v4-flash-free": { "name": "DeepSeek V4 Flash Free (OpenCode Zen)" },
+		"opencode/big-pickle": { "name": "Big Pickle (OpenCode Zen)" },
+		"opencode/mimo-v2.5-free": { "name": "MiMo V2.5 Free (OpenCode Zen)" },
+		"opencode/nemotron-3-ultra-free": { "name": "Nemotron 3 Ultra Free (OpenCode Zen)" },
+		"opencode/north-mini-code-free": { "name": "North Mini Code Free (OpenCode Zen)" },
+		"opencode/ling-3.0-flash-free": { "name": "Ling 3.0 Flash Free (OpenCode Zen)" },
+		"opencode/laguna-s-2.1-free": { "name": "Laguna S 2.1 Free (OpenCode Zen)" }
       }
     }
   }
@@ -1161,8 +1435,8 @@ Tip: The proxy auto-routes by model id.
 			"opencode":       openCodeJSON,
 			"kilo":           kiloGuide,
 			"curl":           curlExample,
-			"models_note":    "GET /v1/models lista Grok + Kimi. O client escolhe o model; o proxy roteia.",
-			"models_example": []string{"grok-4.5", "kimi-for-coding", "k3-agent", "k3-agent-low", "k3-agent-medium", "k3-agent-high", "k3-agent-xhigh"},
+			"models_note":    "GET /v1/models lista Grok + Kimi + OpenCode Zen Free. O client escolhe o model; o proxy roteia.",
+			"models_example": []string{"grok-4.5", "kimi-for-coding", "k3-agent", "opencode/deepseek-v4-flash-free", "opencode/mimo-v2.5-free"},
 		},
 		"data_dir": a.store.Root(),
 	}
@@ -1193,6 +1467,9 @@ func (a *App) CancelChat() {
 // Provider is chosen from the request model (same as HTTP proxy), not the UI global.
 func (a *App) SendChat(req upstream.ChatRequest) error {
 	route := a.store.Settings().WithProviderForModel(req.Model)
+	if message := store.ProviderAvailabilityMessage(route.NormalizedProvider()); message != "" {
+		return errors.New(message)
+	}
 	ctxRoute := proxyhttp.WithRouteProvider(a.ctx, route.NormalizedProvider())
 	// Track accounts Inc'd by ensure (initial pick + rotation retries) so
 	// in-flight counters are decremented exactly once per Inc when the stream ends.
@@ -1218,6 +1495,9 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		req.APIMode = settings.APIMode
 	}
 	// Kimi Work agent-gw has no /responses — always chat/completions.
+	if settings.IsAccio() || settings.IsDeepSeek() || settings.IsOpenCodeZen() {
+		req.APIMode = "chat"
+	}
 	if settings.IsKimiWork() {
 		req.APIMode = "chat"
 		req.Model = kimi.ResolveKimiModel(req.Model)
@@ -1280,6 +1560,13 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			a.mu.Unlock()
 			runtime.EventsEmit(a.ctx, "request:active", nil)
 		}()
+		// Wails event delivery is much more expensive than appending a token.
+		// Keep first-token latency immediate, then coalesce text for one frame.
+		// Control events still arrive in order and flush pending text first.
+		chatEvents := newChatEventBatcher(func(ev upstream.StreamEvent) {
+			a.safeEmit("chat:event", ev)
+		})
+		defer chatEvents.Close()
 
 		emit := func(ev upstream.StreamEvent) {
 			switch ev.Type {
@@ -1330,13 +1617,13 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 					"error": ev.Error, "tool_call_id": ev.ID,
 				})
 			}
-			runtime.EventsEmit(a.ctx, "chat:event", ev)
+			chatEvents.Push(ev)
 			if ev.Type == "usage" && ev.Usage != nil {
 				model := ev.Model
 				if model == "" {
 					model = req.Model
 				}
-				cost := pricing.CostUSD(model, ev.Usage.PromptTokens, ev.Usage.CompletionTokens, ev.Usage.ReasoningTokens, ev.Usage.CachedTokens)
+				cost := pricing.CostUSD(model, route.NormalizedProvider(), ev.Usage.PromptTokens, ev.Usage.CompletionTokens, ev.Usage.ReasoningTokens, ev.Usage.CachedTokens)
 				total := ev.Usage.TotalTokens
 				if total == 0 {
 					total = ev.Usage.PromptTokens + ev.Usage.CompletionTokens
@@ -1366,8 +1653,8 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			req.ReasoningEffort = settings.ReasoningEffort
 		}
 		// xAI: Responses + native search.
-		// Kimi Work / Ollie / Gemini / Qwen: OpenAI chat/completions only (agent-gw has no /responses).
-		if settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() {
+		// Kimi Work / Ollie / Gemini / Qwen / DeepSeek: OpenAI chat/completions only.
+		if settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsAccio() {
 			req.APIMode = "chat"
 		} else {
 			req.APIMode = "responses"
@@ -1383,24 +1670,116 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		// Inject skills + MCP catalog into conversation context.
 		req.Messages = a.injectAgentContext(req.Messages)
 
+		// Accio uses its native Phoenix wire format; do not send it through the
+		// generic OpenAI upstream client or let another provider's retry logic run.
+		if settings.IsAccio() {
+			if a.accio == nil {
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: "Accio provider is not initialized"})
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
+				return
+			}
+			raw, marshalErr := json.Marshal(req)
+			if marshalErr != nil {
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: marshalErr.Error()})
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
+				return
+			}
+			var native map[string]any
+			if marshalErr = json.Unmarshal(raw, &native); marshalErr != nil {
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: marshalErr.Error()})
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
+				return
+			}
+			native["model"] = req.Model
+			native["stream"] = true
+			native["request_id"] = reqID
+			logging.Info("chat.accio.payload", "model", req.Model, "msgs", len(req.Messages), "effort", req.ReasoningEffort, "api_mode", req.APIMode, "token_len", len(token))
+			firstThinking := false
+			firstContent := false
+			firstDone := false
+			accioEmit := func(text, reasoning string, call map[string]any, done bool) {
+				if reasoning != "" && !firstThinking {
+					firstThinking = true
+					logging.Info("chat.accio.first_thinking", "preview", truncText(reasoning, 40))
+				}
+				if text != "" && !firstContent {
+					firstContent = true
+					logging.Info("chat.accio.first_content", "preview", truncText(text, 40))
+				}
+				if done && !firstDone {
+					firstDone = true
+					logging.Info("chat.accio.event_done", "text_chars", len(text), "has_content", firstContent, "has_thinking", firstThinking)
+				}
+				if reasoning != "" {
+					emit(upstream.StreamEvent{Type: "thinking", Text: reasoning, Model: req.Model})
+				}
+				if text != "" {
+					emit(upstream.StreamEvent{Type: "content", Text: text, Model: req.Model})
+				}
+				if call != nil {
+					emit(upstream.StreamEvent{Type: "tool_call", ID: fmt.Sprint(call["id"]), Text: fmt.Sprint(call["function"]), Model: req.Model, Payload: call})
+				}
+				if done {
+					emit(upstream.StreamEvent{Type: "done", Model: req.Model})
+				}
+			}
+			var err error
+			for attempt := 0; attempt < 3; attempt++ {
+				err = a.accio.StreamWithToken(ctx, native, token, accioEmit)
+				if err == nil || ctx.Err() != nil {
+					break
+				}
+				rawErr := accio.GatewayRawError(err)
+				logging.Error("accio.gateway.error", "account_id", acc.ID, "model", req.Model, "attempt", attempt+1, "status", accio.GatewayStatus(err), "raw", rawErr)
+				runtime.EventsEmit(a.ctx, "accio:error", map[string]any{"account_id": acc.ID, "model": req.Model, "attempt": attempt + 1, "status": accio.GatewayStatus(err), "raw": rawErr, "error": err.Error()})
+				if isQuotaExhaustedErr(err) {
+					a.markAccountExhausted(acc.ID, rawErr)
+				} else if isAuthDeniedErr(err) {
+					a.markAccountAuthDenied(acc.ID, rawErr)
+				} else {
+					break
+				}
+				next := a.pickNonExhausted(acc.ID)
+				if next == "" {
+					break
+				}
+				prev := acc.ID
+				tok2, acc2, _, err2 := a.ensureCredsFor(ctx, next)
+				if err2 != nil || acc2 == nil {
+					break
+				}
+				token, acc = tok2, acc2
+				label = firstNonEmpty(acc.Label, acc.Email)
+				runtime.EventsEmit(a.ctx, "account:rotated", map[string]any{"id": acc.ID, "from": prev, "reason": "accio"})
+				logging.Warn("accio.account.rotated", "from_account", prev, "to_account", acc.ID, "reason", "gateway_error")
+			}
+			if err != nil && ctx.Err() == nil {
+				rawErr := accio.GatewayRawError(err)
+				logging.Error("chat.ui.error", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "raw", rawErr, "err", err.Error(), "duration_ms", time.Since(chatT0).Milliseconds())
+				emit(upstream.StreamEvent{Type: "error", Error: rawErr, Model: req.Model})
+				emit(upstream.StreamEvent{Type: "done", Model: req.Model})
+			}
+			return
+		}
+
 		err := a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, emit)
 		if err != nil && ctx.Err() == nil {
 			// Gemini uses ADC (no multi-account rotate).
-		if settings.IsGemini() {
-			logging.Error("chat.ui.error", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "err", err, "duration_ms", time.Since(chatT0).Milliseconds())
-			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
-			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
-			return
-		}
+			if settings.IsGemini() || settings.IsOpenCodeZen() || settings.IsOllie() || settings.IsQwen() || settings.IsDeepSeek() {
+				logging.Error("chat.ui.error", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "err", err, "duration_ms", time.Since(chatT0).Milliseconds())
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
+				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
+				return
+			}
 			// Auth failure: force-refresh once, then rotate.
 			if isAuthDeniedErr(err) && acc != nil {
 				if tokR, accR, settingsR, errR := a.forceRefreshAccount(ctx, acc.ID); errR == nil && tokR != "" && tokR != token {
 					adoptCreds(acc.ID, accR)
-				err = a.upstream.StreamChat(ctx, tokR, settingsR, label, accR.Email, req, emit)
-				if err == nil {
-					logging.Info("chat.ui.done", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "duration_ms", time.Since(chatT0).Milliseconds())
-					return
-				}
+					err = a.upstream.StreamChat(ctx, tokR, settingsR, label, accR.Email, req, emit)
+					if err == nil {
+						logging.Info("chat.ui.done", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "duration_ms", time.Since(chatT0).Milliseconds())
+						return
+					}
 					token, acc, settings = tokR, accR, settingsR
 				}
 				if err != nil && isAuthDeniedErr(err) {
@@ -1416,18 +1795,18 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 								Type: "content",
 								Text: "\n\n_Auth negada — trocando para " + label2 + "…_\n\n",
 							})
-					err = a.upstream.StreamChat(ctx, tok2, settings2, label2, acc2.Email, req, emit)
-					if err == nil {
-						logging.Info("chat.ui.done", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "duration_ms", time.Since(chatT0).Milliseconds())
-						return
-					}
+							err = a.upstream.StreamChat(ctx, tok2, settings2, label2, acc2.Email, req, emit)
+							if err == nil {
+								logging.Info("chat.ui.done", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "duration_ms", time.Since(chatT0).Milliseconds())
+								return
+							}
 						}
 					}
 				}
 			}
 			if isQuotaExhaustedErr(err) {
-			// Blocks on Kimi when re-login recreates the only usable account.
-			a.markAccountExhausted(acc.ID, err.Error())
+				// Blocks on Kimi when re-login recreates the only usable account.
+				a.markAccountExhausted(acc.ID, err.Error())
 				nextID := a.pickNonExhausted(acc.ID)
 				if nextID == "" {
 					if after, ok := a.store.ActiveAccount(); ok && after != nil && after.Usable() {
@@ -1455,24 +1834,25 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 					}
 				}
 			}
-		logging.Error("chat.ui.error", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "err", err, "duration_ms", time.Since(chatT0).Milliseconds())
-		runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
-		runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
-		return
-	}
-	logging.Info("chat.ui.done", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "duration_ms", time.Since(chatT0).Milliseconds())
-}()
+			logging.Error("chat.ui.error", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "err", err, "duration_ms", time.Since(chatT0).Milliseconds())
+			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
+			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
+			return
+		}
+		logging.Info("chat.ui.done", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "duration_ms", time.Since(chatT0).Milliseconds())
+	}()
 	return nil
 }
 
 func (a *App) setPhase(phase string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.activeReq != nil {
-		a.activeReq.Phase = phase
-		cp := *a.activeReq
-		runtime.EventsEmit(a.ctx, "request:active", &cp)
+	if a.activeReq == nil || a.activeReq.Phase == phase {
+		return
 	}
+	a.activeReq.Phase = phase
+	cp := *a.activeReq
+	runtime.EventsEmit(a.ctx, "request:active", &cp)
 }
 
 // safeEmit never lets a Wails/webview emit failure take down the process mid-proxy request.
@@ -1502,6 +1882,27 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 	if rp := proxyhttp.RouteProviderFrom(ctx); rp != "" {
 		settings = settings.WithProvider(rp)
 	}
+	// Accio uses independent credential files but selects from the common pool,
+	// allowing unlimited logged-in accounts and automatic failover.
+	if settings.IsAccio() {
+		if a.accio == nil {
+			return "", nil, settings, fmt.Errorf("accio provider is not initialized")
+		}
+		strategy := a.store.GetLoadBalancerStrategy(store.ProviderAccio)
+		var acc *store.Account
+		if preferID != "" {
+			if candidate, ok := a.store.GetAccount(preferID); ok && candidate != nil && candidate.NormalizedProvider() == store.ProviderAccio && candidate.Usable() {
+				acc = candidate
+			}
+		}
+		if acc == nil {
+			acc = a.store.PickAccountForProvider(store.ProviderAccio, strategy)
+		}
+		if acc == nil {
+			return "", nil, settings, fmt.Errorf("nenhuma conta Accio utilizável — faça login em Adicionar conta")
+		}
+		return acc.BearerToken(), acc, settings, nil
+	}
 	// QwenBridge: single local bridge account — base URL + API key from settings.
 	// No fallback to another provider when the key is missing.
 	if settings.IsQwen() {
@@ -1520,6 +1921,39 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 			Issuer:      settings.EffectiveQwenUpstream(),
 		}
 		return key, acc, settings, nil
+	}
+	// DeepSeek: single official API account — encrypted key from settings.
+	if settings.IsDeepSeek() {
+		key := settings.DeepSeekAPIKeyPlain()
+		if key == "" {
+			return "", nil, settings, fmt.Errorf("deepseek: API key não configurada — selecione o provedor DeepSeek e cole a chave")
+		}
+		acc := &store.Account{
+			ID:          "deepseek",
+			Provider:    store.ProviderDeepSeek,
+			Label:       "DeepSeek",
+			Email:       store.DeepSeekUpstream,
+			AccessToken: key,
+			APIKey:      key,
+			ClientID:    "deepseek",
+			Issuer:      store.DeepSeekUpstream,
+		}
+		return key, acc, settings, nil
+	}
+	// OpenCode Zen Free is native/keyless: call Zen directly with its public
+	// bearer token. No opencode CLI, `opencode serve`, terminal, or account is
+	// required for either the desktop UI or the HTTP route.
+	if settings.IsOpenCodeZen() {
+		acc := &store.Account{
+			ID:          "opencode-zen-free",
+			Provider:    store.ProviderOpenCodeZen,
+			Label:       "OpenCode Zen Free",
+			Email:       "keyless@opencode.ai",
+			AccessToken: store.OpenCodeZenAPIKey,
+			ClientID:    "opencode-zen",
+			Issuer:      store.OpenCodeZenUpstream,
+		}
+		return store.OpenCodeZenAPIKey, acc, settings, nil
 	}
 	// OllieChat is keyless — no xAI OAuth account required.
 	if settings.IsOllie() {
@@ -1805,6 +2239,38 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n := 0
+	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+		return def
+	}
+	return n
+}
+
+func envDur(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+func truncText(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // StartAutoSignup creates a web account via chrome isolate + darkemail, then starts device OAuth.
@@ -2437,7 +2903,7 @@ func isQuotaExhaustedErr(err error) bool {
 	if strings.Contains(s, "usage balance exhausted") || strings.Contains(s, "balance exhausted") {
 		return true
 	}
-	if strings.Contains(s, "http 402") {
+	if strings.Contains(s, "http 402") || (strings.Contains(s, "http 403") && (strings.Contains(s, "quota") || strings.Contains(s, "credit") || strings.Contains(s, "diamond") || strings.Contains(s, "balance"))) {
 		return true
 	}
 	// Kimi Work plan / billing cycle cap

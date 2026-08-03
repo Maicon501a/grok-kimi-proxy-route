@@ -1,6 +1,5 @@
 package proxyhttp
 
-
 import (
 	"bufio"
 	"bytes"
@@ -19,13 +18,13 @@ import (
 
 	"github.com/google/uuid"
 
+	"grok-desktop/internal/accio"
 	"grok-desktop/internal/gemini"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
+	"grok-desktop/internal/warp"
 )
-
-
 
 // Server is a local OpenAI + Anthropic compatible reverse proxy.
 
@@ -58,18 +57,19 @@ import (
 // is only a fallback when model is empty/alias.
 
 type Server struct {
+	mu sync.Mutex
 
-	mu       sync.Mutex
-
-	store    *store.Store
+	store *store.Store
 
 	upstream *upstream.Client
+	warp     *warp.Manager
 
-	ensure   func(ctx context.Context) (token string, account *store.Account, settings store.Settings, err error)
+	ensure func(ctx context.Context) (token string, account *store.Account, settings store.Settings, err error)
 
 	// forceRefresh re-syncs CLI tokens and forces OAuth refresh for a specific account.
 
 	forceRefresh func(ctx context.Context, accountID string) (token string, account *store.Account, settings store.Settings, err error)
+	accio        *accio.Client
 
 	// onQuota is optional: called when upstream returns 402 / balance exhausted so the app can
 
@@ -83,12 +83,11 @@ type Server struct {
 
 	onAuthFail func(accountID, reason string) (rotated bool)
 
-	srv        *http.Server
+	srv *http.Server
 
-	ln         net.Listener
+	ln net.Listener
 
-	addr       string
-
+	addr string
 }
 
 // maxProxyBodyBytes caps inbound request bodies (32 MiB) so a rogue client
@@ -102,6 +101,10 @@ var upstreamHTTPClient = &http.Client{
 	Timeout: 0,
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
 		ResponseHeaderTimeout: 120 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
@@ -173,11 +176,9 @@ func New(
 
 ) *Server {
 
-	return &Server{store: st, upstream: up, ensure: ensure}
+	return &Server{store: st, upstream: up, ensure: ensure, warp: warp.Default()}
 
 }
-
-
 
 // SetQuotaHandler registers a callback invoked on quota exhaustion (402 / balance exhausted).
 
@@ -191,8 +192,6 @@ func (s *Server) SetQuotaHandler(fn func(accountID, reason string) (rotated bool
 
 }
 
-
-
 // SetAuthFailHandler registers a callback for chat auth denial (403 permission-denied / 401).
 
 func (s *Server) SetAuthFailHandler(fn func(accountID, reason string) (rotated bool)) {
@@ -205,9 +204,23 @@ func (s *Server) SetAuthFailHandler(fn func(accountID, reason string) (rotated b
 
 }
 
-
-
 // SetForceRefresh registers force OAuth refresh (used before marking auth-denied).
+
+func (s *Server) SetAccio(client *accio.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accio = client
+}
+
+func (s *Server) accioClient() *accio.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accio
+}
+
+func (s *Server) emitAccioError(ctx context.Context, accountID, model string, attempt int, err error) {
+	logging.Error("accio.gateway.error", "account_id", accountID, "model", model, "attempt", attempt, "status", accio.GatewayStatus(err), "raw", accio.GatewayRawError(err))
+}
 
 func (s *Server) SetForceRefresh(fn func(ctx context.Context, accountID string) (string, *store.Account, store.Settings, error)) {
 
@@ -219,8 +232,6 @@ func (s *Server) SetForceRefresh(fn func(ctx context.Context, accountID string) 
 
 }
 
-
-
 func (s *Server) quotaHandler() func(accountID, reason string) (rotated bool) {
 
 	s.mu.Lock()
@@ -230,8 +241,6 @@ func (s *Server) quotaHandler() func(accountID, reason string) (rotated bool) {
 	return s.onQuota
 
 }
-
-
 
 // handleStreamQuota reports a quota error detected INSIDE an SSE stream (the
 // upstream sent a 200 then an error payload mid-stream). The client already got
@@ -258,8 +267,6 @@ func (s *Server) handleStreamQuota(accountID string, pipeErr error) {
 
 }
 
-
-
 func (s *Server) authFailHandler() func(accountID, reason string) (rotated bool) {
 
 	s.mu.Lock()
@@ -269,8 +276,6 @@ func (s *Server) authFailHandler() func(accountID, reason string) (rotated bool)
 	return s.onAuthFail
 
 }
-
-
 
 func (s *Server) forceRefreshFn() func(ctx context.Context, accountID string) (string, *store.Account, store.Settings, error) {
 
@@ -282,8 +287,6 @@ func (s *Server) forceRefreshFn() func(ctx context.Context, accountID string) (s
 
 }
 
-
-
 func (s *Server) Addr() string {
 
 	s.mu.Lock()
@@ -293,8 +296,6 @@ func (s *Server) Addr() string {
 	return s.addr
 
 }
-
-
 
 func (s *Server) Start(listen string) error {
 
@@ -369,11 +370,9 @@ func (s *Server) Start(listen string) error {
 					"/v1/messages",
 
 					"/v1/search",
-
 				},
 
 				"not_supported": []string{"/v1/completions"},
-
 			})
 
 			return
@@ -383,8 +382,6 @@ func (s *Server) Start(listen string) error {
 		http.NotFound(w, r)
 
 	})
-
-
 
 	ln, err := net.Listen("tcp", listen)
 
@@ -434,7 +431,7 @@ func (s *Server) Start(listen string) error {
 
 	s.srv = &http.Server{
 
-		Handler:           handler,
+		Handler: handler,
 
 		ReadHeaderTimeout: 30 * time.Second,
 
@@ -446,7 +443,6 @@ func (s *Server) Start(listen string) error {
 		// WriteTimeout 0: Grok 4.5 long reasoning streams can exceed minutes.
 
 		ErrorLog: log.Default(),
-
 	}
 
 	go func() {
@@ -464,8 +460,6 @@ func (s *Server) Start(listen string) error {
 	return nil
 
 }
-
-
 
 func (s *Server) Stop(ctx context.Context) error {
 
@@ -491,8 +485,6 @@ func (s *Server) Stop(ctx context.Context) error {
 
 }
 
-
-
 func (s *Server) handleLegacyCompletions(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
@@ -505,17 +497,13 @@ func (s *Server) handleLegacyCompletions(w http.ResponseWriter, r *http.Request)
 
 			"message": "Legacy /v1/completions is not supported. Use /v1/chat/completions (OpenAI), /v1/responses (OpenAI), or /v1/messages (Anthropic).",
 
-			"type":    "invalid_request_error",
+			"type": "invalid_request_error",
 
-			"code":    "endpoint_not_supported",
-
+			"code": "endpoint_not_supported",
 		},
-
 	})
 
 }
-
-
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
@@ -585,29 +573,31 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	}
 
+	warpStatus := map[string]any{"enabled": false}
+	if s.warp != nil {
+		warpStatus = s.warp.Status()
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 
-		"status":    "ok",
+		"status": "ok",
 
-		"addr":      s.Addr(),
+		"addr": s.Addr(),
 
-		"account":   email,
+		"account": email,
 
 		"exhausted": exhausted,
 
-		"provider":  settings.NormalizedProvider(),
+		"provider": settings.NormalizedProvider(),
 
 		"auth_mode": settings.ProviderAuthMode(),
 
-		"upstream":  settings.EffectiveUpstream(),
+		"upstream": settings.EffectiveUpstream(),
 
-		"model":     settings.ResolveModel("default"),
-
+		"model": settings.ResolveModel("default"),
+		"warp":  warpStatus,
 	})
 
 }
-
-
 
 func (s *Server) gate(r *http.Request) bool {
 
@@ -631,8 +621,6 @@ func (s *Server) gate(r *http.Request) bool {
 
 }
 
-
-
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !s.gate(r) {
 		http.Error(w, `{"error":{"message":"unauthorized","type":"invalid_request_error"}}`, http.StatusUnauthorized)
@@ -650,6 +638,37 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, m := range xaiModels {
 		data = append(data, enrichModelMeta(m, store.ProviderXAI))
+	}
+
+	// --- OpenCode Zen Free (native/keyless) ---
+	// Keep this catalog on the Grok proxy itself: clients only need this one
+	// base URL and never need a separate `opencode serve` terminal process.
+	for _, m := range upstream.OpenCodeZenFreeModels() {
+		data = append(data, enrichModelMeta(m, store.ProviderOpenCodeZen))
+	}
+
+	// --- Accio ---
+	// Use the authenticated native client. Keep the fallback only when the
+	// catalog is unavailable; a real catalog is authoritative and may omit it.
+	if client := s.accioClient(); client != nil {
+		models, err := client.Models(r.Context())
+		if err != nil || len(models) == 0 {
+			data = append(data, enrichModelMeta(upstream.ModelInfo{ID: accio.DefaultModel, Name: "Accio Nexus", Description: "Accio · login required", APIMode: "chat"}, store.ProviderAccio))
+		} else {
+			accioSeen := make(map[string]bool, len(models))
+			for _, m := range models {
+				if accioSeen[m.ID] {
+					continue
+				}
+				accioSeen[m.ID] = true
+				freeUse, locked := m.FreeUse, m.Locked
+				data = append(data, enrichModelMeta(upstream.ModelInfo{
+					ID: m.ID, Name: m.Name, Description: m.Description, APIMode: "chat",
+					ContextWindow: m.Context, ReasoningEfforts: m.ReasoningEfforts,
+					DefaultReasoningEffort: m.DefaultReasoningEffort, FreeUse: &freeUse, Locked: &locked,
+				}, store.ProviderAccio))
+			}
+		}
 	}
 
 	// --- Kimi Work ---
@@ -696,14 +715,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "QwenBridge · local", APIMode: "chat"}, store.ProviderQwen))
 	}
 
+	// DeepSeek: official API — listed whenever a key is configured (cached probe).
+	for _, id := range deepSeekModels(base) {
+		data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "DeepSeek API · chat/completions", APIMode: "chat"}, store.ProviderDeepSeek))
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
 		"data":   data,
 		"route":  "model",
 		"api_policy": map[string]string{
-			"xai":       "responses",
-			"kimi_work": "chat",
+			"xai":          "responses",
+			"kimi_work":    "chat",
+			"deepseek":     "chat",
+			"opencode_zen": "chat",
 		},
 		"note": "Pick model on the client; same baseURL routes Grok vs Kimi automatically.",
 	})
@@ -818,6 +844,71 @@ func qwenBridgeModels(settings store.Settings) []string {
 	return models
 }
 
+// deepSeekProbeCache memoizes the DeepSeek model-list probe so /v1/models
+// never pays more than one short network check per TTL window.
+var deepSeekProbeCache = struct {
+	sync.Mutex
+	at     time.Time
+	key    string
+	models []string
+}{}
+
+const deepSeekProbeTTL = 60 * time.Second
+
+// deepSeekModels fetches the official DeepSeek model list (GET /models with
+// the decrypted API key). Returns nil when no key is configured, the API is
+// unreachable, or the payload cannot be parsed — DeepSeek is then omitted
+// from the catalog. Result cached deepSeekProbeTTL.
+func deepSeekModels(settings store.Settings) []string {
+	key := settings.DeepSeekAPIKeyPlain()
+	if key == "" {
+		return nil
+	}
+	cacheKey := "deepseek|" + key
+	deepSeekProbeCache.Lock()
+	if deepSeekProbeCache.key == cacheKey && time.Since(deepSeekProbeCache.at) < deepSeekProbeTTL {
+		models := deepSeekProbeCache.models
+		deepSeekProbeCache.Unlock()
+		return models
+	}
+	deepSeekProbeCache.Unlock()
+
+	base := strings.TrimRight(settings.WithProvider(store.ProviderDeepSeek).EffectiveUpstream(), "/")
+	var models []string
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	if err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, derr := upstreamHTTPClient.Do(req)
+		if derr == nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			if resp.StatusCode < 500 {
+				var parsed struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(body, &parsed) == nil {
+					for _, m := range parsed.Data {
+						if id := strings.TrimSpace(m.ID); id != "" {
+							models = append(models, id)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	deepSeekProbeCache.Lock()
+	deepSeekProbeCache.at = time.Now()
+	deepSeekProbeCache.key = cacheKey
+	deepSeekProbeCache.models = models
+	deepSeekProbeCache.Unlock()
+	return models
+}
+
 // geminiConfigured reports whether Vertex/ADC credentials are plausibly set up
 // (explicit project in settings, or standard Google env vars), so /v1/models
 // can list Gemini models without depending on the global UI provider switch.
@@ -850,6 +941,18 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 		owner = "Qwen"
 		prov = store.ProviderQwen
 		ctxWindow = 131072
+	case store.ProviderDeepSeek, "deep-seek", "ds":
+		owner = "DeepSeek"
+		prov = store.ProviderDeepSeek
+		ctxWindow = 131072
+	case store.ProviderOpenCodeZen, "opencode-zen", "opencode", "zen", "zen-free":
+		owner = "OpenCode Zen Free"
+		prov = store.ProviderOpenCodeZen
+		ctxWindow = 131072
+	case store.ProviderAccio, "accio-work", "phoenix":
+		owner = "Accio"
+		prov = store.ProviderAccio
+		ctxWindow = 131072
 	case store.ProviderKimiWork, "kimi", "kimi-work":
 		owner = "Kimi"
 		prov = store.ProviderKimiWork
@@ -876,20 +979,73 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 			apiMode = "chat"
 		}
 	}
-	return map[string]any{
-		"id":             m.ID,
-		"object":         "model",
-		"created":        time.Now().Unix(),
-		"owned_by":       owner,
-		"provider":       prov,
-		"name":           firstNonEmpty(m.Name, m.ID),
-		"description":    desc,
-		"api_mode":       apiMode,
-		"root":           m.Root,
-		"context_window": ctxWindow,
-		"context_length": ctxWindow,
-		"max_tokens":     ctxWindow,
+	out := map[string]any{
+		"id":                       m.ID,
+		"object":                   "model",
+		"created":                  time.Now().Unix(),
+		"owned_by":                 owner,
+		"provider":                 prov,
+		"name":                     firstNonEmpty(m.Name, m.ID),
+		"description":              desc,
+		"api_mode":                 apiMode,
+		"root":                     m.Root,
+		"context_window":           firstPositiveInt64(m.ContextWindow, int64(ctxWindow)),
+		"context_length":           firstPositiveInt64(m.ContextWindow, int64(ctxWindow)),
+		"max_tokens":               firstPositiveInt64(m.ContextWindow, int64(ctxWindow)),
+		"reasoning_efforts":        m.ReasoningEfforts,
+		"default_reasoning_effort": m.DefaultReasoningEffort,
 	}
+	if m.FreeUse != nil {
+		out["free_use"] = *m.FreeUse
+	}
+	if m.Locked != nil {
+		out["locked"] = *m.Locked
+	}
+	return out
+}
+
+func firstPositiveInt64(value, fallback int64) int64 {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func validateAccioReasoning(ctx context.Context, client *accio.Client, modelValue any, body map[string]any) error {
+	modelID, _ := modelValue.(string)
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	effort, _ := body["reasoning_effort"].(string)
+	if strings.TrimSpace(effort) == "" {
+		if compat, ok := body["reasoningEffort"].(string); ok && strings.TrimSpace(compat) != "" {
+			effort = strings.TrimSpace(compat)
+			body["reasoning_effort"] = effort
+		}
+	}
+	if strings.TrimSpace(effort) == "" {
+		return nil
+	}
+	models, err := client.Models(ctx)
+	if err != nil {
+		return nil // Preserve upstream behavior when metadata is temporarily unavailable.
+	}
+	for _, model := range models {
+		if model.ID != modelID && strings.TrimPrefix(model.ID, "accio/") != strings.TrimPrefix(modelID, "accio/") {
+			continue
+		}
+		if len(model.ReasoningEfforts) == 0 {
+			return nil
+		}
+		for _, allowed := range model.ReasoningEfforts {
+			if effort == allowed {
+				return nil
+			}
+		}
+		return fmt.Errorf("reasoning_effort %q is not supported by model %q; allowed values: %s", effort, modelID, strings.Join(model.ReasoningEfforts, ", "))
+	}
+	return nil
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -898,15 +1054,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 }
 
-
-
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	s.proxyUpstream(w, r, "/responses")
 
 }
-
-
 
 // injectTemporalIntoMessages prepends a system line with today's date/year (e.g. 2026).
 
@@ -919,8 +1071,6 @@ func injectTemporalIntoMessages(msgs []any) []any {
 		". The current year is " + strconv.Itoa(now.Year()) +
 
 		". Treat this as ground truth for \"today\", \"this year\", recency, and time-sensitive answers — do not assume you are stuck in 2023–2024."
-
-
 
 	if len(msgs) > 0 {
 
@@ -953,8 +1103,6 @@ func injectTemporalIntoMessages(msgs []any) []any {
 	return append([]any{sys}, msgs...)
 
 }
-
-
 
 func contentToString(c any) string {
 
@@ -995,8 +1143,6 @@ func contentToString(c any) string {
 	}
 
 }
-
-
 
 func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path string) {
 
@@ -1042,10 +1188,26 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	}
 
 	// Route ONLY by client model (never UI global provider).
-	// grok-* → xAI, k3-agent/kimi-* → Kimi, qwen* → QwenBridge, empty/alias/unknown → xAI.
+	// accio/* → Accio, grok-* → xAI, k3-agent/kimi-* → Kimi, qwen* → QwenBridge, empty/alias/unknown → xAI.
 	baseSettings := s.store.Settings()
 	routeSettings := baseSettings.WithProviderForModel(reqModel)
 	routeProv := routeSettings.NormalizedProvider()
+	if message := store.ProviderAvailabilityMessage(routeProv); message != "" {
+		typ := "provider_disabled"
+		if store.ProviderAvailability(routeProv) == "maintenance" {
+			typ = "provider_maintenance"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message":  message,
+				"type":     typ,
+				"provider": routeProv,
+			},
+		})
+		return
+	}
 	ctx := WithRouteProvider(r.Context(), routeProv)
 	ctx = logging.WithRequestID(ctx, uuid.NewString()[:8])
 	reqLog := logging.FromContext(ctx).With("provider", routeProv, "path", clientPath, "stream", stream)
@@ -1069,11 +1231,86 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	reqLog.Info("proxy.request.start", "model", reqModel, "resolved_model", resolvedModel, "account_id", accountID)
 	// ensure may return store settings; force route from client model again.
 	settings = routeSettings
+	var clientStatus int
+	if routeProv == store.ProviderAccio {
+		client := s.accioClient()
+		if client == nil {
+			http.Error(w, `{"error":{"message":"Accio provider is not initialized","type":"server_error"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		// Accio uses native Phoenix requests, but still participates in the same
+		// account failover loop as the generic providers.
+		if m == nil {
+			_ = json.Unmarshal(body, &m)
+		}
+		if m == nil {
+			m = map[string]any{}
+		}
+		m["model"] = settings.ResolveModelForClient(reqModel)
+		if err := validateAccioReasoning(r.Context(), client, m["model"], m); err != nil {
+			clientStatus = http.StatusBadRequest
+			http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error"}}`, err.Error()), clientStatus)
+			return
+		}
+		for attempt := 0; attempt < 3; attempt++ {
+			err := client.ChatWithToken(r.Context(), m, token, w)
+			if err == nil {
+				clientStatus = http.StatusOK
+				return
+			}
+			rawErr := accio.GatewayRawError(err)
+			reqLog.Error("accio.gateway.error", "account_id", accountID, "model", reqModel, "attempt", attempt+1, "status", accio.GatewayStatus(err), "raw", rawErr)
+			s.emitAccioError(r.Context(), accountID, reqModel, attempt+1, err)
+			if !isQuotaStatus(accio.GatewayStatus(err), []byte(rawErr)) && !isAuthStatus(accio.GatewayStatus(err), []byte(rawErr)) {
+				clientStatus = http.StatusBadGateway
+				http.Error(w, rawErr, clientStatus)
+				return
+			}
+			rotated := false
+			if fn := s.quotaHandler(); isQuotaStatus(accio.GatewayStatus(err), []byte(rawErr)) && fn != nil {
+				rotated = fn(accountID, rawErr)
+			}
+			if fn := s.authFailHandler(); isAuthStatus(accio.GatewayStatus(err), []byte(rawErr)) && !isQuotaStatus(accio.GatewayStatus(err), []byte(rawErr)) && fn != nil {
+				rotated = fn(accountID, rawErr)
+			}
+			if !rotated {
+				_, _ = s.store.MarkExhausted(accountID, rawErr)
+				if isAuthStatus(accio.GatewayStatus(err), []byte(rawErr)) {
+					_, _ = s.store.MarkAuthDenied(accountID, rawErr)
+				}
+			}
+			next := s.store.NextUsableAccountID(accountID)
+			if next == "" {
+				clientStatus = http.StatusBadGateway
+				http.Error(w, rawErr, clientStatus)
+				return
+			}
+			_ = s.store.SetActiveAccount(next)
+			tok2, acc2, _, err2 := s.ensure(r.Context())
+			if err2 != nil || acc2 == nil {
+				clientStatus = http.StatusBadGateway
+				http.Error(w, rawErr, clientStatus)
+				return
+			}
+			prev := accountID
+			token, acc, accountID = tok2, acc2, acc2.ID
+			reqLog.Warn("accio.account.rotated", "from_account", prev, "to_account", accountID, "reason", "gateway_error")
+		}
+		clientStatus = http.StatusBadGateway
+		http.Error(w, "Accio gateway retries exhausted", clientStatus)
+		return
+	}
 	if routeProv == store.ProviderKimiWork {
 		settings.UpstreamBase = store.KimiWorkUpstream
 		settings.APIMode = "chat"
 	} else if routeProv == store.ProviderQwen {
 		settings.UpstreamBase = settings.EffectiveQwenUpstream()
+		settings.APIMode = "chat"
+	} else if routeProv == store.ProviderDeepSeek {
+		settings.UpstreamBase = store.DeepSeekUpstream
+		settings.APIMode = "chat"
+	} else if routeProv == store.ProviderOpenCodeZen {
+		settings.UpstreamBase = store.OpenCodeZenUpstream
 		settings.APIMode = "chat"
 	} else if routeProv == store.ProviderXAI {
 		settings.UpstreamBase = store.DefaultUpstream
@@ -1090,7 +1327,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	startedAt := time.Now()
 	resolvedModel = settings.ResolveModelForClient(reqModel)
-	var clientStatus int
 	defer func() {
 		dur := time.Since(startedAt).Milliseconds()
 		if clientStatus >= 400 {
@@ -1115,8 +1351,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			delete(m, "last_response_id")
 		}
 
-		// Kimi / Ollie / Gemini / Qwen: /responses → chat/completions
-		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen()) && path == "/responses" {
+		// Kimi / Ollie / Gemini / Qwen / DeepSeek: /responses → chat/completions
+		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen()) && path == "/responses" {
 			path = "/chat/completions"
 			wantClientChat = true
 			wantClientResponses = false
@@ -1139,8 +1375,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 				resolvedModel = mid
 			}
 		}
-
-
 
 		if path == "/chat/completions" {
 
@@ -1209,8 +1443,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 		}
 
-
-
 		if path == "/responses" {
 
 			if settings.StoreResponses {
@@ -1277,8 +1509,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	}
 
-
-
 	// Gemini: handle entirely via Vertex REST + ADC (not reverse-proxy to UpstreamBase).
 
 	if settings.IsGemini() {
@@ -1326,8 +1556,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	}
 
-
-
 	// Up to 3 attempts: original → force-refresh same account (auth) → rotated account.
 
 	maxAttempts := 3
@@ -1340,14 +1568,29 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	}
 
-	// QwenBridge: single bridge account — no rotation; upstream 429/401 goes
-	// straight back to the client.
-	if settings.IsQwen() {
+	// QwenBridge / DeepSeek: single account — no rotation; upstream 429/401
+	// goes straight back to the client.
+	if settings.IsQwen() || settings.IsDeepSeek() {
 
 		maxAttempts = 1
 
 		accountID = ""
 
+	}
+
+	warpTried := false
+	viaWarp := false
+	if settings.IsOpenCodeZen() {
+		accountID = ""
+		if s.warp != nil && s.warp.Enabled() {
+			viaWarp = s.warp.IsActive()
+			warpTried = viaWarp
+			if !viaWarp {
+				maxAttempts = 2
+			}
+		} else {
+			maxAttempts = 1
+		}
 	}
 
 	authRetried := false
@@ -1409,21 +1652,38 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 		}
 
-
-
 		upstreamSentAt := time.Now()
 		reqLog.Debug("proxy.upstream.request", "attempt", attempt+1, "url", url, "account_id", accountID)
-		resp, err := upstreamHTTPClient.Do(req)
+		client := upstreamHTTPClient
+		if settings.IsOpenCodeZen() && viaWarp && s.warp != nil {
+			client = s.warp.HTTPClient(upstreamHTTPClient)
+			reqLog.Debug("proxy.warp.route", "attempt", attempt+1, "socks", s.warp.Status()["socks"])
+		}
+		resp, err := client.Do(req)
 
 		if err != nil {
 			reqLog.Error("proxy.upstream.error", "attempt", attempt+1, "err", err.Error(), "latency_ms", time.Since(upstreamSentAt).Milliseconds())
+			if settings.IsOpenCodeZen() && viaWarp && s.warp != nil && s.warp.Enabled() && warp.IsNetworkFailure(err) {
+				s.warp.MarkInactive(err.Error())
+				viaWarp = false
+				maxAttempts = attempt + 2
+				reqLog.Warn("proxy.warp.stale_state", "reason", "network")
+				continue
+			}
+			if settings.IsOpenCodeZen() && !warpTried && s.warp != nil && s.warp.Enabled() && warp.IsNetworkFailure(err) {
+				warpTried = true
+				reqLog.Warn("proxy.warp.failover.trigger", "reason", "network")
+				if activateErr := s.warp.Activate(r.Context()); activateErr == nil {
+					viaWarp = true
+					continue
+				}
+				reqLog.Warn("proxy.warp.failover.activation_failed", "reason", "network")
+			}
 			http.Error(w, err.Error(), http.StatusBadGateway)
 
 			return
 
 		}
-
-
 
 		reqLog.Info("proxy.upstream.response", "attempt", attempt+1, "status", resp.StatusCode, "latency_ms", time.Since(upstreamSentAt).Milliseconds())
 		// Read error body only when status is bad; keep stream body for SSE success path.
@@ -1435,8 +1695,18 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			_ = resp.Body.Close()
 
 			reason := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(errBody))
+			log.Printf("[AUDIT] upstream error raw: status=%d body=%q", resp.StatusCode, string(errBody))
 
-
+			if settings.IsOpenCodeZen() && !warpTried && s.warp != nil && s.warp.Enabled() && warp.ShouldFailover(resp.StatusCode, errBody) {
+				warpTried = true
+				reqLog.Warn("proxy.warp.failover.trigger", "reason", "upstream", "status", resp.StatusCode)
+				if activateErr := s.warp.Activate(r.Context()); activateErr == nil {
+					viaWarp = true
+					reqLog.Info("proxy.warp.failover.retry", "status", resp.StatusCode)
+					continue
+				}
+				reqLog.Warn("proxy.warp.failover.activation_failed", "status", resp.StatusCode)
+			}
 
 			// Kimi global capacity — fail fast, no account rotate / re-mint spam.
 
@@ -1450,11 +1720,11 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			}
 
-
-
 			// Quota first (Kimi billing 403 must not be treated as auth-denied).
 			// Handler may block while re-login refills a Kimi account (HTTP or clean profile).
-			if isQuotaStatus(resp.StatusCode, errBody) {
+			quotaHit := isQuotaStatus(resp.StatusCode, errBody)
+			log.Printf("[AUDIT] quota check: status=%d quotaHit=%v", resp.StatusCode, quotaHit)
+			if quotaHit {
 				if fn := s.quotaHandler(); fn != nil && accountID != "" {
 					if rotated := fn(accountID, reason); rotated {
 						tok2, acc2, _, err2 := s.ensure(ctx)
@@ -1578,18 +1848,18 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 		}
 
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
 
-
-		ct := resp.Header.Get("Content-Type")
-
-		isSSE := stream || strings.Contains(ct, "text/event-stream")
-
-
+		// A JSON fallback from an upstream that ignored stream=true must not be
+		// fed to the SSE pipe (it would silently discard the whole answer).
+		// Only assume SSE when the provider omitted Content-Type entirely; a
+		// declared application/json response is a normal non-stream fallback.
+		isSSE := strings.Contains(ct, "text/event-stream") || (stream && ct == "")
 
 		// Ollie/Gemini: client asked for Responses but we hit chat/completions — translate wire format.
 		if settings.IsOllie() && clientPath == "/responses" {
 			if isSSE {
-				if err := pipeOllieChatSSEToResponses(w, resp.Body, resolvedModel); err != nil {
+				if err := pipeOllieChatSSEToResponsesContext(r.Context(), w, resp.Body, resolvedModel); err != nil {
 					log.Printf("proxyhttp ollie responses sse: %v", err)
 				}
 				_ = resp.Body.Close()
@@ -1608,7 +1878,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			if acc != nil {
 				accountID = acc.ID
 			}
-			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			s.recordUsageFromJSONBody(raw, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 			clientStatus = 200
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -1616,14 +1886,15 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 
-		// Qwen (QwenBridge): client asked for Responses but we hit chat/completions — translate wire format.
-		if settings.IsQwen() && clientPath == "/responses" {
+		// Qwen (QwenBridge) / DeepSeek: client asked for Responses but we hit
+		// chat/completions — translate wire format.
+		if (settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen()) && clientPath == "/responses" {
 			accountID := ""
 			if acc != nil {
 				accountID = acc.ID
 			}
 			if isSSE {
-				if err := pipeKimiChatSSEToResponses(w, resp.Body, resolvedModel); err != nil {
+				if err := pipeKimiChatSSEToResponsesContext(r.Context(), w, resp.Body, resolvedModel); err != nil {
 					log.Printf("proxyhttp qwen responses sse: %v", err)
 					s.handleStreamQuota(accountID, err)
 				}
@@ -1639,7 +1910,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 				_, _ = w.Write(raw)
 				return
 			}
-			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			s.recordUsageFromJSONBody(raw, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 			clientStatus = 200
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -1653,14 +1924,14 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			if acc != nil {
 				accountID = acc.ID
 			}
-		if isSSE {
-			if err := pipeKimiChatSSEToResponses(w, resp.Body, resolvedModel); err != nil {
-				log.Printf("proxyhttp kimi responses sse: %v", err)
-				s.handleStreamQuota(accountID, err)
+			if isSSE {
+				if err := pipeKimiChatSSEToResponsesContext(r.Context(), w, resp.Body, resolvedModel); err != nil {
+					log.Printf("proxyhttp kimi responses sse: %v", err)
+					s.handleStreamQuota(accountID, err)
+				}
+				_ = resp.Body.Close()
+				return
 			}
-			_ = resp.Body.Close()
-			return
-		}
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 			_ = resp.Body.Close()
 			out, err := chatCompletionJSONToResponse(raw, resolvedModel)
@@ -1670,7 +1941,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 				_, _ = w.Write(raw)
 				return
 			}
-			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			s.recordUsageFromJSONBody(raw, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 			clientStatus = 200
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -1684,21 +1955,21 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			if acc != nil {
 				accountID = acc.ID
 			}
-		if isSSE {
-			tee := newUsageTeeReader(resp.Body)
-			if err := pipeResponsesSSEToChat(r.Context(), w, tee, resolvedModel); err != nil {
-				log.Printf("proxyhttp grok responses→chat sse: %v", err)
-				s.handleStreamQuota(accountID, err)
-			}
+			if isSSE {
+				tee := newUsageTeeReader(resp.Body)
+				if err := pipeResponsesSSEToChat(r.Context(), w, tee, resolvedModel); err != nil {
+					log.Printf("proxyhttp grok responses→chat sse: %v", err)
+					s.handleStreamQuota(accountID, err)
+				}
 				_ = resp.Body.Close()
 				if len(tee.lastJSON) > 0 {
-					s.recordUsageFromSSECapture(tee.lastJSON, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+					s.recordUsageFromSSECapture(tee.lastJSON, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 				}
 				return
 			}
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 			_ = resp.Body.Close()
-			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			s.recordUsageFromJSONBody(raw, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 			out, err := responsesJSONToChatCompletion(raw, resolvedModel)
 			if err != nil {
 				w.Header().Set("Content-Type", "application/json")
@@ -1730,23 +2001,23 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			}
 
-		tee := newUsageTeeReader(resp.Body)
+			tee := newUsageTeeReader(resp.Body)
 
-		if err := pipeSSE(r.Context(), w, tee); err != nil {
+			if err := pipeSSE(r.Context(), w, tee); err != nil {
 
-			log.Printf("proxyhttp sse: %v", err)
+				log.Printf("proxyhttp sse: %v", err)
 
-			streamAccountID := ""
+				streamAccountID := ""
 
-			if acc != nil {
+				if acc != nil {
 
-				streamAccountID = acc.ID
+					streamAccountID = acc.ID
+
+				}
+
+				s.handleStreamQuota(streamAccountID, err)
 
 			}
-
-			s.handleStreamQuota(streamAccountID, err)
-
-		}
 
 			_ = resp.Body.Close()
 
@@ -1760,7 +2031,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			if len(tee.lastJSON) > 0 {
 
-				s.recordUsageFromSSECapture(tee.lastJSON, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+				s.recordUsageFromSSECapture(tee.lastJSON, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 
 			}
 
@@ -1769,8 +2040,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			return
 
 		}
-
-
 
 		// JSON success
 
@@ -1786,7 +2055,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 		}
 
-		s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+		s.recordUsageFromJSONBody(raw, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
 
 		clientStatus = 200
 
@@ -1815,8 +2084,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	}
 
 }
-
-
 
 // sanitizeKimiWorkChatBody rewrites HTTP chat bodies for agent-gw:
 //   - real wire model ids (k3-agent / k2d6-agent / …), never force kimi-for-coding
@@ -1900,9 +2167,7 @@ func clampKimiContextLimits(m map[string]any, model string) map[string]any {
 
 	// Leave 10 % headroom for prompts, tools, reasoning.
 
-	ceiling := 235930
-
-
+	ceiling := 65536
 
 	cur := 0
 
@@ -1938,8 +2203,6 @@ func clampKimiContextLimits(m map[string]any, model string) map[string]any {
 
 }
 
-
-
 // isKimiCapacityBusy detects Kimi Work / Desktop overload that cannot be fixed by rotating accounts.
 
 // Example: "Too many people are chatting with Kimi right now. Please try again soon."
@@ -1947,46 +2210,34 @@ func clampKimiContextLimits(m map[string]any, model string) map[string]any {
 func isKimiCapacityBusy(code int, body []byte) bool {
 
 	low := strings.ToLower(string(body))
+	result := false
 
 	if strings.Contains(low, "too many people are chatting with kimi") {
-
-		return true
-
+		result = true
 	}
 
-	if strings.Contains(low, "too many people are chatting") && strings.Contains(low, "kimi") {
-
-		return true
-
+	if !result && strings.Contains(low, "too many people are chatting") && strings.Contains(low, "kimi") {
+		result = true
 	}
 
-	if strings.Contains(low, "please try again soon") && strings.Contains(low, "kimi") {
-
-		return true
-
+	if !result && strings.Contains(low, "please try again soon") && strings.Contains(low, "kimi") {
+		result = true
 	}
 
 	// Some gateways return 429/503 with generic capacity wording.
 
-	if (code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable) &&
-
+	if !result && (code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable) &&
 		(strings.Contains(low, "too many people") ||
-
 			strings.Contains(low, "server is busy") ||
-
 			strings.Contains(low, "capacity") && strings.Contains(low, "kimi") ||
-
 			strings.Contains(low, "overloaded")) {
-
-		return true
-
+		result = true
 	}
 
-	return false
+	log.Printf("[AUDIT] isKimiCapacityBusy: code=%d result=%v bodySnippet=%q", code, result, truncateForLog(string(body), 300))
+	return result
 
 }
-
-
 
 func writeKimiCapacityError(w http.ResponseWriter, upstreamBody []byte) {
 
@@ -2000,6 +2251,8 @@ func writeKimiCapacityError(w http.ResponseWriter, upstreamBody []byte) {
 
 	}
 
+	log.Printf("[AUDIT] writeKimiCapacityError: returning 503 to client with upstreamMsg=%q", msg)
+
 	w.Header().Set("Content-Type", "application/json")
 
 	w.Header().Set("Retry-After", "30")
@@ -2012,23 +2265,19 @@ func writeKimiCapacityError(w http.ResponseWriter, upstreamBody []byte) {
 
 			"message": msg,
 
-			"type":    "kimi_capacity_error",
+			"type": "kimi_capacity_error",
 
-			"code":    "kimi_server_busy",
+			"code": "kimi_server_busy",
 
 			"retryable": true,
 
 			// Explicit: not an auth/account problem — do not rotate keys or re-mint.
 
 			"hint": "Kimi upstream servers are overloaded. Wait and retry; rotating accounts will not help.",
-
 		},
-
 	})
 
 }
-
-
 
 func extractUpstreamMessage(body []byte) (string, bool) {
 
@@ -2070,57 +2319,45 @@ func extractUpstreamMessage(body []byte) (string, bool) {
 
 }
 
-
-
 func isQuotaStatus(code int, body []byte) bool {
+	result := false
 
 	if code == http.StatusPaymentRequired { // 402
-
-		return true
-
+		result = true
 	}
 
 	low := strings.ToLower(string(body))
 
-	if strings.Contains(low, "usage balance exhausted") || strings.Contains(low, "balance exhausted") {
-
-		return true
-
+	if !result && (strings.Contains(low, "usage balance exhausted") || strings.Contains(low, "balance exhausted") || strings.Contains(low, "credit exhausted") || strings.Contains(low, "no remaining quota") || strings.Contains(low, "diamond") && strings.Contains(low, "insufficient")) {
+		result = true
 	}
 
 	// Kimi Work billing / plan cap (often HTTP 403 with access_terminated / resource_exhausted).
-	if strings.Contains(low, "usage limit") ||
+	if !result && (strings.Contains(low, "usage limit") ||
 		strings.Contains(low, "billing cycle") ||
 		strings.Contains(low, "resource_exhausted") ||
 		strings.Contains(low, "access_terminated") ||
 		strings.Contains(low, "rate limit exceeded") && (strings.Contains(low, "quota") || strings.Contains(low, "usage") || strings.Contains(low, "billing")) ||
-		strings.Contains(low, "upgrade to get more") {
-
-		return true
-
+		strings.Contains(low, "upgrade to get more")) {
+		result = true
 	}
 
-	if code == http.StatusTooManyRequests && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance") || strings.Contains(low, "rate limit")) {
-
-		return true
-
+	if !result && code == http.StatusTooManyRequests && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance") || strings.Contains(low, "rate limit")) {
+		result = true
 	}
 
 	// Kimi sometimes returns 403 (not 429) for plan exhaustion.
-	if code == http.StatusForbidden && (strings.Contains(low, "usage limit") ||
+	if !result && code == http.StatusForbidden && (strings.Contains(low, "usage limit") ||
 		strings.Contains(low, "resource_exhausted") ||
 		strings.Contains(low, "access_terminated") ||
-		strings.Contains(low, "billing cycle")) {
-
-		return true
-
+		strings.Contains(low, "billing cycle") ||
+		strings.Contains(low, "credit") || strings.Contains(low, "quota") || strings.Contains(low, "diamond")) {
+		result = true
 	}
 
-	return false
-
+	log.Printf("[AUDIT] isQuotaStatus: code=%d result=%v bodySnippet=%q", code, result, truncateForLog(string(body), 300))
+	return result
 }
-
-
 
 func isQuotaErrorPayload(payload map[string]any) (bool, string) {
 	errObj, ok := payload["error"].(map[string]any)
@@ -2204,7 +2441,8 @@ func isAuthStatus(code int, body []byte) bool {
 // isCrossProviderAuthMismatch reports that an auth error is almost certainly from
 // sending the wrong credential type to the wrong upstream (must not MarkAuthDenied).
 // Example we hit: Kimi sk-kimi against cli-chat-proxy.grok.com →
-//   "x_xai_token_auth=none ... no auth context"
+//
+//	"x_xai_token_auth=none ... no auth context"
 func isCrossProviderAuthMismatch(acc *store.Account, settings store.Settings, body []byte) bool {
 	low := strings.ToLower(string(body))
 	up := strings.ToLower(settings.EffectiveUpstream())
@@ -2230,8 +2468,6 @@ func isCrossProviderAuthMismatch(acc *store.Account, settings store.Settings, bo
 	}
 	return false
 }
-
-
 
 // writeCrossProviderError fails the request when account rotation landed on a
 // different provider than the model route pinned (a Kimi-shaped body would go
@@ -2274,12 +2510,24 @@ func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Sett
 
 	}
 
+	if token == "" && settings.IsDeepSeek() {
+
+		token = settings.DeepSeekAPIKeyPlain()
+
+	}
+
+	if token == "" && settings.IsOpenCodeZen() {
+
+		token = store.OpenCodeZenAPIKey
+
+	}
+
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	req.Header.Set("Content-Type", "application/json")
 
-	// QwenBridge: Authorization + Content-Type only — no provider-specific headers.
-	if settings.IsQwen() {
+	// QwenBridge / DeepSeek: Authorization + Content-Type only — no provider-specific headers.
+	if settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() {
 
 		return
 
@@ -2312,8 +2560,6 @@ func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Sett
 	req.Header.Set("User-Agent", "grok/"+version)
 
 }
-
-
 
 // chatCompletionsBodyToResponses converts OpenAI chat/completions body into /v1/responses
 // so OpenCode/Kilo (which only call chat/completions) work with Grok/xAI.
@@ -2393,29 +2639,29 @@ func chatCompletionsBodyToResponses(m map[string]any, settings store.Settings) m
 			}
 			// assistant with tool_calls
 			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
-			for _, tc := range tcs {
-				tcm, ok := tc.(map[string]any)
-				if !ok {
-					continue
+				for _, tc := range tcs {
+					tcm, ok := tc.(map[string]any)
+					if !ok {
+						continue
+					}
+					sanitized := sanitizeToolCall(tcm)
+					if sanitized == nil {
+						continue
+					}
+					fn, _ := sanitized["function"].(map[string]any)
+					name := asString(fn["name"])
+					args := asString(fn["arguments"])
+					callID := asString(sanitized["id"])
+					item := map[string]any{
+						"type":      "function_call",
+						"name":      name,
+						"arguments": args,
+					}
+					if callID != "" {
+						item["call_id"] = callID
+					}
+					input = append(input, item)
 				}
-				sanitized := sanitizeToolCall(tcm)
-				if sanitized == nil {
-					continue
-				}
-				fn, _ := sanitized["function"].(map[string]any)
-				name := asString(fn["name"])
-				args := asString(fn["arguments"])
-				callID := asString(sanitized["id"])
-				item := map[string]any{
-					"type":      "function_call",
-					"name":      name,
-					"arguments": args,
-				}
-				if callID != "" {
-					item["call_id"] = callID
-				}
-				input = append(input, item)
-			}
 				if content != "" {
 					input = append(input, map[string]any{
 						"type": "message",
@@ -2594,8 +2840,6 @@ func responsesBodyToChatCompletions(m map[string]any, settings store.Settings) m
 
 }
 
-
-
 // sanitizeOllieChatBody makes chat/completions bodies safe for the free OllieChat gateway.
 
 //
@@ -2636,8 +2880,6 @@ func sanitizeOllieChatBody(m map[string]any) {
 
 	delete(m, "reasoning") // Responses-style object; not valid on chat/completions
 
-
-
 	// Clamp xhigh → high (the gateway rejects xhigh). Everything else stays as-is.
 
 	if re, ok := m["reasoning_effort"].(string); ok {
@@ -2656,8 +2898,6 @@ func sanitizeOllieChatBody(m map[string]any) {
 
 	}
 
-
-
 	// Only set a default when the client sent NOTHING.  If the client sent a value
 
 	// (high or low) we respect it — no floor, no ceiling, no interference.
@@ -2673,8 +2913,6 @@ func sanitizeOllieChatBody(m map[string]any) {
 	}
 
 }
-
-
 
 func ensureMinMaxTokens(m map[string]any, min int) {
 
@@ -2715,8 +2953,6 @@ func ensureMinMaxTokens(m map[string]any, min int) {
 	}
 
 }
-
-
 
 func responsesInputToChatMessages(input any) []any {
 
@@ -2906,7 +3142,7 @@ func responsesInputToChatMessages(input any) []any {
 
 				out = append(out, map[string]any{
 
-					"role":    "assistant",
+					"role": "assistant",
 
 					"content": nil,
 
@@ -2914,22 +3150,18 @@ func responsesInputToChatMessages(input any) []any {
 
 						map[string]any{
 
-							"id":   callID,
+							"id": callID,
 
 							"type": "function",
 
 							"function": map[string]any{
 
-								"name":      name,
+								"name": name,
 
 								"arguments": args,
-
 							},
-
 						},
-
 					}),
-
 				})
 
 			case "function_call_output", "custom_tool_call_output":
@@ -3004,8 +3236,6 @@ func responsesInputToChatMessages(input any) []any {
 
 }
 
-
-
 func flattenResponsesContent(content any) string {
 
 	switch c := content.(type) {
@@ -3066,8 +3296,6 @@ func flattenResponsesContent(content any) string {
 
 }
 
-
-
 func injectTemporalIntoResponsesInput(input []any) []any {
 
 	// Prepend a system-like user note if nothing temporal yet
@@ -3105,9 +3333,7 @@ func injectTemporalIntoResponsesInput(input []any) []any {
 		"content": []any{
 
 			map[string]any{"type": "input_text", "text": line},
-
 		},
-
 	}
 
 	return append([]any{sys}, input...)
@@ -3387,9 +3613,7 @@ func normalizeUsageToChat(u any) map[string]any {
 // Forwards output_text and client function_call items as OpenAI tool_calls so agents (Kilo, etc.) execute tools.
 func pipeResponsesSSEToChat(ctx context.Context, w http.ResponseWriter, body io.Reader, model string) error {
 	flusher, _ := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
+	setSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	id := "chatcmpl-" + uuid.NewString()
@@ -3668,4 +3892,3 @@ func truncateForLog(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
-

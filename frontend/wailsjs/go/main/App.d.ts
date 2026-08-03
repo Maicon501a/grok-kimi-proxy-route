@@ -5,6 +5,14 @@ import {main} from '../models';
 import {store} from '../models';
 import {upstream} from '../models';
 
+export function AccioCredits():Promise<Record<string, any>>;
+
+export function AccioManagerStatus():Promise<Record<string, any>>;
+
+export function AccioStatus():Promise<Record<string, any>>;
+
+export function AccioTopUpNow():Promise<Record<string, any>>;
+
 export function AddKimiAPIKey(arg1:string,arg2:string):Promise<Record<string, any>>;
 
 export function AddKimiFromJWT(arg1:string):Promise<Record<string, any>>;
@@ -67,6 +75,8 @@ export function RenameAccount(arg1:string,arg2:string):Promise<void>;
 
 export function SendChat(arg1:upstream.ChatRequest):Promise<void>;
 
+export function SetAccioManagerConfig(arg1:boolean,arg2:number,arg3:number):Promise<void>;
+
 export function SetAccountGoogleCredentials(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SetActiveAccount(arg1:string):Promise<void>;
@@ -76,6 +86,8 @@ export function SetAutoCreateOnExhausted(arg1:boolean):Promise<void>;
 export function SetGoogleCredentials(arg1:string,arg2:string):Promise<void>;
 
 export function SetKimiStealthHeadless(arg1:boolean):Promise<void>;
+
+export function StartAccioLogin():Promise<string>;
 
 export function StartAutoSignup():Promise<void>;
 

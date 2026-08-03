@@ -83,6 +83,46 @@ func TestMarkAndClearExhausted(t *testing.T) {
 	}
 }
 
+func TestRemoveAccountPurgesHistoryAndPersistence(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertAccount(Account{ID: "remove-me", Provider: ProviderAccio, AccessToken: "tok"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordRequest(RequestSample{ID: "history-remove", At: time.Now().UTC().Format(time.RFC3339), AccountID: "remove-me", Model: "accio/test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RemoveAccount("remove-me"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.GetAccount("remove-me"); ok {
+		t.Fatal("account remains in memory")
+	}
+	for _, h := range st.History(0) {
+		if h.AccountID == "remove-me" {
+			t.Fatal("account history remains in memory")
+		}
+	}
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if _, ok := st2.GetAccount("remove-me"); ok {
+		t.Fatal("account remains after reload")
+	}
+	for _, h := range st2.History(0) {
+		if h.AccountID == "remove-me" {
+			t.Fatal("account history remains after reload")
+		}
+	}
+}
+
 func TestRecordRequestCost(t *testing.T) {
 	isolateHome(t)
 	dir := t.TempDir()

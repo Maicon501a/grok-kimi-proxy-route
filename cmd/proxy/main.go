@@ -11,11 +11,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"grok-desktop/internal/accio"
 	"grok-desktop/internal/kimi"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/oauth"
@@ -40,6 +42,7 @@ var replenishInFlight sync.Map // accountID → struct{}
 var (
 	lastCLISync   time.Time
 	lastCLISyncMu sync.Mutex
+	headlessAccio *accio.Client
 )
 
 func main() {
@@ -55,6 +58,15 @@ func main() {
 		oa.CLIVersion = v
 	}
 	up := upstream.New()
+	// The GUI stores Accio's account pool in the dedicated accio subdirectory.
+	// Keep the headless proxy on the same source of truth instead of looking for
+	// a legacy root-level token.json and silently falling back to Nexus.
+	ac, err := accio.New(filepath.Join(st.Root(), "accio"))
+	if err != nil {
+		log.Printf("accio: disabled: %v", err)
+	} else {
+		headlessAccio = ac
+	}
 
 	ensure := func(ctx context.Context) (string, *store.Account, store.Settings, error) {
 		return ensureCreds(ctx, st, oa, "", false)
@@ -89,6 +101,7 @@ func main() {
 	}
 
 	srv := proxyhttp.New(st, up, ensure)
+	srv.SetAccio(ac)
 	srv.SetForceRefresh(forceRefresh)
 	srv.SetQuotaHandler(func(accountID, reason string) bool {
 		acc, ok := st.GetAccount(accountID)
@@ -123,9 +136,9 @@ func main() {
 			if _, loaded := replenishInFlight.LoadOrStore(accountID, struct{}{}); !loaded {
 				go func(id string) {
 					defer replenishInFlight.Delete(id)
-				if autoReloginKimi(id, reason+" (rotated; replenish)") {
-					logging.Info("kimi.replenish.ok", "account_id", id)
-				}
+					if autoReloginKimi(id, reason+" (rotated; replenish)") {
+						logging.Info("kimi.replenish.ok", "account_id", id)
+					}
 				}(accountID)
 			}
 			return true
@@ -169,7 +182,7 @@ func main() {
 	logging.Info("proxy.startup",
 		"addr", srv.Addr(), "provider", settings.NormalizedProvider(),
 		"model", settings.ResolveModel("default"), "store", st.Root(),
-		"providers", "xai,kimi_work,ollie,gemini,qwen")
+		"providers", "xai,kimi_work,ollie,gemini,qwen,deepseek,opencode_zen,accio")
 	log.Printf("Ctrl+C to stop")
 
 	ch := make(chan os.Signal, 1)
@@ -178,6 +191,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Stop(ctx)
+	accio.ShutdownSGDaemon()
 	fmt.Println("stopped")
 }
 
@@ -260,6 +274,17 @@ func reloginKimiViaGoogleHTTP(st *store.Store, acc *store.Account) bool {
 	return true
 }
 
+func ensureAccioCreds(ctx context.Context, settings store.Settings) (string, *store.Account, store.Settings, error) {
+	if headlessAccio == nil {
+		return "", nil, settings, fmt.Errorf("accio: cliente não inicializado")
+	}
+	tok, err := headlessAccio.CurrentToken()
+	if err != nil {
+		return "", nil, settings, fmt.Errorf("accio: faça login no app Wails ou importe token.json")
+	}
+	return tok, &store.Account{ID: "accio", Provider: store.ProviderAccio, Label: "Accio", Email: "Accio/Phoenix", AccessToken: tok}, settings, nil
+}
+
 func ensureCreds(
 	ctx context.Context,
 	st *store.Store,
@@ -270,6 +295,9 @@ func ensureCreds(
 	settings := st.Settings()
 	if rp := proxyhttp.RouteProviderFrom(ctx); rp != "" {
 		settings = settings.WithProvider(rp)
+	}
+	if settings.IsAccio() {
+		return ensureAccioCreds(ctx, settings)
 	}
 	if settings.IsQwen() {
 		key := strings.TrimSpace(settings.QwenAPIKey)
@@ -283,6 +311,27 @@ func ensureCreds(
 			APIKey:      key,
 		}
 		return key, acc, settings, nil
+	}
+	if settings.IsDeepSeek() {
+		key := settings.DeepSeekAPIKeyPlain()
+		if key == "" {
+			return "", nil, settings, fmt.Errorf("deepseek: API key não configurada — configure no app desktop")
+		}
+		acc := &store.Account{
+			ID: "deepseek", Provider: store.ProviderDeepSeek, Label: "DeepSeek",
+			Email:       store.DeepSeekUpstream,
+			AccessToken: key,
+			APIKey:      key,
+		}
+		return key, acc, settings, nil
+	}
+	if settings.IsOpenCodeZen() {
+		acc := &store.Account{
+			ID: "opencode-zen-free", Provider: store.ProviderOpenCodeZen,
+			Label: "OpenCode Zen Free", Email: "keyless@opencode.ai",
+			AccessToken: store.OpenCodeZenAPIKey,
+		}
+		return store.OpenCodeZenAPIKey, acc, settings, nil
 	}
 	if settings.IsOllie() {
 		acc := &store.Account{

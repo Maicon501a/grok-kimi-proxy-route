@@ -27,7 +27,7 @@ func TestRecordUsageViaServer(t *testing.T) {
 	s := &Server{store: st}
 	raw := []byte(`{"id":"chatcmpl-1","model":"` + store.DefaultModel + `",` +
 		`"usage":{"prompt_tokens":1000,"completion_tokens":200,"total_tokens":1200}}`)
-	s.recordUsageFromJSONBody(raw, "acc", store.DefaultModel, 12)
+	s.recordUsageFromJSONBody(raw, "acc", store.ProviderXAI, store.DefaultModel, 12)
 	snap := st.UsageSnapshot()
 	if snap["acc"].Requests != 1 {
 		t.Fatalf("requests=%d", snap["acc"].Requests)
@@ -36,7 +36,7 @@ func TestRecordUsageViaServer(t *testing.T) {
 		t.Fatalf("expected cost > 0, got %v", snap["acc"].CostUSD)
 	}
 	// pricing sanity
-	cost := pricing.CostUSD(store.DefaultModel, 1000, 200, 0, 0)
+	cost := pricing.CostUSD(store.DefaultModel, store.ProviderXAI, 1000, 200, 0, 0)
 	if cost <= 0 {
 		t.Fatal("pricing zero")
 	}
@@ -58,7 +58,7 @@ func TestRecordUsageFromSSECapture(t *testing.T) {
 	// Responses-shaped final event: usage nested under response.usage
 	raw := []byte(`{"type":"response.completed","response":{"model":"` + store.DefaultModel + `",` +
 		`"usage":{"input_tokens":500,"output_tokens":100,"total_tokens":600}}}`)
-	s.recordUsageFromSSECapture(raw, "acc", store.DefaultModel, 30)
+	s.recordUsageFromSSECapture(raw, "acc", store.ProviderXAI, store.DefaultModel, 30)
 	snap := st.UsageSnapshot()
 	if snap["acc"].Requests != 1 {
 		t.Fatalf("requests=%d", snap["acc"].Requests)

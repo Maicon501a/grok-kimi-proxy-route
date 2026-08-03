@@ -323,7 +323,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if settings.IsXAI() {
 		if !stream {
 			rawResp, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-			s.recordUsageFromJSONBody(rawResp, accountID, model, latencyMs)
+			s.recordUsageFromJSONBody(rawResp, accountID, routeProv, model, latencyMs)
 			out, err := responsesJSONToAnthropicMessage(rawResp, model)
 			if err != nil {
 				writeAnthropicError(w, 500, "api_error", err.Error())
@@ -339,7 +339,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			s.handleStreamQuota(accountID, err)
 		}
 		if len(tee.lastJSON) > 0 {
-			s.recordUsageFromSSECapture(tee.lastJSON, accountID, model, latencyMs)
+			s.recordUsageFromSSECapture(tee.lastJSON, accountID, routeProv, model, latencyMs)
 		}
 		return
 	}
@@ -347,7 +347,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Kimi Work: upstream spoke OpenAI chat/completions.
 	if !stream {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-		s.recordUsageFromJSONBody(b, accountID, model, latencyMs)
+		s.recordUsageFromJSONBody(b, accountID, routeProv, model, latencyMs)
 		out, err := openAIChatToAnthropicMessage(b, model)
 		if err != nil {
 			writeAnthropicError(w, 500, "api_error", err.Error())
@@ -364,7 +364,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		s.handleStreamQuota(accountID, err)
 	}
 	if len(tee.lastJSON) > 0 {
-		s.recordUsageFromSSECapture(tee.lastJSON, accountID, model, latencyMs)
+		s.recordUsageFromSSECapture(tee.lastJSON, accountID, routeProv, model, latencyMs)
 	}
 }
 

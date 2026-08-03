@@ -20,7 +20,12 @@ export async function submit() {
   const promptEl = $("#prompt");
   const text = (promptEl?.value || "").trim();
   if (!text || state.streaming) return;
-  if (!activeAccount()) {
+  // Provedores API key não usam pool de contas — só provedores de sessão exigem conta.
+  const pNow = (state.settings?.provider || "xai").toLowerCase();
+  const sessionAuth =
+    pNow === "xai" || pNow === "grok" || pNow === "kimi_work" || pNow === "kimi" ||
+    pNow === "kimi-work" || pNow === "accio" || pNow === "accio-work" || pNow === "phoenix";
+  if (sessionAuth && !activeAccount()) {
     alert("Adicione e selecione uma conta primeiro.");
     return;
   }
