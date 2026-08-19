@@ -81,27 +81,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $exe = Get-ChildItem -Path build/bin -Filter *.exe -Recurse | Select-Object -First 1
           if (-not $exe) { throw "No .exe found under build/bin" }
-          # Portable layout: exe + grok-signup-bot (auto-register needs Python on host)
+          # The signup worker is embedded in the executable and extracted to AppData.
           $bundle = "dist/GrokProxyPlus-windows-amd64"
           New-Item -ItemType Directory -Force -Path $bundle | Out-Null
           Copy-Item $exe.FullName "$bundle/GrokProxyPlus.exe"
-          Copy-Item -Recurse -Force grok-signup-bot "$bundle/grok-signup-bot"
-          # Drop heavy/local junk if present
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$bundle/grok-signup-bot/.venv","$bundle/grok-signup-bot/__pycache__"
-          Get-ChildItem -Recurse "$bundle/grok-signup-bot" -Filter "__pycache__" -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
           @"
           Grok Proxy Plus - Windows portable
 
           Layout:
             GrokProxyPlus.exe
-            grok-signup-bot\   (Python auto-register bot)
 
           Auto-register setup (optional):
             1. Install Python 3 from https://www.python.org/ (check "Add to PATH")
             2. Install Chrome or Edge
-            3. In this folder:
-                 python -m pip install -r grok-signup-bot\requirements.txt
-            4. Run GrokProxyPlus.exe - bot_dir resolves next to the exe
+            3. Configure YESCAPTCHA_KEY and the selected email provider variables
+            4. Run GrokProxyPlus.exe (the app creates its managed venv automatically)
 
           Manual device login works without Python.
           Data: %LOCALAPPDATA%\GrokDesktop\
@@ -127,20 +121,15 @@ jobs:
           mkdir -p "$BUNDLE"
           cp "$BIN" "$BUNDLE/GrokProxyPlus"
           chmod +x "$BUNDLE/GrokProxyPlus"
-          cp -a grok-signup-bot "$BUNDLE/grok-signup-bot"
-          rm -rf "$BUNDLE/grok-signup-bot/.venv" "$BUNDLE/grok-signup-bot/__pycache__" 2>/dev/null || true
-          find "$BUNDLE/grok-signup-bot" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
           cat > "$BUNDLE/README-LINUX.txt" <<'EOF'
           Grok Proxy Plus - Linux portable
 
           Layout:
             GrokProxyPlus
-            grok-signup-bot/
 
           Auto-register (optional):
-            python3 -m venv .venv
-            .venv/bin/pip install -r grok-signup-bot/requirements.txt
-            # Chrome/Chromium + optional xvfb for headless
+            Install Python 3 and Chrome/Chromium. The embedded worker creates a
+            managed venv automatically. Configure YESCAPTCHA_KEY and email vars.
           Manual device login works without Python.
           Data: ~/.local/share/GrokDesktop/
           EOF
