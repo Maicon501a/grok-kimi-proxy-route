@@ -110,6 +110,17 @@ func (m *Manager) GetActiveChatProfile(excludedIDs []string) (*profile.Profile, 
 		}
 	}
 
+	// A fresh runtime has no in-memory active profile yet; honor the default
+	// persisted with the profiles file before falling back to best-pick.
+	if def := m.profiles.DefaultID(); def != "" {
+		if p := m.profiles.Get(def); p != nil && !containsString(excludedIDs, def) && m.isProfileReusable(def) {
+			m.mu.Lock()
+			m.activeChatProfile = def
+			m.mu.Unlock()
+			return p, nil
+		}
+	}
+
 	candidates := m.availableProfileIDs(excludedIDs)
 	if len(candidates) == 0 {
 		return nil, ErrNoAccount
