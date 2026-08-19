@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -35,16 +36,24 @@ type Config struct {
 }
 
 // DefaultConfig returns sane defaults: top up below 300 credits, at most 10
-// accounts, one creation per 3 minutes, balance re-check every 2 minutes.
-// WARP rotation is on by default (each creation gets a fresh IP — the Accio
-// anti-fraud marks IPs after a few signups); disable with ACCIO_USE_WARP=0.
+// accounts, one creation per 10 minutes, balance re-check every minute.
+// WARP rotation is OFF by default: the risk system keys on the browser
+// profile, not the IP (see waf-accio-re.md §11.1), and WARP's datacenter IPs
+// are actively counterproductive (codes issued under them get poisoned even
+// for the Node exchange path) — enable with ACCIO_USE_WARP=1.
+//
+// The 10-minute create cooldown is deliberate and load-bearing: Accio's risk
+// control heats up on signup VELOCITY per IP/profile. A burst of creations in
+// a few minutes gets the resulting accounts limited (entitlement NOT_LOGIN)
+// or outright blocked (423). Spaced creations come out clean with the full
+// credit grant (~520: 500 referral + 20 daily).
 func DefaultConfig() Config {
 	return Config{
 		MinCredits:     300,
 		MaxAccounts:    10,
-		CreateCooldown: 3 * time.Minute,
-		CheckEvery:     2 * time.Minute,
-		WARP:           true,
+		CreateCooldown: 10 * time.Minute,
+		CheckEvery:     time.Minute,
+		WARP:           strings.TrimSpace(os.Getenv("ACCIO_USE_WARP")) == "1",
 		Headless:       true,
 	}
 }
@@ -126,15 +135,23 @@ func (m *Manager) SetConfig(cfg Config) {
 
 func (m *Manager) loop() {
 	defer close(m.doneCh)
-	ticker := time.NewTicker(m.cfg.CheckEvery)
-	defer ticker.Stop()
 
 	m.check(context.Background())
 	for {
+		// Read the interval every cycle so SetConfig takes effect without a
+		// restart (the old ticker froze the initial CheckEvery forever).
+		m.mu.Lock()
+		every := m.cfg.CheckEvery
+		m.mu.Unlock()
+		if every <= 0 {
+			every = time.Minute
+		}
+		timer := time.NewTimer(every)
 		select {
 		case <-m.stopCh:
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			m.check(context.Background())
 		}
 	}
@@ -149,7 +166,26 @@ func (m *Manager) check(ctx context.Context) {
 		return
 	}
 
-	total, balances, err := m.Aggregate(ctx)
+	total, infos, err := m.aggregateDetailed(ctx)
+	// Prune accounts that never got their credits approved (remaining=0 and
+	// total=0): they are dead weight and, counted toward the pool cap, could
+	// stall top-ups forever. Exhausted-but-approved accounts (total>0) stay —
+	// daily pools replenish.
+	approved := 0
+	for id, bi := range infos {
+		if !pruneable(bi, time.Now()) {
+			approved++
+			continue
+		}
+		if derr := m.acc.RemoveAccount(id); derr == nil {
+			logging.Warn("accmgr.account_removed_unapproved", "id", id)
+			delete(infos, id)
+		}
+	}
+	balances := make(map[string]int, len(infos))
+	for id, bi := range infos {
+		balances[id] = bi.remaining
+	}
 	m.mu.Lock()
 	m.balances = balances
 	m.total = total
@@ -165,100 +201,172 @@ func (m *Manager) check(ctx context.Context) {
 	}
 
 	m.mu.Lock()
-	need := total < m.cfg.MinCredits && len(balances) < m.cfg.MaxAccounts
-	// Backoff: after consecutive failures the cooldown grows exponentially
-	// (3m → 6m → 12m → … capped at 1h) so a hostile WAF period does not
-	// burn temp-mail accounts in a tight loop. One success resets it.
-	cooldown := m.cfg.CreateCooldown
-	for i := 0; i < m.consecutiveFailures && i < 5; i++ {
-		cooldown *= 2
-	}
-	if cooldown > time.Hour {
-		cooldown = time.Hour
-	}
+	need := total < m.cfg.MinCredits && approved < m.cfg.MaxAccounts
+	cooldown := backoffCooldown(m.cfg.CreateCooldown, m.consecutiveFailures)
 	cooldownOK := time.Since(m.lastCreate) >= cooldown
 	m.mu.Unlock()
 	if !need || !cooldownOK {
 		return
 	}
-	if err := m.createAccount(ctx); err != nil {
-		m.mu.Lock()
-		m.failures++
-		m.consecutiveFailures++
-		m.lastErr = err.Error()
-		m.mu.Unlock()
-		logging.Warn("accmgr.create_failed", "err", err.Error(), "consecutive", m.consecutiveFailures)
-		return
-	}
+	// Run the creation async so a multi-minute signup does not block the
+	// balance loop; the creating flag inside createAccount prevents doubles.
+	// lastCreate is stamped up front so the cooldown also bounds failures.
 	m.mu.Lock()
-	m.created++
-	m.consecutiveFailures = 0
 	m.lastCreate = time.Now()
 	m.mu.Unlock()
-	logging.Info("accmgr.account_created")
+	go func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+		defer cancel()
+		if err := m.createAccount(cctx); err != nil {
+			m.mu.Lock()
+			m.failures++
+			m.consecutiveFailures++
+			m.lastErr = err.Error()
+			m.mu.Unlock()
+			logging.Warn("accmgr.create_failed", "err", err.Error(), "consecutive", m.consecutiveFailures)
+			return
+		}
+		m.mu.Lock()
+		m.created++
+		m.consecutiveFailures = 0
+		m.mu.Unlock()
+		logging.Info("accmgr.account_created")
+	}()
 }
 
-// Aggregate sums the remaining credits of every account in the pool. A
+// balanceInfo holds one account's entitlement snapshot.
+type balanceInfo struct {
+	remaining int
+	total     int
+	savedAt   int64 // unix millis, from TokenRecord.SavedAt
+}
+
+// pruneGracePeriod protects fresh accounts whose entitlement is still being
+// provisioned server-side from the zero-balance prune.
+const pruneGracePeriod = 10 * time.Minute
+
+// pruneable reports whether an account never received credits (remaining=0
+// and total=0) and is past the provisioning grace period. Such accounts are
+// dead weight; counted toward the pool cap they could stall top-ups forever.
+func pruneable(bi balanceInfo, now time.Time) bool {
+	if bi.total > 0 || bi.remaining > 0 {
+		return false
+	}
+	if bi.savedAt <= 0 {
+		return true // legacy record without a timestamp: judged immediately
+	}
+	return now.Sub(time.UnixMilli(bi.savedAt)) >= pruneGracePeriod
+}
+
+// backoffCooldown grows the create cooldown exponentially after consecutive
+// failures (base → 2x → 4x → … capped at 1h) so a hostile WAF period does
+// not burn temp-mail accounts in a tight loop. One success resets it.
+func backoffCooldown(base time.Duration, consecutiveFailures int) time.Duration {
+	cooldown := base
+	for i := 0; i < consecutiveFailures && i < 6; i++ {
+		cooldown *= 2
+	}
+	if cooldown > time.Hour {
+		return time.Hour
+	}
+	return cooldown
+}
+
+// Aggregate sums the remaining credits of every account in the pool.
+func (m *Manager) Aggregate(ctx context.Context) (int, map[string]int, error) {
+	total, infos, err := m.aggregateDetailed(ctx)
+	balances := make(map[string]int, len(infos))
+	for id, bi := range infos {
+		balances[id] = bi.remaining
+	}
+	return total, balances, err
+}
+
+// aggregateDetailed reads every account's balance in parallel (bounded by a
+// semaphore so a big pool cannot stampede the entitlement endpoint). A
 // failing account is auto-healed (refresh + persist the rotated pair) once
 // before being counted, so one expired access token cannot stall top-ups.
-func (m *Manager) Aggregate(ctx context.Context) (int, map[string]int, error) {
+func (m *Manager) aggregateDetailed(ctx context.Context) (int, map[string]balanceInfo, error) {
 	accounts := m.acc.Accounts()
-	balances := make(map[string]int, len(accounts))
-	total := 0
+	infos := make(map[string]balanceInfo, len(accounts))
+	var mu sync.Mutex
 	var firstErr error
-	for _, acc := range accounts {
-		rem, err := m.balanceFor(ctx, acc)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for _, acct := range accounts {
+		wg.Add(1)
+		go func(a accio.TokenRecord) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			rem, tot, err := m.balanceFor(ctx, a)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				logging.Warn("accmgr.account_balance_err", "id", a.ID, "err", err.Error())
+				return
 			}
-			logging.Warn("accmgr.account_balance_err", "id", acc.ID, "err", err.Error())
-			continue
-		}
-		balances[acc.ID] = rem
-		total += rem
+			mu.Lock()
+			infos[a.ID] = balanceInfo{remaining: rem, total: tot, savedAt: a.SavedAt}
+			mu.Unlock()
+		}(acct)
 	}
-	return total, balances, firstErr
+	wg.Wait()
+	total := 0
+	for _, bi := range infos {
+		total += bi.remaining
+	}
+	return total, infos, firstErr
 }
 
-// balanceFor reads one account's balance, refreshing (and persisting the
-// rotated pair) when the access token is rejected.
-func (m *Manager) balanceFor(ctx context.Context, acc accio.TokenRecord) (int, error) {
+// balanceFor reads one account's balance (remaining + total ever granted),
+// refreshing (and persisting the rotated pair) when the access token is
+// rejected.
+func (m *Manager) balanceFor(ctx context.Context, acc accio.TokenRecord) (int, int, error) {
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	credits, err := m.acc.CreditsFor(cctx, acc)
 	cancel()
 	if err == nil {
-		return int(firstValueInt(credits, "remaining")), nil
+		return int(firstValueInt(credits, "remaining")), int(firstValueInt(credits, "total")), nil
 	}
 	if !strings.Contains(err.Error(), "401") && !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "NOT_LOGIN") {
-		return 0, err
+		return 0, 0, err
 	}
 	// Auto-heal: refresh the account's own pair (rotation-aware) and retry.
 	// If the refresh token itself is dead, the account is garbage — remove it
-	// so it cannot occupy a slot of the pool cap.
+	// so it cannot occupy a slot of the pool cap. Exception: fresh accounts
+	// get "auth not pass" (502) from the refresh endpoint until server-side
+	// provisioning completes (the official app sees the same); that is not a
+	// dead account, keep it.
 	rctx, cancel2 := context.WithTimeout(ctx, 30*time.Second)
-	access, refresh, rerr := m.acc.RefreshWith(rctx, acc.RefreshToken)
+	access, refresh, rerr := m.acc.RefreshWith(rctx, acc.AccessToken, acc.RefreshToken, acc.Cookie)
 	cancel2()
 	if rerr != nil {
+		if strings.Contains(rerr.Error(), "auth not pass") {
+			return 0, 0, fmt.Errorf("balance refresh deferred (account still provisioning): %w", rerr)
+		}
 		if derr := m.acc.RemoveAccount(acc.ID); derr == nil {
 			logging.Warn("accmgr.account_removed_dead", "id", acc.ID)
 		}
-		return 0, fmt.Errorf("balance refresh: %w", rerr)
+		return 0, 0, fmt.Errorf("balance refresh: %w", rerr)
 	}
 	acc.AccessToken = access
 	if refresh != "" {
 		acc.RefreshToken = refresh
 	}
 	if serr := m.acc.SaveAccount(acc); serr != nil {
-		return 0, fmt.Errorf("balance persist rotated token: %w", serr)
+		return 0, 0, fmt.Errorf("balance persist rotated token: %w", serr)
 	}
 	cctx2, cancel3 := context.WithTimeout(ctx, 25*time.Second)
 	credits, err = m.acc.CreditsFor(cctx2, acc)
 	cancel3()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return int(firstValueInt(credits, "remaining")), nil
+	return int(firstValueInt(credits, "remaining")), int(firstValueInt(credits, "total")), nil
 }
 
 // TopUpNow forces an immediate creation attempt (used by tests / UI button).

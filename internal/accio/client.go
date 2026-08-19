@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,16 +28,21 @@ import (
 )
 
 const (
-	Provider              = "accio"
-	DefaultModel          = "accio/1Nexus-R36W8qJ5vB6h"
-	GatewayBase           = "https://phoenix-gw.alibaba.com/api"
-	GatewayLLM            = GatewayBase + "/adk/llm"
-	RefreshURL            = GatewayBase + "/auth/safe/refresh_token"
-	CreditsURL            = GatewayBase + "/entitlement/currentSubscription"
-	CreditsQuotaURL       = GatewayBase + "/entitlement/quota"
-	UserInfoURL           = GatewayBase + "/auth/safe/userinfo"
+	Provider        = "accio"
+	DefaultModel    = "accio/1Nexus-R36W8qJ5vB6h"
+	GatewayBase     = "https://phoenix-gw.alibaba.com/api"
+	GatewayLLM      = GatewayBase + "/adk/llm"
+	RefreshURL      = GatewayBase + "/auth/safe/refresh_token"
+	CreditsURL      = GatewayBase + "/entitlement/currentSubscription"
+	CreditsQuotaURL = GatewayBase + "/entitlement/quota"
+	UserInfoURL     = GatewayBase + "/auth/safe/userinfo"
+	// RefreshURLV2 / UserInfoURLV2 are the endpoints of the Accio 0.27.x
+	// desktop app (extracted from app.asar): /api/auth/refresh_token and
+	// /api/auth/userinfo (no /safe/ segment).
+	RefreshURLV2          = GatewayBase + "/auth/refresh_token"
+	UserInfoURLV2         = GatewayBase + "/auth/userinfo"
 	LoginBase             = "https://www.accio.com"
-	DefaultAppVersion     = "0.25.0"
+	DefaultAppVersion     = "0.29.1"
 	DefaultSecurityAppKey = "35336201"
 	// OAuthClientID is the public client_id used by the official Accio desktop
 	// app, extracted via reverse-engineering of app.asar (Hne = "accio-work").
@@ -83,6 +89,11 @@ type TokenRecord struct {
 	// are distinguishable in the pool instead of overwriting each other.
 	Email string `json:"email,omitempty"`
 	Label string `json:"label,omitempty"`
+	// InboxSecret keeps the disposable-inbox credential (mail.tm password or
+	// tempmail.lol token) so a pending account can be LOGGED INTO again later
+	// — e.g. to test whether a second login ceremony flips NOT_LOGIN.
+	InboxProvider string `json:"inboxProvider,omitempty"`
+	InboxSecret   string `json:"inboxSecret,omitempty"`
 }
 
 type Model struct {
@@ -163,6 +174,11 @@ type Client struct {
 	activeID         string
 	loginMu          sync.Mutex
 	loginCancel      context.CancelFunc
+	// loginErrCh receives the exchange error when a callback code is rejected
+	// (e.g. invalid_code 90001 from server-side risk control). It lets
+	// automated signup fail fast and retry instead of waiting out the login
+	// timeout for a token that will never arrive. Buffered (1), non-blocking.
+	loginErrCh chan error
 	// onLogin is fired when a callback captures a token. The app layer wires
 	// this to runtime.EventsEmit("accio:login", ...) so the frontend can poll
 	// AccioStatus / refresh models without a tight coupling to the listener.
@@ -189,26 +205,101 @@ func New(dataDir string) (*Client, error) {
 	}
 	// dataDir, gatewayLLM, appVersion, utdid
 
-	utdid := ""
-	if home, err := os.UserHomeDir(); err == nil {
-		b, _ := os.ReadFile(filepath.Join(home, ".accio", "utdid"))
-		utdid = strings.TrimSpace(string(b))
-	}
+	// The proxy uses its OWN persisted device id (utdid), generated once per
+	// install. We deliberately do NOT reuse the official app's id
+	// (~/.accio/utdid): account-creation volume would otherwise attach risk
+	// signals to the user's real device — and to the paid account logged into
+	// it. Accio tokens are not device-bound (the same account logs in from
+	// several machines), so a proxy-specific utdid is safe for refresh/chat.
+	utdid := loadOrCreateUtdid(dataDir)
 	c := &Client{
 		dataDir:          dataDir,
 		tokenPath:        filepath.Join(dataDir, "token.json"),
 		httpClient:       newChromeTLSClient(120 * time.Second),
-		refreshURL:       RefreshURL,
+		refreshURL:       RefreshURLV2,
 		tokenExchangeURL: TokenExchangeURL,
 		gatewayLLM:       GatewayLLM,
 		modelCatalogURL:  GatewayBase + "/llm/config/v2",
 		modelRoutingURL:  GatewayBase + "/tool/rlab/call",
-		appVersion:       DefaultAppVersion,
+		appVersion:       appVersionFromEnv(),
 		utdid:            utdid,
 		catalogTTL:       45 * time.Second,
 	}
 	_ = c.migrateLegacyToken()
 	return c, nil
+}
+
+// loadOrCreateUtdid returns the install-stable device id stored in the data
+// dir, generating one on first use. Format mirrors the app's (24-char base64).
+func loadOrCreateUtdid(dataDir string) string {
+	p := filepath.Join(dataDir, "utdid")
+	if b, err := os.ReadFile(p); err == nil {
+		if v := strings.TrimSpace(string(b)); v != "" {
+			return v
+		}
+	}
+	b := make([]byte, 18)
+	if _, err := cryptoRand.Read(b); err != nil {
+		return ""
+	}
+	v := base64.StdEncoding.EncodeToString(b)
+	_ = os.WriteFile(p, []byte(v), 0o600)
+	return v
+}
+
+// Utdid exposes the client's device id for diagnostics/probes.
+func (c *Client) Utdid() string { return c.utdid }
+
+// appVersionFromEnv lets probes pin the reported app version
+// (ACCIO_APP_VERSION) — e.g. to match an older official install.
+func appVersionFromEnv() string {
+	if v := strings.TrimSpace(os.Getenv("ACCIO_APP_VERSION")); v != "" {
+		return v
+	}
+	return DefaultAppVersion
+}
+
+// WarmDevice replays the official app's launch chatter — SecurityGuard-signed
+// featureFlag/evaluate calls — so the server sees this utdid as an
+// SG-initialized desktop device BEFORE any signup/exchange. Hypothesis under
+// test (13/08 late): the entitlement NOT_LOGIN gate on brand-new accounts is
+// tied to the exchanging device never having passed the Baxia/SG layer.
+func (c *Client) WarmDevice(ctx context.Context) {
+	if securityGuardBundleDir() == "" {
+		return
+	}
+	for i := 0; i < 3; i++ {
+		target := GatewayBase + "/tool/featureFlag/evaluate"
+		sec, err := c.securityHeaders(ctx, target)
+		if err != nil {
+			logging.Warn("accio.warm_device.headers", "err", err.Error())
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader("{}"))
+		if err != nil {
+			return
+		}
+		c.desktopHeaders(req)
+		for k, v := range sec {
+			req.Header.Set(k, v)
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			logging.Warn("accio.warm_device.call", "err", err.Error())
+			return
+		}
+		_, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		logging.Info("accio.warm_device.call", "status", resp.StatusCode)
+		if resp.StatusCode != 200 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(4 * time.Second):
+		}
+	}
 }
 
 func (c *Client) TokenPath() string { return c.tokenPath }
@@ -631,17 +722,19 @@ func (c *Client) Credits(ctx context.Context) (map[string]any, error) {
 // attempted for the active account (the refresh machinery serializes around
 // the active token file); non-active accounts simply report their error.
 func (c *Client) CreditsFor(ctx context.Context, t TokenRecord) (map[string]any, error) {
-	result, status, err := c.creditsWithToken(ctx, t.AccessToken, CreditsURL)
+	result, status, err := c.creditsWithToken(ctx, t.AccessToken, t.Cookie, CreditsURL)
 	if err != nil && status != http.StatusUnauthorized && status != http.StatusForbidden {
-		result, status, err = c.creditsWithToken(ctx, t.AccessToken, CreditsQuotaURL)
+		result, status, err = c.creditsWithToken(ctx, t.AccessToken, t.Cookie, CreditsQuotaURL)
 	}
 	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && err != nil && c.isActiveAccount(t) {
 		if refreshed, rerr := c.refreshForToken(ctx, t.AccessToken); rerr != nil {
-			return nil, rerr
+			// Keep the original entitlement error visible — the refresh
+			// failure (e.g. provisioning-gate 502) is secondary.
+			return nil, fmt.Errorf("credits: %v (refresh attempt: %v)", err, rerr)
 		} else {
-			result, _, err = c.creditsWithToken(ctx, refreshed, CreditsURL)
+			result, _, err = c.creditsWithToken(ctx, refreshed, t.Cookie, CreditsURL)
 			if err != nil {
-				result, _, err = c.creditsWithToken(ctx, refreshed, CreditsQuotaURL)
+				result, _, err = c.creditsWithToken(ctx, refreshed, t.Cookie, CreditsQuotaURL)
 			}
 		}
 	}
@@ -656,16 +749,26 @@ func (c *Client) isActiveAccount(t TokenRecord) bool {
 	return cur.AccessToken == t.AccessToken || cur.ID == t.ID
 }
 
-func (c *Client) creditsWithToken(ctx context.Context, token, endpoint string) (map[string]any, int, error) {
+func (c *Client) creditsWithToken(ctx context.Context, token, cookie, endpoint string) (map[string]any, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, 0, err
 	}
+	// Exact contract captured from the official 0.29.1 app: the token travels
+	// as a query param together with utdid/version, and the headers are the
+	// desktop set — NOT the legacy Authorization/WAF set. The browser session
+	// cookies (cna, _m_h5_tk) captured at login ride along when present: the
+	// WAF rejects entitlement reads that lack the issuing session's cookies.
 	q := req.URL.Query()
 	q.Set("accessToken", token)
 	q.Set("subscripType", "INDIVIDUAL")
+	q.Set("utdid", c.utdid)
+	q.Set("version", c.appVersion)
 	req.URL.RawQuery = q.Encode()
-	c.authHeaders(req)
+	c.desktopHeaders(req)
+	if strings.TrimSpace(cookie) != "" {
+		req.Header.Set("Cookie", cookie)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -673,7 +776,7 @@ func (c *Client) creditsWithToken(ctx context.Context, token, endpoint string) (
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, resp.StatusCode, fmt.Errorf("accio credits rejected: HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("accio credits rejected: HTTP %d: %s", resp.StatusCode, truncateBytes(raw, 300))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.StatusCode, fmt.Errorf("accio credits failed: HTTP %d", resp.StatusCode)
@@ -688,7 +791,7 @@ func (c *Client) creditsWithToken(ctx context.Context, token, endpoint string) (
 	if success, present := root["success"]; present {
 		if ok, isBool := success.(bool); isBool && !ok {
 			code := firstString(root, "code", "responseCode")
-			return nil, http.StatusUnauthorized, fmt.Errorf("accio credits rejected: %s", code)
+			return nil, http.StatusUnauthorized, fmt.Errorf("accio credits rejected: code=%s body=%s", code, truncateBytes(raw, 300))
 		}
 	}
 	data := root
@@ -781,20 +884,30 @@ func (c *Client) Refresh(ctx context.Context) (string, error) {
 	return c.refreshForToken(ctx, "")
 }
 
-// RefreshWith exchanges an arbitrary refresh token (any pool account) for a
-// fresh token pair, without touching the active-account file. Accio rotates
-// refresh tokens on every refresh, so callers must persist the returned pair
-// (see SaveAccount) or the old refresh token becomes invalid.
-func (c *Client) RefreshWith(ctx context.Context, refreshToken string) (access, refresh string, err error) {
+// RefreshWith exchanges an arbitrary account's token pair (any pool account)
+// for a fresh pair, without touching the active-account file. The official
+// app sends the CURRENT access token alongside the refresh token — the server
+// requires both to authorize rotation. Accio rotates refresh tokens on every
+// refresh, so callers must persist the returned pair (see SaveAccount) or the
+// old refresh token becomes invalid.
+//
+// Note: for brand-new accounts the server answers {"success":false,
+// "code":"502","message":"auth not pass"} until provisioning completes — the
+// official app's own refresh fails identically right after signup. Callers
+// validating fresh accounts should use the entitlement API instead.
+func (c *Client) RefreshWith(ctx context.Context, accessToken, refreshToken, cookie string) (access, refresh string, err error) {
 	if strings.TrimSpace(refreshToken) == "" {
 		return "", "", errors.New("accio refresh token is missing")
 	}
-	body, _ := json.Marshal(map[string]string{"refreshToken": refreshToken})
+	body, _ := json.Marshal(map[string]string{"utdid": c.utdid, "version": c.appVersion, "accessToken": accessToken, "refreshToken": refreshToken})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.refreshURL, bytes.NewReader(body))
 	if err != nil {
 		return "", "", err
 	}
-	c.authHeaders(req)
+	c.desktopHeaders(req)
+	if strings.TrimSpace(cookie) != "" {
+		req.Header.Set("Cookie", cookie)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", "", err
@@ -814,7 +927,7 @@ func (c *Client) RefreshWith(ctx context.Context, refreshToken string) (access, 
 	}
 	if success, present := root["success"]; present {
 		if ok, isBool := success.(bool); isBool && !ok {
-			return "", "", errors.New("accio refresh rejected the session")
+			return "", "", fmt.Errorf("accio refresh rejected the session: %s", truncateBytes(raw, 300))
 		}
 	}
 	access = firstString(data, "accessToken", "access_token")
@@ -879,12 +992,15 @@ func (c *Client) refreshForToken(ctx context.Context, failedAccess string) (stri
 	if strings.TrimSpace(t.RefreshToken) == "" {
 		return "", errors.New("accio refresh token is missing")
 	}
-	body, _ := json.Marshal(map[string]string{"refreshToken": t.RefreshToken})
+	body, _ := json.Marshal(map[string]string{"utdid": c.utdid, "version": c.appVersion, "accessToken": t.AccessToken, "refreshToken": t.RefreshToken})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.refreshURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	c.authHeaders(req)
+	c.desktopHeaders(req)
+	if strings.TrimSpace(t.Cookie) != "" {
+		req.Header.Set("Cookie", t.Cookie)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", err
@@ -904,7 +1020,7 @@ func (c *Client) refreshForToken(ctx context.Context, failedAccess string) (stri
 	}
 	if success, present := root["success"]; present {
 		if ok, isBool := success.(bool); isBool && !ok {
-			return "", errors.New("accio refresh rejected the session")
+			return "", fmt.Errorf("accio refresh rejected the session: %s", truncateBytes(raw, 300))
 		}
 	}
 	access := firstString(data, "accessToken", "access_token")
@@ -979,6 +1095,7 @@ func (c *Client) StartLogin(ctx context.Context, callbackPort int) (string, erro
 	}
 	loginCtx, cancel := context.WithCancel(ctx)
 	c.loginCancel = cancel
+	c.loginErrCh = make(chan error, 1)
 	c.loginMu.Unlock()
 
 	// Generate PKCE verifier + challenge (S256), matching the official app.
@@ -989,13 +1106,17 @@ func (c *Client) StartLogin(ctx context.Context, callbackPort int) (string, erro
 	}
 
 	if callbackPort == 0 {
+		// Random local port. NOTE: the official app's canonical port 4097 was
+		// tested and the OAuth server consistently rejects codes issued for
+		// redirect_uri=http://localhost:4097/... from non-app sessions with
+		// invalid_code (90001); random ports work. Do not "prefer 4097".
 		listener, err := net.Listen("tcp", "localhost:0")
 		if err != nil {
 			cancel()
 			return "", fmt.Errorf("accio callback listener: %w", err)
 		}
 		callbackPort = listener.Addr().(*net.TCPAddr).Port
-		redirect := fmt.Sprintf("http://localhost:%d/auth/callback", callbackPort)
+		redirect := buildRedirectURI(callbackPort)
 		state, err := randomHexState()
 		if err != nil {
 			_ = listener.Close()
@@ -1012,7 +1133,7 @@ func (c *Client) StartLogin(ctx context.Context, callbackPort int) (string, erro
 		return loginURL, nil
 	}
 
-	redirect := fmt.Sprintf("http://localhost:%d/auth/callback", callbackPort)
+	redirect := buildRedirectURI(callbackPort)
 	state, err := randomHexState()
 	if err != nil {
 		cancel()
@@ -1032,6 +1153,41 @@ func (c *Client) StartLogin(ctx context.Context, callbackPort int) (string, erro
 		c.loginCallbackWithListener(loginCtx, listener)
 	}()
 	return loginURL, nil
+}
+
+// LoginErrors returns the channel that receives the OAuth exchange error if
+// the callback's code is rejected. nil until StartLogin runs.
+func (c *Client) LoginErrors() <-chan error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	return c.loginErrCh
+}
+
+// reportLoginErr delivers an exchange failure to any automated waiter
+// (non-blocking; a human-driven login just ignores the channel).
+func (c *Client) reportLoginErr(err error) {
+	c.loginMu.Lock()
+	ch := c.loginErrCh
+	c.loginMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- err:
+	default:
+	}
+}
+
+// buildRedirectURI builds the OAuth redirect URI exactly like the official
+// 0.29.1 app: the local gateway callback carrying a per-login trace id
+// ("login_" + 16 random hex bytes), which the OAuth server binds the issued
+// code to. Captured live from the official app (see phoenix-sniff tooling).
+func buildRedirectURI(port int) string {
+	b := make([]byte, 16)
+	if _, err := cryptoRand.Read(b); err != nil {
+		return fmt.Sprintf("http://localhost:%d/auth/callback", port)
+	}
+	return fmt.Sprintf("http://localhost:%d/auth/callback?login_trace_id=login_%x", port, b)
 }
 
 // randomHexState generates a 32-byte random hex state for CSRF protection,
@@ -1106,11 +1262,6 @@ func (c *Client) loginCallbackWithListener(ctx context.Context, listener net.Lis
 		return true
 	}
 	mux.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
-		if !markHandled() {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = io.WriteString(w, callbackSuccessHTML)
-			return
-		}
 		q := r.URL.Query()
 
 		// PKCE flow: the callback arrives with ?code=...&state=...
@@ -1130,9 +1281,15 @@ func (c *Client) loginCallbackWithListener(ctx context.Context, listener net.Lis
 				http.Error(w, "No pending login — start login first.", http.StatusBadRequest)
 				return
 			}
+			if !markHandled() {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				_, _ = io.WriteString(w, callbackSuccessHTML)
+				return
+			}
 
 			token, err := c.exchangeCodeForToken(ctx, code, pending)
 			if err != nil {
+				c.reportLoginErr(err)
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, callbackErrorHTML(err.Error()))
@@ -1172,6 +1329,11 @@ func (c *Client) loginCallbackWithListener(ctx context.Context, listener net.Lis
 			_, _ = io.WriteString(w, callbackRelayHTML)
 			return
 		}
+		if !markHandled() {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = io.WriteString(w, callbackSuccessHTML)
+			return
+		}
 		if err := c.setTokenWithCookie(access, refresh, cookie, expires, false); err != nil {
 			http.Error(w, "Unable to save token", http.StatusInternalServerError)
 			return
@@ -1191,9 +1353,171 @@ func (c *Client) loginCallbackWithListener(ctx context.Context, listener net.Lis
 	_ = srv.Serve(listener)
 }
 
+// desktopHeaders applies the exact header contract captured from the official
+// 0.29.1 app's Node-stack calls to phoenix-gw (exchange, userinfo). No WAF
+// headers, no cookies, no Authorization — auth travels in the JSON body.
+func (c *Client) desktopHeaders(req *http.Request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-language", "pt")
+	req.Header.Set("x-locale", "pt-BR")
+	req.Header.Set("x-platform", "pc-win")
+	req.Header.Set("x-utdid", c.utdid)
+	req.Header.Set("x-app-version", c.appVersion)
+	req.Header.Set("x-os", "win32")
+	req.Header.Set("x-deploy-target", "desktop")
+	req.Header.Set("x-source", "ACCIO_DESKTOP")
+	req.Header.Set("x-cna", "")
+	req.Header.Set("x-package-region", "GLOBAL")
+}
+
+// UserInfoV2WithToken resolves identity via the current phoenix-gw endpoint
+// used by the 0.29.1 app: POST /api/auth/userinfo with the token in the body.
+// The legacy /safe/ userinfo endpoint is dead (404). NOTE: the response masks
+// the email (desensitizedEmail like "a*************0@emalupe.com") — compare
+// with maskMatch-style logic, never exact equality.
+func (c *Client) UserInfoV2WithToken(ctx context.Context, access string) (maskedEmail, label string, err error) {
+	body, _ := json.Marshal(map[string]string{
+		"utdid":       c.utdid,
+		"version":     c.appVersion,
+		"accessToken": access,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, UserInfoURLV2, bytes.NewReader(body))
+	if err != nil {
+		return "", "", err
+	}
+	c.desktopHeaders(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("accio userinfo v2 failed: HTTP %d", resp.StatusCode)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return "", "", err
+	}
+	data := root
+	if d, ok := root["data"].(map[string]any); ok {
+		data = d
+	}
+	maskedEmail = firstString(data, "desensitizedEmail", "email")
+	label = firstString(data, "userName", "name", "nickname")
+	if label == "" {
+		label = maskedEmail
+	}
+	return maskedEmail, label, nil
+}
+
 // exchangeCodeForToken performs the PKCE token exchange at /api/oauth/token,
 // matching the official app's qc(Sc.tokenExchange, {code, codeVerifier, clientId, redirectUri}).
+//
+// The server gates the exchange on the CLIENT TLS fingerprint: Go's
+// crypto/tls stack gets its codes rejected with invalid_code (90001) most of
+// the time, while the official app's Node stack — and our Node sidecar
+// replaying the identical request — succeeds first try (proven by the
+// TestNodeExchange probe). So the exchange prefers a `node` child process
+// when one is available; ACCIO_EXCHANGE_VIA=go forces the pure-Go path.
 func (c *Client) exchangeCodeForToken(ctx context.Context, code string, pending pendingLogin) (*TokenRecord, error) {
+	if os.Getenv("ACCIO_EXCHANGE_VIA") != "go" && c.tokenExchangeURL == TokenExchangeURL {
+		if node, err := exec.LookPath("node"); err == nil {
+			rec, nerr := c.exchangeViaNode(ctx, node, code, pending)
+			if nerr == nil {
+				return rec, nil
+			}
+			// A server-side rejection (invalid_code) would fail identically
+			// over the Go stack — only fall back when Node itself broke.
+			if !errors.Is(nerr, errNodeUnavailable) {
+				return nil, nerr
+			}
+		}
+	}
+	return c.exchangeCodeForTokenGo(ctx, code, pending)
+}
+
+var errNodeUnavailable = errors.New("node exchange unavailable")
+
+// nodeExchangeScript replays the official app's exact /api/oauth/token call
+// from a Node TLS stack. Args: code, codeVerifier, redirectUri, utdid,
+// version. stdout = response body (JSON); exit 1 + stderr on transport error.
+const nodeExchangeScript = `const https = require('https');
+const [code, verifier, redirectUri, utdid, version] = process.argv.slice(2);
+const body = JSON.stringify({ utdid, version, code, codeVerifier: verifier, clientId: "accio-work", redirectUri });
+const req = https.request("https://phoenix-gw.alibaba.com/api/oauth/token", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    // The official app's SDK runs on Node fetch, whose default UA is "node";
+    // https.request sends none, and a missing UA is an exchange anomaly.
+    "User-Agent": "node",
+    "x-language": "pt",
+    "x-locale": "pt-BR",
+    "x-platform": "pc-win",
+    "x-utdid": utdid,
+    "x-app-version": version,
+    "x-os": "win32",
+    "x-deploy-target": "desktop",
+    "x-source": "ACCIO_DESKTOP",
+    "x-cna": "",
+    "x-package-region": "GLOBAL",
+    "Content-Length": Buffer.byteLength(body),
+  },
+}, res => {
+  let d = "";
+  res.on("data", c => d += c);
+  res.on("end", () => process.stdout.write(d));
+});
+req.on("error", e => { console.error(e.message); process.exit(1); });
+req.setTimeout(30000, () => { console.error("timeout"); req.destroy(); process.exit(1); });
+req.end(body);
+`
+
+func (c *Client) exchangeViaNode(ctx context.Context, node string, code string, pending pendingLogin) (*TokenRecord, error) {
+	script := filepath.Join(os.TempDir(), "accio-oauth-exchange.cjs")
+	if cur, err := os.ReadFile(script); err != nil || string(cur) != nodeExchangeScript {
+		if err := os.WriteFile(script, []byte(nodeExchangeScript), 0o600); err != nil {
+			return nil, fmt.Errorf("%w: write script: %v", errNodeUnavailable, err)
+		}
+	}
+	out, err := exec.CommandContext(ctx, node, script, code, pending.codeVerifier, pending.redirectURI, c.utdid, c.appVersion).Output()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return nil, fmt.Errorf("%w: %s", errNodeUnavailable, truncateBytes(exitErr.Stderr, 200))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errNodeUnavailable, err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		return nil, fmt.Errorf("accio token exchange (node): invalid JSON: %w", err)
+	}
+	data := root
+	if d, ok := root["data"].(map[string]any); ok {
+		data = d
+	}
+	access := firstString(data, "accessToken", "access_token")
+	refresh := firstString(data, "refreshToken", "refresh_token")
+	if access == "" {
+		fmt.Fprintf(os.Stderr, "[accio] token exchange (node) response (no accessToken): body=%s\n", truncateBytes(out, 600))
+		return nil, fmt.Errorf("accio token exchange: no accessToken in response: %s", truncateBytes(out, 300))
+	}
+	var expiresAt any
+	if v, ok := data["expiresAt"]; ok {
+		expiresAt = v
+	} else if v, ok := data["expires_at"]; ok {
+		expiresAt = v
+	}
+	if n, ok := expiresAt.(float64); ok && n > 0 && n < 1e12 {
+		expiresAt = int64(n * 1000)
+	}
+	cookie := extractCookiesFromRefresh(data)
+	return &TokenRecord{AccessToken: access, RefreshToken: refresh, Cookie: cookie, ExpiresAt: expiresAt}, nil
+}
+
+// exchangeCodeForTokenGo is the pure-Go exchange (kept as fallback when no
+// node binary exists; server-side risk control rejects it frequently).
+func (c *Client) exchangeCodeForTokenGo(ctx context.Context, code string, pending pendingLogin) (*TokenRecord, error) {
 	body, _ := json.Marshal(map[string]string{
 		"code":         code,
 		"codeVerifier": pending.codeVerifier,
@@ -1206,7 +1530,12 @@ func (c *Client) exchangeCodeForToken(ctx context.Context, code string, pending 
 	if err != nil {
 		return nil, err
 	}
-	c.authHeaders(req)
+	// Header contract captured live from the official 0.29.1 app's own
+	// /api/oauth/token call (Node stack, no WAF headers, no cookies, no
+	// Authorization). Do NOT reuse authHeaders here — the extra Cookie /
+	// User-Agent / appKey headers and the SG package-region are what made the
+	// server reject our exchanges with invalid_code (90001).
+	c.desktopHeaders(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -1227,6 +1556,12 @@ func (c *Client) exchangeCodeForToken(ctx context.Context, code string, pending 
 	access := firstString(data, "accessToken", "access_token")
 	refresh := firstString(data, "refreshToken", "refresh_token")
 	if access == "" {
+		// Log the raw response body for diagnosis (signup flow debugging).
+		if len(raw) > 0 && len(raw) < 4096 {
+			fmt.Fprintf(os.Stderr, "[accio] token exchange response (no accessToken): HTTP %d body=%s\n",
+				resp.StatusCode, string(raw))
+			fmt.Fprintf(os.Stderr, "[accio] exchange request was: %s\n", string(body))
+		}
 		return nil, fmt.Errorf("accio token exchange: no accessToken in response")
 	}
 	var expiresAt any
@@ -2238,6 +2573,7 @@ type frame struct {
 	GatewayError    any            `json:"gatewayError"`
 	GatewayPayload  map[string]any `json:"gatewayPayload"`
 	GatewayEnvelope map[string]any `json:"gatewayEnvelope"`
+	RawResponseJSON string         `json:"raw_response_json"`
 }
 
 func (c *Client) writeChatResponse(resp *http.Response, request map[string]any, w http.ResponseWriter) error {
@@ -2416,6 +2752,28 @@ func frameError(f frame) error {
 	if f.GatewayEnvelope != nil {
 		if code, ok := f.GatewayEnvelope["code"].(float64); ok && code >= 400 {
 			return fmt.Errorf("accio gateway HTTP %.0f: %s", code, firstString(f.GatewayEnvelope, "messageRaw", "message"))
+		}
+	}
+	// Some Accio deployments wrap the real OpenAI-shaped failure in a successful
+	// turn_complete SSE frame. Decode that nested JSON so callers receive the
+	// actual failure instead of an empty completion.
+	if raw := strings.TrimSpace(f.RawResponseJSON); raw != "" {
+		var inner map[string]any
+		if json.Unmarshal([]byte(raw), &inner) == nil && strings.EqualFold(firstString(inner, "type"), "response.failed") {
+			response, _ := inner["response"].(map[string]any)
+			errObj, _ := response["error"].(map[string]any)
+			code := firstString(errObj, "code", "type")
+			message := firstString(errObj, "message", "error")
+			if message == "" {
+				message = firstString(response, "status", "statusText")
+			}
+			if code != "" && message != "" {
+				return fmt.Errorf("accio response failed (%s): %s", code, message)
+			}
+			if message != "" {
+				return fmt.Errorf("accio response failed: %s", message)
+			}
+			return errors.New("accio response failed")
 		}
 	}
 	for _, raw := range []any{f.Error, f.GatewayError} {

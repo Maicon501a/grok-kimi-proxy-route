@@ -46,7 +46,13 @@ type sgResponse struct {
 }
 
 var globalSGDaemon *sgDaemon
-var sgDaemonOnce sync.Once
+
+// sgDaemonMu serializes daemon start/restart so a failed or dead daemon is
+// retried on the next call instead of failing forever (the old sync.Once
+// consumed itself on a first-boot failure — node missing, bundle missing —
+// and every later request returned "security guard daemon unavailable" until
+// the process restarted).
+var sgDaemonMu sync.Mutex
 
 // securityGuardBundleDir returns the path to the bundled security-guard
 // directory (contains sg_daemon.js + prebuild/ + resources/).
@@ -224,35 +230,23 @@ func securityNodePath() string {
 // deadline (the old 15s fixed wait made a broken UMID init cost 45s across
 // the chat retry loop).
 func getSGDaemon(ctx context.Context) (*sgDaemon, error) {
-	var startErr error
-	sgDaemonOnce.Do(func() {
-		d := &sgDaemon{
-			pending: make(map[string]chan sgResponse),
-			done:    make(chan struct{}),
-		}
-		if err := d.start(ctx); err != nil {
-			startErr = err
-			return
-		}
-		globalSGDaemon = d
-	})
-	if startErr != nil {
-		return nil, startErr
+	sgDaemonMu.Lock()
+	defer sgDaemonMu.Unlock()
+	if globalSGDaemon != nil && !sgDaemonDead(globalSGDaemon) {
+		return globalSGDaemon, nil
 	}
-	if globalSGDaemon == nil {
-		return nil, errors.New("security guard daemon unavailable")
-	}
-	if sgDaemonDead(globalSGDaemon) {
+	if globalSGDaemon != nil {
 		log.Printf("accio: sg daemon died; restarting")
-		d := &sgDaemon{
-			pending: make(map[string]chan sgResponse),
-			done:    make(chan struct{}),
-		}
-		if err := d.start(ctx); err != nil {
-			return nil, err
-		}
-		globalSGDaemon = d
 	}
+	d := &sgDaemon{
+		pending: make(map[string]chan sgResponse),
+		done:    make(chan struct{}),
+	}
+	if err := d.start(ctx); err != nil {
+		// Do not cache the failure: the next call tries to start again.
+		return nil, err
+	}
+	globalSGDaemon = d
 	return globalSGDaemon, nil
 }
 
@@ -459,8 +453,11 @@ func (d *sgDaemon) Shutdown() {
 
 // ShutdownSGDaemon is the package-level shutdown hook.
 func ShutdownSGDaemon() {
+	sgDaemonMu.Lock()
+	defer sgDaemonMu.Unlock()
 	if globalSGDaemon != nil {
 		globalSGDaemon.Shutdown()
+		globalSGDaemon = nil
 	}
 }
 
@@ -474,5 +471,17 @@ func (c *Client) securityHeaders(ctx context.Context, requestURL string) (map[st
 	if err != nil {
 		return nil, err
 	}
-	return daemon.headers(callCtx, requestURL)
+	headers, err := daemon.headers(callCtx, requestURL)
+	if err != nil {
+		return nil, err
+	}
+	return applyLocalSign(headers), nil
+}
+
+// SecurityHeadersForURL exposes the WAF security headers (x-sign, x-mini-wua,
+// sgext, …) for an arbitrary gateway URL. The PKCE token exchange endpoint
+// started rejecting unsigned requests (90001 invalid_code), so the login
+// path needs the same signing the chat path already had.
+func (c *Client) SecurityHeadersForURL(ctx context.Context, requestURL string) (map[string]string, error) {
+	return c.securityHeaders(ctx, requestURL)
 }

@@ -301,6 +301,15 @@ func TestReadFramesParsesNestedCandidateContent(t *testing.T) {
 	}
 }
 
+func TestReadFramesReturnsNestedResponseFailed(t *testing.T) {
+	c := &Client{}
+	raw := "data: {\"turn_complete\":true,\"raw_response_json\":\"{\\\"type\\\":\\\"response.failed\\\",\\\"response\\\":{\\\"status\\\":\\\"failed\\\",\\\"error\\\":{\\\"code\\\":\\\"context_length_exceeded\\\",\\\"message\\\":\\\"request exceeds the context window\\\"}}}\"}\n"
+	err := c.readFrames(strings.NewReader(raw), func(string, string, map[string]any, bool) {})
+	if err == nil || !strings.Contains(err.Error(), "context_length_exceeded") || !strings.Contains(err.Error(), "request exceeds the context window") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestReadFramesRejectsHTMLChallenge(t *testing.T) {
 	c := &Client{}
 	raw := "<!doctype html><html><body>challenge</body></html>\n"
