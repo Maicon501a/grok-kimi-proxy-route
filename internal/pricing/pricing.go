@@ -27,6 +27,9 @@ type Rate struct {
 
 var table = map[string]Rate{
 	// ——— xAI / Grok ———
+	"grok-4.6": {
+		InputPerM: 2.00, CachedPerM: 0.30, OutputPerM: 6.00, Label: "Grok 4.6 (est.)",
+	},
 	"grok-4.5": {
 		InputPerM: 2.00, CachedPerM: 0.30, OutputPerM: 6.00, Label: "Grok 4.5",
 	},
@@ -144,6 +147,12 @@ var providerFixed = map[string]Rate{
 func init() {
 	providerFixed[store.ProviderOpenCodeZen] = Rate{
 		InputPerM: 0, CachedPerM: 0, OutputPerM: 0, Label: "OpenCode Zen Free",
+	}
+	providerFixed[store.ProviderOpenCodeGo] = Rate{
+		InputPerM: 0, CachedPerM: 0, OutputPerM: 0, Label: "OpenCode Go",
+	}
+	providerFixed[store.ProviderCodex] = Rate{
+		InputPerM: 0, CachedPerM: 0, OutputPerM: 0, Label: "OpenAI Codex · ChatGPT plan",
 	}
 }
 

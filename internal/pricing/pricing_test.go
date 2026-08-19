@@ -32,6 +32,8 @@ func TestRateForProviderAware(t *testing.T) {
 		// xAI.
 		{model: "grok-4.5", provider: store.ProviderXAI, wantIn: 2.00},
 		{model: "grok-4.3", provider: store.ProviderXAI, wantIn: 1.25},
+		// ChatGPT subscription usage is quota-based, not API token billing.
+		{model: "codex/gpt-5.6-sol", provider: store.ProviderCodex, wantIn: 0},
 	}
 	for _, c := range cases {
 		r := RateFor(c.model, c.provider)
