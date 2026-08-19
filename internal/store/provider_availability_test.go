@@ -3,7 +3,7 @@ package store
 import "testing"
 
 func TestProviderAvailability(t *testing.T) {
-	for _, provider := range []string{ProviderOllie, "olliechat", ProviderGemini, "google", "vertex", ProviderQwen, "qwenbridge"} {
+	for _, provider := range []string{ProviderOllie, "olliechat", ProviderQwen, "qwenbridge"} {
 		if got := ProviderAvailability(provider); got != "disabled" {
 			t.Fatalf("ProviderAvailability(%q) = %q, want disabled", provider, got)
 		}
@@ -19,12 +19,12 @@ func TestProviderAvailability(t *testing.T) {
 			t.Fatalf("ProviderAvailabilityBlocksRequests(%q) = true, want advisory maintenance", provider)
 		}
 	}
-	for _, provider := range []string{ProviderOllie, ProviderGemini, ProviderQwen} {
+	for _, provider := range []string{ProviderOllie, ProviderQwen} {
 		if !ProviderAvailabilityBlocksRequests(provider) {
 			t.Fatalf("ProviderAvailabilityBlocksRequests(%q) = false, want disabled block", provider)
 		}
 	}
-	for _, provider := range []string{ProviderXAI, ProviderKimiWork, ProviderDeepSeek, ProviderOpenCodeZen} {
+	for _, provider := range []string{ProviderXAI, ProviderKimiWork, ProviderGemini, "google", "vertex", ProviderDeepSeek, ProviderOpenCodeZen, ProviderOpenCodeGo} {
 		if got := ProviderAvailability(provider); got != "" {
 			t.Fatalf("ProviderAvailability(%q) = %q, want available", provider, got)
 		}

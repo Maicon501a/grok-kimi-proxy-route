@@ -20,14 +20,22 @@ import (
 )
 
 const (
-	AppName              = "GrokDesktop"
-	DefaultUpstream      = "https://cli-chat-proxy.grok.com/v1"
-	DefaultClientVersion = "0.2.106"
-	DefaultModel         = "grok-4.5"
-	DefaultEffort        = "high"
-	DefaultClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
-	DefaultIssuer        = "https://auth.x.ai"
-	DefaultScopes        = "openid profile email offline_access api:access grok-cli:access conversations:read conversations:write"
+	AppName         = "GrokDesktop"
+	DefaultUpstream = "https://cli-chat-proxy.grok.com/v1"
+	// Wire identity of the official Grok CLI (currently 1.0.5). cli-chat-proxy
+	// gates function-tool emission on these headers; older 0.2.x values look
+	// like a chat-only client and the model never returns tool_calls.
+	DefaultClientVersion    = "1.0.5"
+	DefaultClientIdentifier = "grok-cli"
+	DefaultClientSurface    = "grok-cli"
+	DefaultModel            = "grok-4.6"
+	DefaultEffort           = "high"
+	DefaultClientID         = "b1a00492-073a-47ea-816f-4c329264a828"
+	DefaultIssuer           = "https://auth.x.ai"
+	// Scope matching the official Grok CLI device grant. cli-chat-proxy
+	// rejects /v1/responses when the token lacks conversations/workspaces,
+	// so the full set is requested up front (auth.x.ai accepts it).
+	DefaultScopes = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 
 	// Upstream providers (local proxy can fan-out to any of these).
 	ProviderXAI         = "xai"
@@ -87,13 +95,25 @@ const (
 	OpenCodeZenUpstream     = "https://opencode.ai/zen/v1"
 	OpenCodeZenAPIKey       = "public"
 	OpenCodeZenDefaultModel = "opencode/deepseek-v4-flash-free"
+
+	// OpenCode Go uses the authenticated OpenCode gateway with a user API key.
+	// It is distinct from OpenCode Zen Free and every opencode-go model must use
+	// the dedicated Go gateway.
+	OpenCodeGoUpstream     = "https://opencode.ai/zen/go/v1"
+	OpenCodeGoGateway      = "https://opencode.ai/zen/go/v1"
+	OpenCodeGoDefaultModel = "opencode-go/deepseek-v4-flash"
+
+	// OpenAI Codex via the user's ChatGPT subscription (official Codex OAuth).
+	CodexUpstream      = "https://chatgpt.com/backend-api/codex"
+	CodexDefaultModel  = "codex/gpt-5.6-sol"
+	CodexClientVersion = "0.144.0"
 )
 
 // ProviderAvailability returns the product-level availability gate used by
 // both the desktop chat and the embedded HTTP proxy. Empty means available.
 func ProviderAvailability(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case ProviderOllie, "olliechat", ProviderGemini, "google", "vertex", ProviderQwen, "qwenbridge":
+	case ProviderOllie, "olliechat", ProviderQwen, "qwenbridge":
 		return "disabled"
 	case ProviderAccio, "accio-work", "phoenix":
 		return "maintenance"
@@ -319,7 +339,7 @@ func decodeB64URL(s string) ([]byte, error) {
 
 type Settings struct {
 	ActiveAccountID string `json:"active_account_id"`
-	// Provider: xai | kimi_work | ollie | gemini | qwen | deepseek | opencode_zen
+	// Provider: xai | kimi_work | ollie | gemini | qwen | deepseek | opencode_zen | opencode_go
 	Provider        string `json:"provider,omitempty"`
 	DefaultModel    string `json:"default_model"`
 	ReasoningEffort string `json:"reasoning_effort"`
@@ -486,6 +506,12 @@ func (s Settings) resolveModel(requested string, force bool) string {
 	if s.IsOpenCodeZen() {
 		req = resolveOpenCodeZenModel(req)
 	}
+	if s.IsOpenCodeGo() {
+		req = resolveOpenCodeGoModel(req)
+	}
+	if s.IsCodex() {
+		req = resolveCodexModel(req)
+	}
 	// Kimi Work: Desktop aliases → gateway wire id
 	if s.IsKimiWork() {
 		req = resolveKimiWorkModel(req)
@@ -544,6 +570,8 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 	id = normalizeOllieModelAlias(id)
 	id = NormalizeKimiModelAlias(id)
 	switch {
+	case looksLikeCodexModel(id):
+		return s.WithProvider(ProviderCodex)
 	case looksLikeAccioModel(id):
 		return s.WithProvider(ProviderAccio)
 	case looksLikeKimiWorkModel(id):
@@ -553,6 +581,8 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 	case looksLikeQwenModel(id):
 		// Before Ollie: its catalog hints contain "qwen-".
 		return s.WithProvider(ProviderQwen)
+	case looksLikeOpenCodeGoModel(id):
+		return s.WithProvider(ProviderOpenCodeGo)
 	case looksLikeOpenCodeZenModel(id):
 		return s.WithProvider(ProviderOpenCodeZen)
 	case looksLikeDeepSeekModel(id):
@@ -624,6 +654,20 @@ func (s Settings) WithProvider(provider string) Settings {
 		if out.DefaultModel == "" || !looksLikeOpenCodeZenModel(out.DefaultModel) {
 			out.DefaultModel = OpenCodeZenDefaultModel
 		}
+	case ProviderOpenCodeGo, "opencode-go", "opencode go":
+		out.Provider = ProviderOpenCodeGo
+		out.UpstreamBase = OpenCodeGoUpstream
+		out.APIMode = "chat"
+		if out.DefaultModel == "" || !looksLikeOpenCodeGoModel(out.DefaultModel) {
+			out.DefaultModel = OpenCodeGoDefaultModel
+		}
+	case ProviderCodex, "codex", "openai-codex", "openai codex", "chatgpt":
+		out.Provider = ProviderCodex
+		out.UpstreamBase = CodexUpstream
+		out.APIMode = "responses"
+		if out.DefaultModel == "" || !looksLikeCodexModel(out.DefaultModel) {
+			out.DefaultModel = CodexDefaultModel
+		}
 	case ProviderXAI, "grok", "x.ai":
 
 		out.Provider = ProviderXAI
@@ -666,6 +710,10 @@ func (s Settings) isNativeModelForProvider(requested string) bool {
 		return looksLikeDeepSeekModel(id)
 	case ProviderOpenCodeZen:
 		return looksLikeOpenCodeZenModel(id)
+	case ProviderOpenCodeGo:
+		return looksLikeOpenCodeGoModel(id)
+	case ProviderCodex:
+		return looksLikeCodexModel(id)
 	case ProviderKimiWork:
 		return looksLikeKimiWorkModel(id) || looksLikeKimiWorkModel(NormalizeKimiModelAlias(id))
 	default:
@@ -726,6 +774,10 @@ func (s Settings) ProviderDefaultModel() string {
 		return AccioDefaultModel
 	case ProviderOpenCodeZen:
 		return OpenCodeZenDefaultModel
+	case ProviderOpenCodeGo:
+		return OpenCodeGoDefaultModel
+	case ProviderCodex:
+		return CodexDefaultModel
 	case ProviderKimiWork:
 		return KimiWorkDefaultModel
 	default:
@@ -736,7 +788,7 @@ func (s Settings) ProviderDefaultModel() string {
 // ProviderAuthMode returns "auth" (session/account pool) or "api_key" (direct key/ADC).
 func (s Settings) ProviderAuthMode() string {
 	switch s.NormalizedProvider() {
-	case ProviderXAI, ProviderKimiWork, ProviderAccio:
+	case ProviderXAI, ProviderKimiWork, ProviderAccio, ProviderCodex, ProviderGemini:
 		return AuthModeSession
 	default:
 		return AuthModeAPIKey
@@ -761,6 +813,10 @@ func (s Settings) NormalizedProvider() string {
 		return ProviderAccio
 	case ProviderOpenCodeZen, "opencode-zen", "opencode", "zen", "zen-free", "opencode-zen-free", "opencode zen", "opencode zen free":
 		return ProviderOpenCodeZen
+	case ProviderOpenCodeGo, "opencode-go", "opencode go":
+		return ProviderOpenCodeGo
+	case ProviderCodex, "codex", "openai-codex", "openai codex", "chatgpt":
+		return ProviderCodex
 	case "", ProviderXAI, "grok", "x.ai", "cli":
 		return ProviderXAI
 	default:
@@ -778,6 +834,9 @@ func (s Settings) NormalizedProvider() string {
 		if strings.Contains(strings.ToLower(s.UpstreamBase), "opencode.ai/zen") {
 			return ProviderOpenCodeZen
 		}
+		if strings.Contains(strings.ToLower(s.UpstreamBase), "chatgpt.com/backend-api/codex") {
+			return ProviderCodex
+		}
 		return ProviderXAI
 	}
 }
@@ -790,6 +849,8 @@ func (s Settings) IsQwen() bool        { return s.NormalizedProvider() == Provid
 func (s Settings) IsDeepSeek() bool    { return s.NormalizedProvider() == ProviderDeepSeek }
 func (s Settings) IsAccio() bool       { return s.NormalizedProvider() == ProviderAccio }
 func (s Settings) IsOpenCodeZen() bool { return s.NormalizedProvider() == ProviderOpenCodeZen }
+func (s Settings) IsOpenCodeGo() bool  { return s.NormalizedProvider() == ProviderOpenCodeGo }
+func (s Settings) IsCodex() bool       { return s.NormalizedProvider() == ProviderCodex }
 func (s Settings) IsSessionAuth() bool { return s.ProviderAuthMode() == AuthModeSession }
 
 // HasDeepSeekKey reports whether a DeepSeek API key is configured. The stored
@@ -805,6 +866,21 @@ func (s Settings) DeepSeekAPIKeyPlain() string {
 		return ""
 	}
 	out, err := secure.Decrypt(s.DeepSeekAPIKey)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func (s Settings) HasOpenCodeGoKey() bool {
+	return strings.TrimSpace(s.OpenCodeGoAPIKey) != ""
+}
+
+func (s Settings) OpenCodeGoAPIKeyPlain() string {
+	if !s.HasOpenCodeGoKey() {
+		return ""
+	}
+	out, err := secure.Decrypt(s.OpenCodeGoAPIKey)
 	if err != nil {
 		return ""
 	}
@@ -859,6 +935,10 @@ func (s Settings) EffectiveUpstream() string {
 		return "https://phoenix-gw.alibaba.com/api/adk/llm"
 	case ProviderOpenCodeZen:
 		return OpenCodeZenUpstream
+	case ProviderOpenCodeGo:
+		return OpenCodeGoUpstream
+	case ProviderCodex:
+		return CodexUpstream
 	default:
 		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
 		if b == "" || strings.Contains(strings.ToLower(b), "olliechat") ||
@@ -966,6 +1046,16 @@ func (s *Settings) ApplyProviderDefaults(provider string) {
 		s.UpstreamBase = OpenCodeZenUpstream
 		s.APIMode = "chat"
 		s.DefaultModel = OpenCodeZenDefaultModel
+	case ProviderOpenCodeGo:
+		s.Provider = ProviderOpenCodeGo
+		s.UpstreamBase = OpenCodeGoUpstream
+		s.APIMode = "chat"
+		s.DefaultModel = OpenCodeGoDefaultModel
+	case ProviderCodex:
+		s.Provider = ProviderCodex
+		s.UpstreamBase = CodexUpstream
+		s.APIMode = "responses"
+		s.DefaultModel = CodexDefaultModel
 	default:
 		s.Provider = ProviderXAI
 		s.UpstreamBase = DefaultUpstream
@@ -1105,6 +1195,54 @@ func looksLikeOpenCodeZenModel(model string) bool {
 	}
 }
 
+// OpenCode Go uses a distinct namespace so its authenticated requests never
+// collide with the keyless OpenCode Zen Free models on the shared local route.
+func looksLikeOpenCodeGoModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-responses", "@responses", "/responses"} {
+		m = strings.TrimSuffix(m, suffix)
+	}
+	return strings.HasPrefix(m, "opencode-go/")
+}
+
+func looksLikeCodexModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-responses", "@responses", "/responses"} {
+		m = strings.TrimSuffix(m, suffix)
+	}
+	return strings.HasPrefix(m, "codex/")
+}
+
+// IsBareCodexModel reports official Codex slugs that may arrive without the
+// local codex/ namespace from first-party Codex clients.
+func IsBareCodexModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch m {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveCodexModel(model string) string {
+	m := strings.TrimSpace(model)
+	if strings.HasPrefix(strings.ToLower(m), "codex/") {
+		return m[len("codex/"):]
+	}
+	return m
+}
+
+func resolveOpenCodeGoModel(model string) string {
+	m := strings.TrimSpace(model)
+	if strings.HasPrefix(strings.ToLower(m), "opencode-go/") {
+		m = m[len("opencode-go/"):]
+	}
+	// Zcode has persisted this model once with sentence punctuation appended.
+	// The Go gateway only accepts the exact catalog identifier.
+	return strings.TrimSuffix(m, ".")
+}
+
 func resolveOpenCodeZenModel(model string) string {
 	m := strings.TrimSpace(model)
 	if strings.HasPrefix(strings.ToLower(m), "opencode/") {
@@ -1195,7 +1333,26 @@ func (s *Settings) SanitizeModelForProvider() {
 		}
 		s.UpstreamBase = OpenCodeZenUpstream
 		s.APIMode = "chat"
+	case ProviderOpenCodeGo:
+		s.Provider = ProviderOpenCodeGo
+		if s.DefaultModel == "" || !looksLikeOpenCodeGoModel(s.DefaultModel) {
+			s.DefaultModel = OpenCodeGoDefaultModel
+		}
+		s.UpstreamBase = OpenCodeGoUpstream
+		s.APIMode = "chat"
+	case ProviderCodex:
+		s.Provider = ProviderCodex
+		if s.DefaultModel == "" || !looksLikeCodexModel(s.DefaultModel) {
+			s.DefaultModel = CodexDefaultModel
+		}
+		s.UpstreamBase = CodexUpstream
+		s.APIMode = "responses"
 	default:
+		// grok-4.5 was removed from the xAI Build pool when 4.6 launched.
+		// Migrate persisted defaults while still allowing explicit 4.5 requests.
+		if strings.EqualFold(strings.TrimSpace(s.DefaultModel), "grok-4.5") {
+			s.DefaultModel = DefaultModel
+		}
 		if s.DefaultModel == "" || looksLikeOllieModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) {
 			s.DefaultModel = DefaultModel
 		}
@@ -1216,7 +1373,7 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 
 	// API-key providers don't have account pools. Accio sessions are stored as
 	// normal provider accounts and are selected by the same load balancer.
-	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen {
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen || want == ProviderOpenCodeGo {
 		return nil
 	}
 
@@ -1319,7 +1476,7 @@ func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStr
 // Use this in pollers/readiness checks; PickAccountForProvider advances RR.
 func (s *Store) HasUsableAccountForProvider(provider string) bool {
 	want := s.normalizeProviderFilter(provider)
-	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen {
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen || want == ProviderOpenCodeGo {
 		return false
 	}
 	s.mu.RLock()
@@ -1436,6 +1593,11 @@ func ProviderCatalog() []map[string]any {
 			"default_model": DefaultModel, "default_api": "responses",
 		},
 		{
+			"id": ProviderCodex, "name": "OpenAI Codex (ChatGPT)", "auth_mode": AuthModeSession,
+			"description":   "OAuth oficial do Codex - usa a assinatura ChatGPT da conta",
+			"default_model": CodexDefaultModel, "default_api": "responses",
+		},
+		{
 			"id": ProviderKimiWork, "name": "Kimi Work", "auth_mode": AuthModeSession,
 			"description":   "Google login → sk-kimi · até 3 contas · rotação + re-login HTTP",
 			"default_model": KimiWorkDefaultModel, "default_api": "chat",
@@ -1446,8 +1608,8 @@ func ProviderCatalog() []map[string]any {
 			"default_model": OllieDefaultModel, "default_api": "chat",
 		},
 		{
-			"id": ProviderGemini, "name": "Gemini (ADC)", "auth_mode": AuthModeAPIKey,
-			"description":   "Google ADC / projeto · sem pool de contas",
+			"id": ProviderGemini, "name": "Gemini (AI Studio)", "auth_mode": AuthModeSession,
+			"description":   "Google AI Studio · Chrome login · pool de contas local",
 			"default_model": GeminiDefaultModel, "default_api": "chat",
 		},
 		{
@@ -1464,6 +1626,11 @@ func ProviderCatalog() []map[string]any {
 			"id": ProviderOpenCodeZen, "name": "OpenCode Zen Free", "auth_mode": AuthModeAPIKey,
 			"description":   "Zen direto - bearer publico - sem terminal/opencode serve - modelos free",
 			"default_model": OpenCodeZenDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderOpenCodeGo, "name": "OpenCode Go", "auth_mode": AuthModeAPIKey,
+			"description":   "API key de opencode.ai/auth - gateway OpenCode direto - sem terminal",
+			"default_model": OpenCodeGoDefaultModel, "default_api": "chat",
 		},
 		{
 			"id": ProviderAccio, "name": "Accio", "auth_mode": AuthModeSession,
@@ -1593,12 +1760,28 @@ func Open(root string) (*Store, error) {
 	if err := s.loadFromSQLite(); err != nil {
 		return nil, fmt.Errorf("sqlite load: %w", err)
 	}
+	// Migrate legacy plaintext Codex credentials under the same cross-process
+	// lock used by refresh-token rotation.
+	var codexAccountIDs []string
+	for id, account := range s.accounts {
+		if account.NormalizedProvider() == ProviderCodex {
+			codexAccountIDs = append(codexAccountIDs, id)
+		}
+	}
+	for _, id := range codexAccountIDs {
+		if err := s.migrateCodexCredentialsAtRest(id); err != nil {
+			return nil, fmt.Errorf("protect Codex credentials: %w", err)
+		}
+	}
 	// DeepSeek key vault: file is source of truth, settings blob is a mirror.
 	s.syncDeepSeekKeyVault()
+	// OpenCode Go key vault: same treatment (stale processes re-saving
+	// settings must not be able to wipe the user key).
+	s.syncOpenCodeGoKeyVault()
 	// One-time migrations from older app formats
 	_ = s.migrateFromLegacy()
 	// Bump stale client version baked into older installs.
-	if s.settings.ClientVersion == "" || s.settings.ClientVersion == "0.2.93" {
+	if staleGrokClientVersion(s.settings.ClientVersion) {
 		s.settings.ClientVersion = DefaultClientVersion
 		_ = s.saveSettingsLocked()
 	}
@@ -1656,6 +1839,23 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// staleGrokClientVersion is true for empty / pre-1.0.5 identities that
+// cli-chat-proxy treats as chat-only (no function tools).
+func staleGrokClientVersion(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" || v == DefaultClientVersion {
+		return v == ""
+	}
+	if strings.HasPrefix(v, "0.2.") {
+		return true
+	}
+	switch v {
+	case "1.0.4":
+		return true
+	}
+	return false
+}
+
 func defaultSettings() Settings {
 	force := false
 	return Settings{
@@ -1684,6 +1884,43 @@ func (s *Store) Root() string { return s.root }
 func (s *Store) secretsDir() string { return filepath.Join(s.root, "secrets") }
 
 func (s *Store) deepSeekKeyPath() string { return filepath.Join(s.secretsDir(), "deepseek.key") }
+
+func (s *Store) openCodeGoKeyPath() string { return filepath.Join(s.secretsDir(), "opencode-go.key") }
+
+// WriteOpenCodeGoKeyFile atomically persists the encrypted blob (0600, dir 0700).
+func (s *Store) WriteOpenCodeGoKeyFile(encryptedBlob string) error {
+	if encryptedBlob == "" {
+		return os.Remove(s.openCodeGoKeyPath())
+	}
+	if err := os.MkdirAll(s.secretsDir(), 0o700); err != nil {
+		return err
+	}
+	tmp := s.openCodeGoKeyPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(encryptedBlob), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.openCodeGoKeyPath())
+}
+
+func (s *Store) readOpenCodeGoKeyFile() string {
+	b, err := os.ReadFile(s.openCodeGoKeyPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// syncOpenCodeGoKeyVault runs on Open: the vault file is the source of truth.
+// A legacy blob left in settings is migrated into the vault (one-way).
+func (s *Store) syncOpenCodeGoKeyVault() {
+	if b := s.readOpenCodeGoKeyFile(); b != "" {
+		s.settings.OpenCodeGoAPIKey = b
+		return
+	}
+	if secure.HasCiphertext(s.settings.OpenCodeGoAPIKey) {
+		_ = s.WriteOpenCodeGoKeyFile(s.settings.OpenCodeGoAPIKey)
+	}
+}
 
 // WriteDeepSeekKeyFile atomically persists the encrypted blob (0600, dir 0700).
 func (s *Store) WriteDeepSeekKeyFile(encryptedBlob string) error {
@@ -1897,7 +2134,14 @@ func writeJSON(path string, v any) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		// Windows does not replace an existing destination atomically.
+		_ = os.Remove(path)
+		if replaceErr := os.Rename(tmp, path); replaceErr != nil {
+			return replaceErr
+		}
+	}
+	return nil
 }
 
 func (s *Store) saveSettingsLocked() error {
@@ -2172,6 +2416,8 @@ func (s *Store) ListAccountsForProvider(provider string) []Account {
 		want = ProviderKimiWork
 	case "grok", "x.ai":
 		want = ProviderXAI
+	case "codex", "openai-codex", "chatgpt":
+		want = ProviderCodex
 	}
 	out := make([]Account, 0)
 	for _, a := range s.accounts {
@@ -2199,10 +2445,12 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 		want = ProviderKimiWork
 	case "grok", "x.ai":
 		want = ProviderXAI
+	case "codex", "openai-codex", "chatgpt":
+		want = ProviderCodex
 	}
 	// API-key providers have no session account pool. Accio accounts are
 	// synchronized from the independent native client into this same UI pool.
-	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen {
+	if want == ProviderOllie || want == ProviderGemini || want == ProviderQwen || want == ProviderDeepSeek || want == ProviderOpenCodeZen || want == ProviderOpenCodeGo {
 		return []map[string]any{}
 	}
 	out := make([]map[string]any, 0, len(s.accounts))
@@ -2380,6 +2628,8 @@ func (s *Store) normalizeProviderFilter(provider string) string {
 		return ProviderKimiWork
 	case "grok", "x.ai":
 		return ProviderXAI
+	case "codex", "openai-codex", "chatgpt":
+		return ProviderCodex
 	default:
 		return want
 	}
@@ -3016,12 +3266,16 @@ func (s *Store) RemoveAccount(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, had := s.accounts[id]
+	if s.db != nil {
+		if err := s.deleteAccountDB(id); err != nil {
+			return fmt.Errorf("delete account from database: %w", err)
+		}
+	}
+	if err := os.Remove(s.accountPath(id)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete account backup: %w", err)
+	}
 	delete(s.accounts, id)
 	logging.Info("store.account.remove", "account_id", id)
-	if s.db != nil {
-		_ = s.deleteAccountDB(id)
-	}
-	_ = os.Remove(s.accountPath(id))
 	if s.settings.ActiveAccountID == id {
 		s.settings.ActiveAccountID = ""
 		want := s.settings.NormalizedProvider()
@@ -3034,7 +3288,9 @@ func (s *Store) RemoveAccount(id string) error {
 				break
 			}
 		}
-		_ = s.saveSettingsLocked()
+		if err := s.saveSettingsLocked(); err != nil {
+			return err
+		}
 	}
 	delete(s.usage, id)
 	_ = s.saveUsageLocked()

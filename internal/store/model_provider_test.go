@@ -42,3 +42,11 @@ func TestApplyProviderDefaults_Gemini(t *testing.T) {
 		t.Fatalf("model=%s", s.DefaultModel)
 	}
 }
+
+func TestSanitizeModelForProviderMigratesGrok45To46(t *testing.T) {
+	s := Settings{Provider: ProviderXAI, DefaultModel: "grok-4.5", UpstreamBase: DefaultUpstream}
+	s.SanitizeModelForProvider()
+	if s.DefaultModel != DefaultModel {
+		t.Fatalf("model=%q want=%q", s.DefaultModel, DefaultModel)
+	}
+}

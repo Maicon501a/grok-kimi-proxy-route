@@ -55,3 +55,35 @@ func TestProviderCatalogIncludesOpenCodeZenFree(t *testing.T) {
 	}
 	t.Fatal("ProviderCatalog missing OpenCode Zen Free")
 }
+
+func TestOpenCodeGoRoutesDedicatedNamespace(t *testing.T) {
+	base := Settings{Provider: ProviderXAI, DefaultModel: DefaultModel}
+	got := base.WithProviderForModel("opencode-go/deepseek-v4-flash")
+	if !got.IsOpenCodeGo() {
+		t.Fatalf("model routed to %q, want %q", got.NormalizedProvider(), ProviderOpenCodeGo)
+	}
+	if got.EffectiveUpstream() != OpenCodeGoUpstream {
+		t.Fatalf("upstream=%q", got.EffectiveUpstream())
+	}
+	if wire := got.ResolveModelForClient("opencode-go/deepseek-v4-flash"); wire != "deepseek-v4-flash" {
+		t.Fatalf("wire model=%q", wire)
+	}
+}
+
+func TestOpenCodeGoStripsAccidentalTrailingPeriod(t *testing.T) {
+	s := Settings{Provider: ProviderOpenCodeGo}
+	if got := s.ResolveModelForClient("opencode-go/deepseek-v4-flash."); got != "deepseek-v4-flash" {
+		t.Fatalf("wire model=%q", got)
+	}
+}
+
+func TestOpenCodeGoIsAPIKeyProvider(t *testing.T) {
+	s := Settings{Provider: "opencode-go"}
+	if !s.IsOpenCodeGo() || s.ProviderAuthMode() != AuthModeAPIKey {
+		t.Fatalf("provider=%q auth=%q", s.NormalizedProvider(), s.ProviderAuthMode())
+	}
+	s.ApplyProviderDefaults("opencode_go")
+	if s.UpstreamBase != OpenCodeGoUpstream || s.DefaultModel != OpenCodeGoDefaultModel || s.APIMode != "chat" {
+		t.Fatalf("defaults=%+v", s)
+	}
+}

@@ -19,6 +19,44 @@ func isolateHome(t *testing.T) {
 	t.Setenv("HOMEPATH", "")
 }
 
+func TestStaleGrokClientVersion(t *testing.T) {
+	if !staleGrokClientVersion("") {
+		t.Fatal("empty is stale")
+	}
+	if !staleGrokClientVersion("0.2.106") {
+		t.Fatal("0.2.106 is stale")
+	}
+	if !staleGrokClientVersion("1.0.4") {
+		t.Fatal("1.0.4 is stale")
+	}
+	if staleGrokClientVersion(DefaultClientVersion) {
+		t.Fatalf("%s should not be stale", DefaultClientVersion)
+	}
+}
+
+func TestOpenMigratesStaleClientVersion(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateSettings(func(s *Settings) { s.ClientVersion = "0.2.106" }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if got := st.Settings().ClientVersion; got != DefaultClientVersion {
+		t.Fatalf("ClientVersion=%q want %q", got, DefaultClientVersion)
+	}
+}
+
 func TestExhaustedFlag(t *testing.T) {
 	a := Account{ExhaustedAt: time.Now().UTC()}
 	if !a.Exhausted() {
