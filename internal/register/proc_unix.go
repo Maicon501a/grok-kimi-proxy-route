@@ -19,6 +19,10 @@ func prepareProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
+func setupProcessJob(cmd *exec.Cmd) error { return nil }
+
+func releaseProcessJob(cmd *exec.Cmd) {}
+
 func killProcessTree(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return

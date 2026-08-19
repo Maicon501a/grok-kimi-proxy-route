@@ -67,8 +67,8 @@ func EnsureBotDeps(ctx context.Context, dataRoot, hostPython, botDir string, pro
 	}
 	if b, e := os.ReadFile(marker); e == nil && strings.TrimSpace(string(b)) == hash {
 		if st, e := os.Stat(py); e == nil && !st.IsDir() {
-			// Quick import check
-			if checkImport(ctx, py, "DrissionPage") {
+			// Quick import check for the two runtime-critical packages.
+			if checkImport(ctx, py, "curl_cffi") && checkImport(ctx, py, "patchright") && checkImport(ctx, py, "DrissionPage") {
 				depsDone[key] = true
 				return py, nil
 			}
@@ -102,14 +102,14 @@ func EnsureBotDeps(ctx context.Context, dataRoot, hostPython, botDir string, pro
 		py = venvPython(venv)
 	}
 
-	emit("pip install bot deps (DrissionPage)…")
+	emit("pip install signup dependencies…")
 	// Upgrade pip quietly then install requirements
 	_ = runPython(ctx, py, nil, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel")
 	if err := runPython(ctx, py, nil, "-m", "pip", "install", "-r", req); err != nil {
 		return hostPython, fmt.Errorf("pip install: %w", err)
 	}
-	if !checkImport(ctx, py, "DrissionPage") {
-		return hostPython, fmt.Errorf("DrissionPage still missing after pip install (python=%s)", py)
+	if !checkImport(ctx, py, "curl_cffi") || !checkImport(ctx, py, "patchright") || !checkImport(ctx, py, "DrissionPage") {
+		return hostPython, fmt.Errorf("signup dependencies still missing after pip install (python=%s)", py)
 	}
 	if err := os.WriteFile(marker, []byte(hash+"\n"), 0o600); err != nil {
 		return py, err

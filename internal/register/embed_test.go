@@ -26,5 +26,8 @@ func TestExtractEmbeddedBot(t *testing.T) {
 	if err != nil || dest2 != dest {
 		t.Fatalf("reuse: %v %q vs %q", err, dest2, dest)
 	}
+	if _, err := os.Stat(filepath.Join(dest, "UPSTREAM.md")); err != nil {
+		t.Fatalf("missing provenance metadata: %v", err)
+	}
 	t.Log("ver", register.BotEmbedVersion(), "dest", dest)
 }

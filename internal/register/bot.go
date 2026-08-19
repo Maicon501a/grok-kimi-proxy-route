@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Progress represents a step event from the signup bot.
@@ -31,14 +32,13 @@ type Result struct {
 	AccessToken string            `json:"access_token,omitempty"`
 }
 
-// Runner manages the Python signup bot subprocess (DrissionPage).
+// Runner manages the embedded Python signup subprocess.
 type Runner struct {
-	PythonPath     string // default "python3" / "python" on Windows
-	BotDir         string // path to grok-signup-bot/
-	CredsDir       string // directory to save auto_creds.json
-	EmailProviders []string
-	DuckMailURL    string
-	DuckMailKey    string
+	PythonPath    string // default "python3" / "python" on Windows
+	BotDir        string // extracted embedded bot directory
+	DataRoot      string // app data root used for the managed virtualenv
+	EmailProvider string // luckmail | mailnest | gmail | mailtm
+	MaxAttempts   int
 }
 
 // New creates a Runner with sensible defaults.
@@ -67,7 +67,7 @@ func (r *Runner) CreateAccount(
 		return &Result{
 			Status: "error",
 			Reason: fmt.Sprintf(
-				"bot script missing: %s — bot should extract under AppData (embedded) or put grok-signup-bot next to the .exe / set bot_dir",
+				"embedded signup script missing after extraction: %s",
 				script,
 			),
 			Step: "start",
@@ -84,12 +84,13 @@ func (r *Runner) CreateAccount(
 		}
 	}
 
-	// Auto venv + pip install under AppData (DrissionPage etc.)
-	if r.CredsDir != "" {
+	// Auto venv + dependency install under AppData. Credentials are never used
+	// as a reason to enable dependency setup or plaintext persistence.
+	if r.DataRoot != "" {
 		if progress != nil {
 			progress(Progress{Step: "deps", Message: "checking python packages"})
 		}
-		py, err := EnsureBotDeps(ctx, r.CredsDir, r.PythonPath, r.BotDir, func(msg string) {
+		py, err := EnsureBotDeps(ctx, r.DataRoot, r.PythonPath, r.BotDir, func(msg string) {
 			if progress != nil {
 				progress(Progress{Step: "deps", Message: msg})
 			}
@@ -114,21 +115,11 @@ func (r *Runner) CreateAccount(
 	if userCode != "" {
 		args = append(args, "--user-code", userCode)
 	}
-	if r.CredsDir != "" {
-		args = append(args, "--creds-dir", r.CredsDir)
+	if provider := strings.TrimSpace(r.EmailProvider); provider != "" {
+		args = append(args, "--email-provider", provider)
 	}
-	if len(r.EmailProviders) > 0 {
-		joined := r.EmailProviders[0]
-		for i := 1; i < len(r.EmailProviders); i++ {
-			joined += "," + r.EmailProviders[i]
-		}
-		args = append(args, "--email-providers", joined)
-	}
-	if r.DuckMailURL != "" {
-		args = append(args, "--duckmail-url", r.DuckMailURL)
-	}
-	if r.DuckMailKey != "" {
-		args = append(args, "--duckmail-key", r.DuckMailKey)
+	if r.MaxAttempts > 0 {
+		args = append(args, "--max-attempts", fmt.Sprint(r.MaxAttempts))
 	}
 
 	// Do not use CommandContext — we need to kill the full process tree (Chrome)
@@ -164,6 +155,11 @@ func (r *Runner) CreateAccount(
 			Step:   "start",
 		}, nil
 	}
+	if err := setupProcessJob(cmd); err != nil {
+		// taskkill/process-group fallback still works; log the weaker lifecycle
+		// instead of failing a signup that has already started.
+		log.Printf("register: process job setup failed: %v", err)
+	}
 
 	var (
 		stderrMu  sync.Mutex
@@ -175,6 +171,7 @@ func (r *Runner) CreateAccount(
 	waitDone := make(chan struct{})
 	go func() {
 		waitErr = cmd.Wait()
+		releaseProcessJob(cmd)
 		close(waitDone)
 	}()
 
@@ -260,7 +257,13 @@ func (r *Runner) CreateAccount(
 		killProcessTree(cmd)
 		result = &Result{Status: "error", Reason: "timeout/cancelled" + killHint()}
 	case <-waitDone:
-		// process exited before __RESULT__
+		// stdout and process completion race on fast scripts. Give the scanner a
+		// chance to publish the already-written __RESULT__ before declaring failure.
+		select {
+		case res := <-resultCh:
+			result = res
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 
 	<-waitDone
@@ -282,7 +285,7 @@ func (r *Runner) CreateAccount(
 			snip = strings.ReplaceAll(snip, "\n", " ")
 			reason = reason + ": " + snip
 		} else {
-			reason = reason + fmt.Sprintf(" (python=%s bot_dir=%s — check Python/DrissionPage/Chrome install)", r.PythonPath, r.BotDir)
+			reason = reason + fmt.Sprintf(" (python=%s bot_dir=%s — check Python/patchright/Chrome install)", r.PythonPath, r.BotDir)
 		}
 		result = &Result{Status: "error", Reason: reason, Step: "start"}
 	}

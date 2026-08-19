@@ -13,7 +13,7 @@ import (
 )
 
 // Embedded signup bot (Python). Extracted under the app data dir at runtime so a
-// bare .exe works without a sibling grok-signup-bot folder.
+// bare executable works without a sibling source tree.
 //
 //go:embed all:bot
 var botFS embed.FS
