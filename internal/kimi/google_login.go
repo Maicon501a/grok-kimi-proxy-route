@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -132,7 +133,8 @@ func openBrowser(u string) error {
 
 // LoginWithGoogleBrowser opens the USER's default browser (same as Kimi Desktop),
 // receives OAuth callback on 127.0.0.1, exchanges for Google id_token, then
-// POST https://www.kimi.com/api/auth/login/google with {code: id_token}.
+// POST auth.kimi.com/api/account.gateway.v1.AuthService/LoginWithThirdParty
+// (legacy: POST www.kimi.com/api/auth/login/google) with the id_token.
 func LoginWithGoogleBrowser(timeout time.Duration) (*GoogleLoginSession, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -667,30 +669,28 @@ func LoginWithGoogleRefresh(googleRefreshToken string) (*GoogleLoginSession, err
 	return &GoogleLoginSession{Session: *sess, IDToken: idToken, GoogleRefreshToken: googleRefreshToken}, nil
 }
 
-// exchangeGoogleIDTokenForKimi — SPA: POST /api/auth/login/google {code: <google id_token>}
-func exchangeGoogleIDTokenForKimi(idToken string) (*Session, error) {
-	body, _ := json.Marshal(map[string]any{"code": idToken})
-	req, err := http.NewRequest(http.MethodPost, DefaultKimiURL+"/api/auth/login/google", strings.NewReader(string(body)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", DefaultKimiURL)
-	req.Header.Set("Referer", DefaultKimiURL+"/")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
-	req.Header.Set("x-msh-platform", "windows")
-	req.Header.Set("x-msh-version", "3.1.0")
+// AuthServiceLoginWithThirdPartyURL is the account-gateway Connect RPC the
+// kimi.com web app uses for Google sign-in since the 2026-08-18 backend
+// migration (account.gateway.v1.AuthService/LoginWithThirdParty).
+const AuthServiceLoginWithThirdPartyURL = "https://auth.kimi.com/api/account.gateway.v1.AuthService/LoginWithThirdParty"
 
+// exchangeGoogleIDTokenForKimi trades a Google id_token for Kimi tokens via the
+// current Connect RPC: POST auth.kimi.com/api/account.gateway.v1.AuthService/
+// LoginWithThirdParty {"credential":{"third_party":"THIRD_PARTY_GOOGLE","code":<id_token>}}.
+// The legacy REST route (POST www.kimi.com/api/auth/login/google {code}) is
+// kept only as a fallback for older backends — since the migration it returns
+// "该邮箱已被注册过" for already-registered emails instead of logging in.
+func exchangeGoogleIDTokenForKimi(idToken string) (*Session, error) {
 	client := &http.Client{Timeout: 45 * time.Second}
-	resp, err := client.Do(req)
+	b, err := doGoogleLoginRequest(client, AuthServiceLoginWithThirdPartyURL,
+		map[string]any{"credential": map[string]any{"third_party": "THIRD_PARTY_GOOGLE", "code": idToken}})
+	if err == errLoginRouteGone {
+		// Pre-migration backend: fall back to the legacy REST login.
+		b, err = doGoogleLoginRequest(client, DefaultKimiURL+"/api/auth/login/google",
+			map[string]any{"code": idToken})
+	}
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("kimi google login HTTP %d: %s", resp.StatusCode, truncate(string(b), 300))
 	}
 	var data map[string]any
 	if err := json.Unmarshal(b, &data); err != nil {
@@ -742,5 +742,45 @@ func exchangeGoogleIDTokenForKimi(idToken string) (*Session, error) {
 			}
 		}
 	}
+	if s.UserID == "" {
+		if id, ok := data["user_id"].(string); ok {
+			s.UserID = id
+		}
+	}
 	return s, nil
+}
+
+// errLoginRouteGone marks an auth route that no longer exists (404), signalling
+// the caller to retry against the legacy pre-migration endpoint.
+var errLoginRouteGone = errors.New("kimi login route gone")
+
+// doGoogleLoginRequest performs one Google id_token → Kimi token exchange
+// attempt with the SPA headers kimi.com sends.
+func doGoogleLoginRequest(client *http.Client, endpoint string, payload map[string]any) ([]byte, error) {
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", DefaultKimiURL)
+	req.Header.Set("Referer", DefaultKimiURL+"/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
+	req.Header.Set("x-msh-platform", "windows")
+	req.Header.Set("x-msh-version", "3.2.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errLoginRouteGone
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("kimi google login HTTP %d: %s", resp.StatusCode, truncate(string(b), 300))
+	}
+	return b, nil
 }

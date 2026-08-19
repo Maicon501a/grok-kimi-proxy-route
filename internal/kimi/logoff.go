@@ -1,6 +1,7 @@
 package kimi
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,9 +9,19 @@ import (
 	"time"
 )
 
-// LogoffURL is the consumer account deletion endpoint (Settings → Delete Account).
-// DELETE with Bearer access JWT (web session). Confirmation phrase is UI-only.
-const LogoffURL = DefaultKimiURL + "/api/user/logoff"
+const (
+	// AuthLogoutURL is the consumer-session logout RPC used by Kimi Desktop.
+	AuthLogoutURL = "https://auth.kimi.com/api/account.gateway.v1.AuthService/Logout"
+	// DeactivateAccountURL is the generated Connect RPC for Settings → Deactivate
+	// Account (kimi.gateway.account.v1.SecurityService/DeactivateAccount, verified
+	// unchanged in the 2026-08-18 kimi.com web bundle and Desktop 3.2.0). Its
+	// protobuf descriptor has no REST annotation, so the client posts an empty
+	// message to the canonical Connect route under the /apiv2 base.
+	DeactivateAccountURL = DefaultKimiURL + "/apiv2/kimi.gateway.account.v1.SecurityService/DeactivateAccount"
+	// LegacyLogoffURL is retained only for older Kimi desktop builds whose new
+	// RPC route is unavailable.
+	LegacyLogoffURL = DefaultKimiURL + "/api/user/logoff"
+)
 
 // HasWebSession reports whether the account can call consumer APIs (logoff, etc.).
 // sk-kimi keys alone are Work gateway credentials and cannot delete the user account.
@@ -71,26 +82,115 @@ func EnsureAccessToken(accessToken, refreshToken string) (access, refresh string
 	return access, refresh, nil
 }
 
-// LogoffAccount permanently deletes the Kimi user account (same as site Delete Account).
-// Uses consumer web session JWT, not sk-kimi.
+// LogoffAccount permanently deletes the Kimi user account using the same
+// SecurityService/DeactivateAccount Connect RPC as the current Kimi clients.
+// Uses a consumer access JWT, not an sk-kimi Work key.
 func LogoffAccount(accessToken string) error {
 	accessToken = strings.TrimPrefix(strings.TrimSpace(accessToken), "Bearer ")
 	if accessToken == "" || strings.HasPrefix(accessToken, "sk-kimi-") {
 		return fmt.Errorf("web access_token JWT required for account logoff")
 	}
-	req, err := http.NewRequest(http.MethodDelete, LogoffURL, nil)
+	client := &http.Client{Timeout: 45 * time.Second}
+	// Desktop runs Connect in binary mode. JSON variants are included for older
+	// gateways that do not accept the binary media types.
+	attempts := []struct {
+		contentType string
+		body        []byte
+	}{
+		{"application/proto", nil},
+		{"application/connect+proto", nil},
+		{"application/json", []byte("{}")},
+		{"application/connect+json", []byte("{}")},
+	}
+	var codecErrs []string
+	for _, attempt := range attempts {
+		req, err := http.NewRequest(http.MethodPost, DeactivateAccountURL, bytes.NewReader(attempt.body))
+		if err != nil {
+			return err
+		}
+		setLogoffHeaders(req, accessToken)
+		req.Header.Set("Content-Type", attempt.contentType)
+		req.Header.Set("Connect-Protocol-Version", "1")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		// An unsupported codec is safe to retry with the next Connect shape.
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnsupportedMediaType || resp.StatusCode == http.StatusUnprocessableEntity {
+			codecErrs = append(codecErrs, fmt.Sprintf("content-type %s HTTP %d (response content-type=%q accept-post=%q): %s", attempt.contentType, resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Accept-Post"), truncate(string(b), 240)))
+			continue
+		}
+		// Older desktop releases used DELETE /api/user/logoff. Fall back only
+		// when the current RPC route itself is unavailable.
+		if resp.StatusCode == http.StatusNotFound {
+			return logoffLegacyAccount(accessToken)
+		}
+		return fmt.Errorf("deactivate account HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+	}
+	if len(codecErrs) > 0 {
+		return fmt.Errorf("deactivate account codec attempts: %s", strings.Join(codecErrs, " | "))
+	}
+	return fmt.Errorf("deactivate account rejected every supported Connect media type")
+}
+
+// LogoutAccount revokes the current consumer session without deleting the
+// Kimi user account. This is useful when local credentials are being removed
+// but DeactivateAccount is blocked by Kimi's account-age policy.
+func LogoutAccount(accessToken string) error {
+	accessToken = strings.TrimPrefix(strings.TrimSpace(accessToken), "Bearer ")
+	if accessToken == "" || strings.HasPrefix(accessToken, "sk-kimi-") {
+		return fmt.Errorf("web access_token JWT required for session logout")
+	}
+	req, err := http.NewRequest(http.MethodPost, AuthLogoutURL, bytes.NewReader(nil))
 	if err != nil {
 		return err
 	}
+	setLogoffHeaders(req, accessToken)
+	req.Header.Set("Content-Type", "application/proto")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	resp, err := (&http.Client{Timeout: 45 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return fmt.Errorf("session logout HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+}
+
+// LogoutWithSession refreshes the consumer JWT if needed, then revokes the
+// current Kimi session. It intentionally does not deactivate the account.
+func LogoutWithSession(accessToken, refreshToken string) (usedAccess string, err error) {
+	if !HasWebSession(accessToken, refreshToken) {
+		return "", fmt.Errorf("account has no web session (only sk-kimi?) — cannot logout")
+	}
+	access, _, err := EnsureAccessToken(accessToken, refreshToken)
+	if err != nil {
+		return "", err
+	}
+	if err := LogoutAccount(access); err != nil {
+		return access, err
+	}
+	return access, nil
+}
+
+func setLogoffHeaders(req *http.Request, accessToken string) {
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) KimiDesktop/3.2.0 Chrome/134.0.0.0 Safari/537.36")
 	req.Header.Set("Origin", DefaultKimiURL)
 	req.Header.Set("Referer", DefaultKimiURL+"/settings")
-	req.Header.Set("x-msh-platform", "web")
-	req.Header.Set("x-msh-version", "2.0.0")
+	req.Header.Set("x-msh-platform", "windows")
+	req.Header.Set("x-msh-version", "3.2.0")
 	req.Header.Set("X-Language", "en-US")
-
+	req.Header.Set("R-Timezone", "America/Sao_Paulo")
 	if p, err := DecodeJWT(accessToken); err == nil && p != nil {
 		if did := DeviceIDString(p.DeviceID); did != "" && did != "<nil>" {
 			req.Header.Set("x-msh-device-id", did)
@@ -102,22 +202,24 @@ func LogoffAccount(accessToken string) error {
 			req.Header.Set("X-Traffic-Id", p.Sub)
 		}
 	}
+}
 
-	client := &http.Client{Timeout: 45 * time.Second}
-	resp, err := client.Do(req)
+func logoffLegacyAccount(accessToken string) error {
+	req, err := http.NewRequest(http.MethodDelete, LegacyLogoffURL, nil)
+	if err != nil {
+		return err
+	}
+	setLogoffHeaders(req, accessToken)
+	resp, err := (&http.Client{Timeout: 45 * time.Second}).Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	// 2xx and 404 (already gone) count as success for cleanup.
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if (resp.StatusCode >= 200 && resp.StatusCode < 300) || resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		return nil
-	}
-	return fmt.Errorf("logoff HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+	return fmt.Errorf("legacy logoff HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
 }
 
 // LogoffWithSession refreshes the web JWT if needed, then deletes the account.

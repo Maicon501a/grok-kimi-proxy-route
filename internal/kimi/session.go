@@ -1,6 +1,7 @@
 package kimi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,36 +27,51 @@ type Session struct {
 	CapturedAt   string `json:"captured_at"`
 }
 
-// RefreshAccessToken renews access JWT using refresh token (Desktop TokenStore.doRefresh).
-// GET https://www.kimi.com/api/auth/token/refresh
-// Authorization: Bearer <refresh_token>
+// RefreshAccessToken renews an access JWT using the current Kimi Desktop
+// AuthService.RefreshToken Connect RPC. The former web GET endpoint is kept as
+// a fallback for older sessions/builds.
 func RefreshAccessToken(refreshToken string) (*Session, error) {
 	refreshToken = strings.TrimPrefix(strings.TrimSpace(refreshToken), "Bearer ")
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh_token required")
 	}
-	req, err := http.NewRequest(http.MethodGet, DefaultKimiURL+"/api/auth/token/refresh", nil)
+	body, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	req, err := http.NewRequest(http.MethodPost, "https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+refreshToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
-	req.Header.Set("Origin", DefaultKimiURL)
-	req.Header.Set("Referer", DefaultKimiURL+"/")
-	req.Header.Set("x-msh-platform", "windows")
-	req.Header.Set("x-msh-version", "3.1.0")
+	setRefreshHeaders(req, refreshToken)
+	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("refresh HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return refreshAccessTokenLegacy(client, refreshToken)
 	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("refresh RPC HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+	}
+	return parseRefreshedSession(b, refreshToken)
+}
+
+func setRefreshHeaders(req *http.Request, refreshToken string) {
+	req.Header.Set("Authorization", "Bearer "+refreshToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KimiDesktop/3.2.0 Chrome/134.0.0.0 Safari/537.36")
+	req.Header.Set("Origin", DefaultKimiURL)
+	req.Header.Set("Referer", DefaultKimiURL+"/")
+	req.Header.Set("x-msh-platform", "windows")
+	req.Header.Set("x-msh-version", "3.2.0")
+	req.Header.Set("X-Language", "en-US")
+	req.Header.Set("R-Timezone", "America/Sao_Paulo")
+}
+
+func parseRefreshedSession(b []byte, refreshToken string) (*Session, error) {
 	var data map[string]any
 	if err := json.Unmarshal(b, &data); err != nil {
 		return nil, err
@@ -88,6 +104,24 @@ func RefreshAccessToken(refreshToken string) (*Session, error) {
 		s.Exp = p.Exp
 	}
 	return s, nil
+}
+
+func refreshAccessTokenLegacy(client *http.Client, refreshToken string) (*Session, error) {
+	req, err := http.NewRequest(http.MethodGet, DefaultKimiURL+"/api/auth/token/refresh", nil)
+	if err != nil {
+		return nil, err
+	}
+	setRefreshHeaders(req, refreshToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("legacy refresh HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+	}
+	return parseRefreshedSession(b, refreshToken)
 }
 
 // BrowserLoginOptions configures standalone Playwright login.
