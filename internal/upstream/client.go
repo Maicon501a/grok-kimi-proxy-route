@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,11 +62,12 @@ type ChatRequest struct {
 }
 
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	Name       string     `json:"name,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role           string           `json:"role"`
+	Content        string           `json:"content"`
+	Name           string           `json:"name,omitempty"`
+	ToolCallID     string           `json:"tool_call_id,omitempty"`
+	ToolCalls      []ToolCall       `json:"tool_calls,omitempty"`
+	ReasoningItems []map[string]any `json:"reasoning_items,omitempty"`
 }
 
 type StreamEvent struct {
@@ -123,6 +125,9 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 	if token == "" && settings.IsOpenCodeZen() {
 		token = store.OpenCodeZenAPIKey
 	}
+	if token == "" && settings.IsOpenCodeGo() {
+		token = settings.OpenCodeGoAPIKeyPlain()
+	}
 	h.Set("Authorization", "Bearer "+token)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream, application/json")
@@ -136,6 +141,16 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 		// DeepSeek: bearer only, no provider-specific headers.
 	case settings.IsOpenCodeZen():
 		// OpenCode Zen Free: direct bearer-only gateway; no local CLI headers.
+	case settings.IsOpenCodeGo():
+		// OpenCode Go: same gateway, authenticated by the user's OpenCode key.
+	case settings.IsCodex():
+		h.Set("ChatGPT-Account-ID", settings.CodexAccountID)
+		h.Set("originator", "codex_cli_rs")
+		h.Set("version", store.CodexClientVersion)
+		h.Set("User-Agent", "codex_cli_rs/"+store.CodexClientVersion)
+		if settings.CodexFedRAMP {
+			h.Set("X-OpenAI-Fedramp", "true")
+		}
 	case settings.IsOllie():
 		h.Set("User-Agent", "grok-desktop-ollie/"+version)
 	case settings.IsKimiWork():
@@ -143,9 +158,11 @@ func (c *Client) authHeaders(token, version string, settings store.Settings) htt
 		h.Set("X-Msh-Platform", "kimi-code-cli")
 		h.Set("X-Msh-Version", "0.23.5")
 	default:
-		// Match official Grok CLI headers so cli-chat-proxy accepts the session.
+		// Match official Grok CLI headers so cli-chat-proxy accepts the session
+		// and emits function_call items (gated on identifier + 1.0.x version).
 		h.Set("x-grok-client-version", version)
-		h.Set("x-grok-client-surface", "grok-cli")
+		h.Set("x-grok-client-identifier", store.DefaultClientIdentifier)
+		h.Set("x-grok-client-surface", store.DefaultClientSurface)
 		h.Set("User-Agent", "grok/"+version)
 	}
 	return h
@@ -190,6 +207,12 @@ func (c *Client) ListModels(ctx context.Context, token string, settings store.Se
 		// Keep the desktop catalog available even if Zen's optional /models
 		// endpoint is temporarily unavailable. Requests still go direct to Zen.
 		return OpenCodeZenFreeModels(), nil
+	}
+	if settings.IsOpenCodeGo() {
+		return c.listOpenCodeGoModels(ctx, token, settings)
+	}
+	if settings.IsCodex() {
+		return CodexModels(), nil
 	}
 	url := c.baseURL(settings) + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -415,6 +438,119 @@ func OpenCodeZenFreeModels() []ModelInfo {
 	}
 }
 
+// openCodeGoPaidModels mirrors the models.dev opencode-go registry block —
+// the exact paid catalog the opencode CLI shows for that provider. Used as
+// the static fallback when the live go gateway is unreachable.
+func openCodeGoPaidModels() []ModelInfo {
+	ids := []string{
+		"deepseek-v4-flash", "deepseek-v4-pro",
+		"glm-5", "glm-5.1", "glm-5.2",
+		"gpt-5.6-luna", "grok-4.5", "hy3",
+		"kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3",
+		"mimo-v2.5", "mimo-v2.5-pro", "mimo-v2-omni", "mimo-v2-pro",
+		"minimax-m2.5", "minimax-m2.7", "minimax-m3",
+		"qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max",
+	}
+	out := make([]ModelInfo, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, ModelInfo{
+			ID: "opencode-go/" + id, Name: id, Description: "OpenCode Go · API key · chat/completions", APIMode: "chat",
+		})
+	}
+	return out
+}
+
+// OpenCodeGoModels returns the static fallback for the dedicated Go catalog.
+func OpenCodeGoModels() []ModelInfo {
+	return openCodeGoPaidModels()
+}
+
+// CodexModels mirrors the current visible catalog bundled with the official
+// Codex CLI. The codex/ namespace is local-only and prevents collisions with
+// other providers; Settings.ResolveModelForClient strips it on the wire.
+func CodexModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "codex/gpt-5.6-sol", Name: "GPT-5.6-Sol", Description: "OpenAI Codex · ChatGPT subscription", APIMode: "responses", ContextWindow: 272000, ReasoningEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"}, DefaultReasoningEffort: "low"},
+		{ID: "codex/gpt-5.6-terra", Name: "GPT-5.6-Terra", Description: "OpenAI Codex · ChatGPT subscription", APIMode: "responses", ContextWindow: 272000, ReasoningEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"}, DefaultReasoningEffort: "medium"},
+		{ID: "codex/gpt-5.6-luna", Name: "GPT-5.6-Luna", Description: "OpenAI Codex · ChatGPT subscription", APIMode: "responses", ContextWindow: 272000, ReasoningEfforts: []string{"low", "medium", "high", "xhigh", "max"}, DefaultReasoningEffort: "medium"},
+		{ID: "codex/gpt-5.5", Name: "GPT-5.5", Description: "OpenAI Codex · ChatGPT subscription", APIMode: "responses", ContextWindow: 272000, ReasoningEfforts: []string{"low", "medium", "high", "xhigh"}, DefaultReasoningEffort: "medium"},
+		{ID: "codex/gpt-5.2", Name: "GPT-5.2", Description: "OpenAI Codex · ChatGPT subscription", APIMode: "responses", ContextWindow: 272000, ReasoningEfforts: []string{"low", "medium", "high", "xhigh"}, DefaultReasoningEffort: "medium"},
+	}
+}
+
+// listOpenCodeGoModels fetches the OpenCode Go model list from the dedicated
+// go gateway exactly like the opencode CLI does (GET zen/go/v1/models with the
+// user key). Falls back to the static catalog when the fetch fails.
+func (c *Client) listOpenCodeGoModels(ctx context.Context, token string, settings store.Settings) ([]ModelInfo, error) {
+	if token == "" {
+		token = settings.OpenCodeGoAPIKeyPlain()
+	}
+	ids, err := FetchOpenCodeGoModelIDs(ctx, c.HTTP, token)
+	if err != nil || len(ids) == 0 {
+		return OpenCodeGoModels(), err
+	}
+	out := make([]ModelInfo, 0, len(ids))
+	for _, id := range ids {
+		if !strings.HasPrefix(strings.ToLower(id), "opencode-go/") {
+			id = "opencode-go/" + id
+		}
+		out = append(out, ModelInfo{
+			ID: id, Name: id, Description: "OpenCode Go · API key · chat/completions", APIMode: "chat",
+		})
+	}
+	return out, nil
+}
+
+// FetchOpenCodeGoModelIDs pulls the live OpenCode Go model ids from the
+// dedicated go gateway (GET {gateway}/models with Bearer key). This is the
+// same catalog the opencode CLI surfaces for the opencode-go provider (the
+// static fallback mirrors models.dev's opencode-go registry block).
+func FetchOpenCodeGoModelIDs(ctx context.Context, hc *http.Client, token string) ([]string, error) {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(store.OpenCodeGoGateway, "/")+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("models HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	ids := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		id := strings.TrimSpace(m.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("empty model list")
+	}
+	return ids, nil
+}
+
 func ollieFallbackModels() []ModelInfo {
 	ids := []string{
 		"claude-sonnet-5", "claude-opus-4-8", "claude-fable-5",
@@ -494,7 +630,7 @@ func (c *Client) StreamChat(
 	var streamErr error
 	if settings.IsGemini() {
 		streamErr = c.streamGemini(ctx, settings, model, req, emit)
-	} else if settings.IsKimiWork() || settings.IsOllie() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || strings.EqualFold(req.APIMode, "chat") {
+	} else if settings.IsKimiWork() || settings.IsOllie() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo() || strings.EqualFold(req.APIMode, "chat") {
 		// OllieChat (and explicit chat mode): OpenAI chat/completions.
 		// Kimi Work coding gateway only exposes /chat/completions (no /responses).
 		// Ollie is chat-only. QwenBridge / DeepSeek are wired chat-only.
@@ -511,6 +647,10 @@ func (c *Client) StreamChat(
 	}
 	logging.Info("upstream.stream.done", "provider", prov, "model", model, "account_id", accountLabel, "duration_ms", time.Since(streamT0).Milliseconds())
 	return nil
+}
+
+func openCodeGoChatURL() string {
+	return strings.TrimRight(store.OpenCodeGoGateway, "/") + "/chat/completions"
 }
 
 func resolveKimiUpstreamModel(model string) string {
@@ -643,7 +783,8 @@ func isQuotaPayload(payload map[string]any) (bool, string) {
 		return false, ""
 	}
 	low := strings.ToLower(msg)
-	if strings.Contains(low, "usage limit") ||
+	if strings.Contains(low, "too many people are chatting with kimi") ||
+		strings.Contains(low, "usage limit") ||
 		strings.Contains(low, "billing cycle") ||
 		strings.Contains(low, "resource_exhausted") ||
 		strings.Contains(low, "access_terminated") ||
@@ -769,6 +910,9 @@ func (c *Client) streamChatCompletions(
 	}
 	raw, _ := json.Marshal(body)
 	url := c.baseURL(settings) + "/chat/completions"
+	if settings.IsOpenCodeGo() {
+		url = openCodeGoChatURL()
+	}
 
 	t0 := time.Now()
 	var ttftMs int64
@@ -975,12 +1119,21 @@ func (c *Client) streamResponses(
 	emit func(StreamEvent),
 ) error {
 	prev := extractPrevID(req)
+	if settings.IsCodex() {
+		// The ChatGPT Codex backend is stateless; the official client resends
+		// conversation input instead of chaining stored response IDs.
+		prev = ""
+		if strings.EqualFold(strings.TrimSpace(effort), "ultra") {
+			effort = "max"
+		}
+	}
+	instructions, messages := splitSystemInstructions(req.Messages)
 	var input any
 	if strings.TrimSpace(req.Input) != "" {
 		input = req.Input
-	} else if len(req.Messages) > 0 {
+	} else if len(messages) > 0 {
 		// only last user turn when chaining
-		msgs := req.Messages
+		msgs := messages
 		if prev != "" {
 			for i := len(msgs) - 1; i >= 0; i-- {
 				if msgs[i].Role == "user" {
@@ -1002,14 +1155,26 @@ func (c *Client) streamResponses(
 			"effort":  effort,
 			"summary": "auto",
 		},
-		// Native xAI server-side search (replaces client-side DuckDuckGo).
-		"tools": []map[string]any{
-			{"type": "web_search"},
-			{"type": "x_search"},
-		},
-		"tool_choice": "auto",
 	}
-	if settings.StoreResponses || prev != "" {
+	if instructions != "" {
+		body["instructions"] = instructions
+	}
+	if settings.IsCodex() {
+		body["store"] = false
+		body["include"] = []string{"reasoning.encrypted_content"}
+		if _, ok := body["instructions"]; !ok {
+			body["instructions"] = ""
+		}
+		if strings.HasPrefix(strings.ToLower(model), "gpt-5.6-") {
+			body["parallel_tool_calls"] = false
+			body["reasoning"].(map[string]any)["context"] = "all_turns"
+		}
+	} else {
+		// Native xAI server-side search (replaces client-side DuckDuckGo).
+		body["tools"] = []map[string]any{{"type": "web_search"}, {"type": "x_search"}}
+		body["tool_choice"] = "auto"
+	}
+	if !settings.IsCodex() && (settings.StoreResponses || prev != "") {
 		body["store"] = true
 	}
 	if prev != "" {
@@ -1022,6 +1187,9 @@ func (c *Client) streamResponses(
 		return err
 	}
 	httpReq.Header = c.authHeaders(token, settings.ClientVersion, settings)
+	if settings.IsCodex() {
+		httpReq.Header.Set("Accept", "text/event-stream")
+	}
 
 	t0 := time.Now()
 	var ttftMs int64
@@ -1052,6 +1220,21 @@ func (c *Client) streamResponses(
 	sc := bufio.NewScanner(newContextReader(ctx, resp.Body))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var eventName string
+	seenReasoning := map[string]bool{}
+	emitReasoning := func(item map[string]any) {
+		if !settings.IsCodex() || strField(item["type"]) != "reasoning" || strField(item["encrypted_content"]) == "" {
+			return
+		}
+		key := strField(item["id"])
+		if key == "" {
+			key = strField(item["encrypted_content"])
+		}
+		if seenReasoning[key] {
+			return
+		}
+		seenReasoning[key] = true
+		emit(StreamEvent{Type: "reasoning_item", ID: id, Model: outModel, Payload: item})
+	}
 	for sc.Scan() {
 		line := sc.Text()
 		if strings.HasPrefix(line, "event:") {
@@ -1120,6 +1303,7 @@ func (c *Client) streamResponses(
 			}
 		case "response.output_item.done":
 			if item, ok := obj["item"].(map[string]any); ok {
+				emitReasoning(item)
 				handleSearchItemDone(item, id, outModel, pendingSearch, t0, emit)
 			}
 		case "response.output_text.annotation.added":
@@ -1146,6 +1330,13 @@ func (c *Client) streamResponses(
 				}
 				if u, ok := r["usage"].(map[string]any); ok {
 					usage = parseResponsesUsage(u)
+				}
+				if output, ok := r["output"].([]any); ok {
+					for _, rawItem := range output {
+						if item, ok := rawItem.(map[string]any); ok {
+							emitReasoning(item)
+						}
+					}
 				}
 			}
 		}
@@ -1182,6 +1373,11 @@ func (c *Client) streamResponses(
 func messagesToResponsesInput(msgs []ChatMessage) any {
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
+		for _, item := range m.ReasoningItems {
+			if strField(item["type"]) == "reasoning" && strField(item["encrypted_content"]) != "" {
+				out = append(out, item)
+			}
+		}
 		role := m.Role
 		if role == "system" {
 			role = "user"
@@ -1198,6 +1394,24 @@ func messagesToResponsesInput(msgs []ChatMessage) any {
 		})
 	}
 	return out
+}
+
+// splitSystemInstructions maps OpenAI-style system messages to the Responses
+// API's dedicated instructions field. This keeps proxy-managed prompts at the
+// proper upstream instruction level instead of turning them into user input.
+func splitSystemInstructions(msgs []ChatMessage) (string, []ChatMessage) {
+	instructions := make([]string, 0, 1)
+	nonSystem := make([]ChatMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		if strings.EqualFold(strings.TrimSpace(msg.Role), "system") {
+			if content := strings.TrimSpace(msg.Content); content != "" {
+				instructions = append(instructions, content)
+			}
+			continue
+		}
+		nonSystem = append(nonSystem, msg)
+	}
+	return strings.Join(instructions, "\n\n"), nonSystem
 }
 
 func searchKindFromItem(item map[string]any) string {
