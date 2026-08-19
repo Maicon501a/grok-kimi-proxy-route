@@ -194,8 +194,14 @@ export function StartKimiStealthLoginNewAccount(arg1) {
   return window['go']['main']['App']['StartKimiStealthLoginNewAccount'](arg1);
 }
 
+}
+
 export function SyncGrokCLI() {
   return window['go']['main']['App']['SyncGrokCLI']();
+}
+
+export function TestKimiGoogleCredentials(arg1) {
+  return window['go']['main']['App']['TestKimiGoogleCredentials'](arg1);
 }
 
 export function UpdateSettings(arg1) {

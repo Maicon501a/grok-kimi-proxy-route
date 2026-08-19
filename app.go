@@ -621,12 +621,16 @@ func (a *App) StartKimiBrowserLogin() (map[string]any, error) {
 // so the user can log into a *different* Google account without reusing the saved
 // persistent profile. Internal proxy still keeps all credentials for refresh/re-login.
 func (a *App) StartKimiStealthLoginNewAccount(autoClose bool) (map[string]any, error) {
-	return a.startKimiStealthLoginNewAccount(autoClose, false)
+	if a.store == nil {
+		return nil, fmt.Errorf("store not ready")
+	}
+	settings := a.store.Settings()
+	return a.startKimiStealthLoginNewAccount(autoClose, false, settings.GoogleEmail, settings.GooglePassword)
 }
 
 // startKimiStealthLoginNewAccount is the internal variant; background=true keeps
 // global settings (provider/active account) untouched for replenish re-logins.
-func (a *App) startKimiStealthLoginNewAccount(autoClose bool, background bool) (map[string]any, error) {
+func (a *App) startKimiStealthLoginNewAccount(autoClose bool, background bool, googleEmail, googlePassword string) (map[string]any, error) {
 	if a.store == nil {
 		return nil, fmt.Errorf("store not ready")
 	}
@@ -642,7 +646,7 @@ func (a *App) startKimiStealthLoginNewAccount(autoClose bool, background bool) (
 		"phase":   "stealth_new",
 		"message": "Iniciando login com perfil isolado (nova conta Google)…",
 	})
-	gl, err := kimi.LoginWithGoogleStealth(root, profileDir, 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless, a.store.Settings().GoogleEmail, a.store.Settings().GooglePassword)
+	gl, err := kimi.LoginWithGoogleStealth(root, profileDir, 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless, googleEmail, googlePassword)
 	if err != nil {
 		return nil, err
 	}
@@ -677,6 +681,25 @@ func (a *App) StartKimiStealthLogin(autoClose bool) (map[string]any, error) {
 // the preferred account, else clean Playwright profile (no shared stealth profile).
 func (a *App) StartKimiStealthLoginForAccount(accountID string, autoClose bool) (map[string]any, error) {
 	return a.startKimiStealthLoginForAccount(accountID, autoClose, false)
+}
+
+// TestKimiGoogleCredentials forces a clean Playwright profile so the saved
+// per-account email/password are tested instead of the Google refresh token.
+func (a *App) TestKimiGoogleCredentials(accountID string) (map[string]any, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not ready")
+	}
+	acc, ok := a.store.GetAccount(accountID)
+	if !ok || acc == nil {
+		return nil, fmt.Errorf("account not found")
+	}
+	if acc.NormalizedProvider() != store.ProviderKimiWork {
+		return nil, fmt.Errorf("account is not Kimi Work")
+	}
+	if acc.GoogleEmail == "" || acc.GooglePassword == "" {
+		return nil, fmt.Errorf("salve o email e a senha Google antes do teste")
+	}
+	return a.startKimiStealthLoginNewAccount(true, true, acc.GoogleEmail, acc.GooglePassword)
 }
 
 // startKimiStealthLoginForAccount is the internal variant; background=true keeps
@@ -729,7 +752,17 @@ func (a *App) startKimiStealthLoginForAccount(accountID string, autoClose bool, 
 		"phase":   "clean_profile",
 		"message": "Abrindo login com perfil limpo (Playwright)…",
 	})
-	return a.startKimiStealthLoginNewAccount(autoClose, background)
+	settings := a.store.Settings()
+	googleEmail, googlePassword := settings.GoogleEmail, settings.GooglePassword
+	if acc, ok := a.store.GetAccount(accountID); ok && acc != nil {
+		if acc.GoogleEmail != "" {
+			googleEmail = acc.GoogleEmail
+		}
+		if acc.GooglePassword != "" {
+			googlePassword = acc.GooglePassword
+		}
+	}
+	return a.startKimiStealthLoginNewAccount(autoClose, background, googleEmail, googlePassword)
 }
 
 // pickGoogleRefreshTokenFor returns a stored Google OAuth refresh_token for HTTP re-login.
@@ -935,8 +968,11 @@ func (a *App) addKimiSession(accessToken, refreshToken, googleRefreshToken strin
 	}
 	now := time.Now().UTC()
 	created := now
+	googleEmail, googlePassword := "", ""
 	if prev, ok := a.store.GetAccount(id); ok && prev != nil && !prev.CreatedAt.IsZero() {
 		created = prev.CreatedAt
+		googleEmail = prev.GoogleEmail
+		googlePassword = prev.GooglePassword
 	}
 	acc := store.Account{
 		ID:                 id,
@@ -952,6 +988,8 @@ func (a *App) addKimiSession(accessToken, refreshToken, googleRefreshToken strin
 		AccessToken:        accessToken,
 		RefreshToken:       refreshToken,
 		GoogleRefreshToken: googleRefreshToken,
+		GoogleEmail:        googleEmail,
+		GooglePassword:     googlePassword,
 		ExpiresAt:          minted.ExpiresAt,
 		CreatedAt:          created,
 		UpdatedAt:          now,

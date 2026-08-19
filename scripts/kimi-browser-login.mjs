@@ -71,11 +71,11 @@ function tryCaptureFromURL(url, state) {
 }
 
 async function fillGoogleLoginForm(page, email, password) {
-  if (!email || !password) return false;
+  if (!email && !password) return false;
   try {
     // Email step
     const emailInput = await page.$('input[type="email"], input[name="identifier"], #identifierId');
-    if (emailInput && (await emailInput.isVisible().catch(() => false))) {
+    if (email && emailInput && (await emailInput.isVisible().catch(() => false))) {
       log('Auto-login: filling email...');
       await emailInput.fill(email);
       await sleep(500);
@@ -89,7 +89,7 @@ async function fillGoogleLoginForm(page, email, password) {
     }
     // Password step
     const passInput = await page.$('input[type="password"], input[name="Passwd"], input[name="password"]');
-    if (passInput && (await passInput.isVisible().catch(() => false))) {
+    if (password && passInput && (await passInput.isVisible().catch(() => false))) {
       log('Auto-login: filling password...');
       await passInput.fill(password);
       await sleep(500);
@@ -124,7 +124,7 @@ async function isManualLoginForm(page) {
   return false;
 }
 
-async function clickAccountChooserOnce(page) {
+async function clickAccountChooserOnce(page, preferredEmail) {
   const selectors = [
     'div[data-identifier]',
     'div[data-email]',
@@ -135,6 +135,7 @@ async function clickAccountChooserOnce(page) {
   for (const sel of selectors) {
     const els = await page.$$(sel);
     if (els.length === 0) continue;
+    const visible = [];
     for (const el of els) {
       try {
         if (!(await el.isVisible())) continue;
@@ -142,6 +143,17 @@ async function clickAccountChooserOnce(page) {
           (await el.getAttribute('data-identifier')) ||
           (await el.getAttribute('data-email')) ||
           '';
+        visible.push({ el, id });
+      } catch (_) {
+        // try the next candidate
+      }
+    }
+    const preferred = String(preferredEmail || '').trim().toLowerCase();
+    const candidates = preferred
+      ? [...visible.filter(({ id }) => id.toLowerCase() === preferred), ...visible.filter(({ id }) => id.toLowerCase() !== preferred)]
+      : visible;
+    for (const { el, id } of candidates) {
+      try {
         log(`Account chooser: click once (${sel}${id ? ` · ${id}` : ''})`);
         await el.click({ timeout: 5000 });
         return true;
@@ -282,7 +294,7 @@ async function main() {
 
           if (await isManualLoginForm(p)) {
             // If credentials provided, try auto-fill
-            if (googleEmail && googlePassword) {
+            if (googleEmail || googlePassword) {
               const filled = await fillGoogleLoginForm(p, googleEmail, googlePassword);
               if (filled) {
                 accountClicked = true;
@@ -300,7 +312,7 @@ async function main() {
           }
 
           if (!accountClicked) {
-            if (await clickAccountChooserOnce(p)) {
+            if (await clickAccountChooserOnce(p, googleEmail)) {
               accountClicked = true;
               await sleep(2000);
               continue;

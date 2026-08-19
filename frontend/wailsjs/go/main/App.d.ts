@@ -101,10 +101,15 @@ export function StartKimiStealthLoginForAccount(arg1:string,arg2:boolean):Promis
 
 export function StartKimiStealthLoginNewAccount(arg1:boolean):Promise<Record<string, any>>;
 
+
 export function SyncGrokCLI():Promise<Record<string, any>>;
+
+export function TestKimiGoogleCredentials(arg1:string):Promise<Record<string, any>>;
 
 export function UpdateSettings(arg1:Record<string, any>):Promise<store.Settings>;
 
 export function UpdateSkill(arg1:string,arg2:string,arg3:string,arg4:string):Promise<skills.Skill>;
 
 export function UpsertMCPServer(arg1:Record<string, any>):Promise<Record<string, any>>;
+
+export function ValidateGeminiAccount(arg1:string):Promise<Record<string, any>>;

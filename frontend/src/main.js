@@ -31,6 +31,7 @@ import {
   SetGoogleCredentials,
   GetAccountGoogleCredentials,
   SetAccountGoogleCredentials,
+  TestKimiGoogleCredentials,
   StartKimiBrowserLogin,
   StartKimiStealthLoginNewAccount,
   AddKimiFromJWT,
@@ -1915,15 +1916,20 @@ async function showAccountCredsModal(account) {
         <button type="button" id="m-toggle-pass" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:4px 6px;line-height:1;">👁</button>
       </div>
       <button type="button" class="btn btn-solid" id="m-save-creds" style="width:100%;font-size:13px;margin-bottom:8px;">Salvar credenciais</button>
+      <button type="button" class="btn btn-quiet" id="m-test-creds" style="width:100%;font-size:13px;margin-bottom:8px;">Testar auto-login</button>
       <p id="m-creds-status" style="font-size:11px;opacity:.5;margin:0 0 8px;text-align:center;"></p>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Fechar</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
-  $("#m-cancel", overlay).onclick = () => overlay.remove();
+  const close = () => {
+    overlay.remove();
+    openAccountsModal();
+  };
+  $("#m-cancel", overlay).onclick = close;
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.remove();
+    if (e.target === overlay) close();
   });
 
   // Load per-account credentials
@@ -1965,6 +1971,31 @@ async function showAccountCredsModal(account) {
         statusEl.textContent = "Erro ao salvar: " + e;
         statusEl.style.color = "#ff7b72";
       }
+    }
+  };
+  $("#m-test-creds", overlay).onclick = async () => {
+    const statusEl = $("#m-creds-status", overlay);
+    const btn = $("#m-test-creds", overlay);
+    if (btn) btn.disabled = true;
+    if (statusEl) {
+      statusEl.textContent = "Testando relogin automático...";
+      statusEl.style.color = "#9ecbff";
+      statusEl.style.opacity = "0.9";
+    }
+    try {
+      const result = await TestKimiGoogleCredentials(account.id);
+      if (statusEl) {
+        statusEl.textContent = `Auto-login OK (${result?.mode || "sessão renovada"})`;
+        statusEl.style.color = "#7ee787";
+      }
+      await refreshBootstrap(false);
+    } catch (e) {
+      if (statusEl) {
+        statusEl.textContent = "Auto-login falhou: " + e;
+        statusEl.style.color = "#ff7b72";
+      }
+    } finally {
+      if (btn) btn.disabled = false;
     }
   };
 }

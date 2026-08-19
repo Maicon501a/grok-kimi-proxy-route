@@ -186,6 +186,45 @@ func TestSettingsPersistRoundtrip(t *testing.T) {
 	}
 }
 
+func TestKimiGoogleCredentialsPersistRoundtrip(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateSettings(func(s *Settings) {
+		s.GoogleEmail = "global@example.com"
+		s.GooglePassword = "global-secret"
+		s.KimiStealthHeadless = true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAccount(Account{
+		ID: "kimi-user", Provider: ProviderKimiWork, APIKey: "sk-kimi-test",
+		GoogleEmail: "account@example.com", GooglePassword: "account-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	settings := st2.Settings()
+	if settings.GoogleEmail != "global@example.com" || settings.GooglePassword != "global-secret" || !settings.KimiStealthHeadless {
+		t.Fatalf("global Google credentials not restored: %+v", settings)
+	}
+	acc, ok := st2.GetAccount("kimi-user")
+	if !ok || acc.GoogleEmail != "account@example.com" || acc.GooglePassword != "account-secret" {
+		t.Fatalf("account Google credentials not restored: %+v", acc)
+	}
+}
+
 func TestPublicAccountsBadges(t *testing.T) {
 	isolateHome(t)
 	dir := t.TempDir()

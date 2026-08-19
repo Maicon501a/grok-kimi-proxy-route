@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
 	b64 "encoding/base64"
 	"encoding/json"
@@ -36,6 +38,8 @@ const (
 	ProviderDeepSeek    = "deepseek"
 	ProviderAccio       = "accio"
 	ProviderOpenCodeZen = "opencode_zen"
+	ProviderOpenCodeGo  = "opencode_go"
+	ProviderCodex       = "openai_codex"
 
 	// AuthMode: how credentials are obtained for a provider.
 	AuthModeSession = "auth"    // multi-account session flow (xAI OAuth, Kimi Work mint)
@@ -223,6 +227,10 @@ func (a *Account) NormalizedProvider() string {
 		return ProviderAccio
 	case ProviderOpenCodeZen, "opencode-zen", "opencode", "zen", "zen-free", "opencode-zen-free", "opencode zen", "opencode zen free":
 		return ProviderOpenCodeZen
+	case ProviderOpenCodeGo, "opencode-go", "opencode go":
+		return ProviderOpenCodeGo
+	case ProviderCodex, "codex", "openai-codex", "openai codex", "chatgpt":
+		return ProviderCodex
 	case "", ProviderXAI, "grok", "x.ai":
 		return ProviderXAI
 	default:
@@ -333,13 +341,76 @@ type Settings struct {
 	// DeepSeekAPIKey stores the DeepSeek API key as an ENCRYPTED blob
 	// (internal/secure — DPAPI on Windows). Never plaintext on disk; the
 	// frontend only ever sees a masked sentinel.
-	DeepSeekAPIKey      string `json:"deepseek_api_key,omitempty"`
+	DeepSeekAPIKey   string `json:"deepseek_api_key,omitempty"`
+	OpenCodeGoAPIKey string `json:"opencode_go_api_key,omitempty"`
+	// CodexAccountID is request-scoped and never persisted. The ChatGPT backend
+	// requires it alongside the OAuth bearer token.
+	CodexAccountID      string `json:"-"`
+	CodexFedRAMP        bool   `json:"-"`
 	ThemeAccent         string `json:"theme_accent,omitempty"`
 	KimiStealthHeadless bool   `json:"kimi_stealth_headless"`
 	GoogleEmail         string `json:"google_email,omitempty"`
 	GooglePassword      string `json:"google_password,omitempty"`
 	// LoadBalancerStrategies maps provider → strategy (active | round_robin | least_used | random).
 	LoadBalancerStrategies map[string]string `json:"load_balancer_strategies,omitempty"`
+	// SystemPrompts stores a user-managed prompt per routed provider and canonical
+	// upstream model id. It is intentionally separate from request payloads so the
+	// local proxy can apply it consistently to desktop and HTTP clients.
+	SystemPrompts map[string]map[string]string `json:"system_prompts,omitempty"`
+	// AutoCreateOnExhausted enables the xAI pool top-up: when the number of
+	// usable xAI accounts drops below AutoCreateMinAccounts, the app runs the
+	// grok-register signup flow until the pool is back at the floor.
+	AutoCreateOnExhausted bool `json:"auto_create_on_exhausted"`
+	// AutoCreateMinAccounts is the target pool size (default 3 when enabled).
+	AutoCreateMinAccounts int `json:"auto_create_min_accounts,omitempty"`
+}
+
+// SystemPromptFor returns the prompt configured for a provider/model pair. Both
+// values are normalized through the same routing/model-resolution path used by
+// the proxy, which keeps aliases such as k3-agent-high and codex/... stable.
+func (s Settings) SystemPromptFor(provider, model string) string {
+	routed := s.WithProvider(provider)
+	providerKey := routed.NormalizedProvider()
+	modelKey := strings.TrimSpace(routed.ResolveModelForClient(model))
+	if modelKey == "" {
+		modelKey = strings.TrimSpace(routed.DefaultModel)
+	}
+	if prompts := s.SystemPrompts[providerKey]; prompts != nil {
+		return strings.TrimSpace(prompts[modelKey])
+	}
+	return ""
+}
+
+// SetSystemPrompt updates one provider/model prompt. An empty prompt removes the
+// entry, making deletion from the UI and API explicit and idempotent.
+func (s *Settings) SetSystemPrompt(provider, model, prompt string) {
+	routed := s.WithProvider(provider)
+	providerKey := routed.NormalizedProvider()
+	modelKey := strings.TrimSpace(routed.ResolveModelForClient(model))
+	if modelKey == "" {
+		modelKey = strings.TrimSpace(routed.DefaultModel)
+	}
+	if providerKey == "" || modelKey == "" {
+		return
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		if s.SystemPrompts == nil || s.SystemPrompts[providerKey] == nil {
+			return
+		}
+		delete(s.SystemPrompts[providerKey], modelKey)
+		if len(s.SystemPrompts[providerKey]) == 0 {
+			delete(s.SystemPrompts, providerKey)
+		}
+		return
+	}
+	if s.SystemPrompts == nil {
+		s.SystemPrompts = make(map[string]map[string]string)
+	}
+	if s.SystemPrompts[providerKey] == nil {
+		s.SystemPrompts[providerKey] = make(map[string]string)
+	}
+	s.SystemPrompts[providerKey][modelKey] = prompt
 }
 
 // ForceModel reports whether the proxy should ignore the client's model field.
@@ -1311,6 +1382,52 @@ func (s *Store) GetLoadBalancerStrategy(provider string) LoadBalancerStrategy {
 	}
 	return StrategyRoundRobin
 }
+
+// WithAccountRefreshLock serializes rotating refresh tokens across GUI and
+// headless proxy processes sharing this store. Stale locks from a crashed
+// process expire after the longest expected token request.
+func (s *Store) WithAccountRefreshLock(ctx context.Context, accountID string, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	lockDir := filepath.Join(s.root, "locks")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(accountID))
+	lockPath := filepath.Join(lockDir, fmt.Sprintf("refresh-%x.lock", sum[:12]))
+	for {
+		lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(lock, "%d\n", os.Getpid())
+			defer func() {
+				_ = lock.Close()
+				_ = os.Remove(lockPath)
+			}()
+			// The other process may have rotated and persisted the refresh token
+			// while this process waited for the lock.
+			if s.db != nil {
+				if err := s.ReloadAccountsFromDB(); err != nil {
+					return err
+				}
+			}
+			return fn()
+		}
+		if !os.IsExist(err) {
+			return err
+		}
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > 2*time.Minute {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func ProviderCatalog() []map[string]any {
 	return []map[string]any{
 		{
@@ -1669,6 +1786,9 @@ func (s *Store) loadAll() error {
 			a.Provider = ProviderXAI
 		}
 		a.Provider = a.NormalizedProvider()
+		if decryptAccountCredentials(&a) != nil {
+			continue
+		}
 		// Accept OAuth bearer or provider API keys (Kimi sk-kimi).
 		if a.AccessToken == "" && a.APIKey == "" {
 			continue
@@ -1737,6 +1857,21 @@ func mergeSettings(base, over Settings) Settings {
 	if over.DeepSeekAPIKey != "" {
 		base.DeepSeekAPIKey = over.DeepSeekAPIKey
 	}
+	if over.QwenUpstream != "" {
+		base.QwenUpstream = over.QwenUpstream
+	}
+	if over.OpenCodeGoAPIKey != "" {
+		base.OpenCodeGoAPIKey = over.OpenCodeGoAPIKey
+	}
+	base.KimiStealthHeadless = over.KimiStealthHeadless
+	base.GoogleEmail = over.GoogleEmail
+	base.GooglePassword = over.GooglePassword
+	if over.LoadBalancerStrategies != nil {
+		base.LoadBalancerStrategies = over.LoadBalancerStrategies
+	}
+	if over.SystemPrompts != nil {
+		base.SystemPrompts = over.SystemPrompts
+	}
 	if over.ActiveAccountID != "" {
 		base.ActiveAccountID = over.ActiveAccountID
 	}
@@ -1794,13 +1929,109 @@ func (s *Store) saveHistoryLocked() error {
 
 func (s *Store) saveAccountLocked(a Account) error {
 	a.DeviceID = cleanDeviceID(a.DeviceID)
+	stored, err := accountForStorage(a)
+	if err != nil {
+		return err
+	}
 	if s.db != nil {
-		if err := s.saveAccountDB(a); err != nil {
+		if err := s.saveAccountDB(stored); err != nil {
 			return err
 		}
 	}
-	// dual-write JSON backup
-	_ = writeJSON(s.accountPath(a.ID), a)
+	// dual-write JSON backup; a failed backup must not silently leave an older
+	// plaintext credential file behind.
+	return writeJSON(s.accountPath(a.ID), stored)
+}
+
+func (s *Store) migrateCodexCredentialsAtRest(accountID string) error {
+	account, ok := s.GetAccount(accountID)
+	if !ok || account == nil || account.NormalizedProvider() != ProviderCodex {
+		return nil
+	}
+	needsMigration, err := s.codexCredentialsNeedMigration(*account)
+	if err != nil || !needsMigration {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return s.WithAccountRefreshLock(ctx, accountID, func() error {
+		account, ok := s.GetAccount(accountID)
+		if !ok || account == nil || account.NormalizedProvider() != ProviderCodex {
+			return nil
+		}
+		needsMigration, err := s.codexCredentialsNeedMigration(*account)
+		if err != nil {
+			return err
+		}
+		if !needsMigration {
+			return nil
+		}
+		return s.UpsertAccount(*account)
+	})
+}
+
+func (s *Store) codexCredentialsNeedMigration(account Account) (bool, error) {
+	var dbAccess, dbRefresh string
+	if s.db != nil {
+		if err := s.db.QueryRow(`SELECT access_token, refresh_token FROM accounts WHERE id = ?`, account.ID).Scan(&dbAccess, &dbRefresh); err != nil {
+			return false, err
+		}
+		if credentialNeedsEncryption(dbAccess) || credentialNeedsEncryption(dbRefresh) {
+			return true, nil
+		}
+	}
+	backup, err := os.ReadFile(s.accountPath(account.ID))
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var stored Account
+	if json.Unmarshal(backup, &stored) != nil {
+		return true, nil
+	}
+	return credentialNeedsEncryption(stored.AccessToken) || credentialNeedsEncryption(stored.RefreshToken), nil
+}
+
+func credentialNeedsEncryption(value string) bool {
+	return strings.TrimSpace(value) != "" && !secure.HasCiphertext(value)
+}
+
+func accountForStorage(a Account) (Account, error) {
+	if a.NormalizedProvider() != ProviderCodex {
+		return a, nil
+	}
+	var err error
+	if !secure.HasCiphertext(a.AccessToken) {
+		a.AccessToken, err = secure.Encrypt(a.AccessToken)
+		if err != nil {
+			return Account{}, fmt.Errorf("encrypt Codex access token: %w", err)
+		}
+	}
+	if !secure.HasCiphertext(a.RefreshToken) {
+		a.RefreshToken, err = secure.Encrypt(a.RefreshToken)
+		if err != nil {
+			return Account{}, fmt.Errorf("encrypt Codex refresh token: %w", err)
+		}
+	}
+	return a, nil
+}
+
+func decryptAccountCredentials(a *Account) error {
+	if a == nil || a.NormalizedProvider() != ProviderCodex {
+		return nil
+	}
+	accessToken, err := secure.Decrypt(a.AccessToken)
+	if err != nil {
+		return fmt.Errorf("decrypt Codex access token: %w", err)
+	}
+	refreshToken, err := secure.Decrypt(a.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("decrypt Codex refresh token: %w", err)
+	}
+	a.AccessToken = accessToken
+	a.RefreshToken = refreshToken
 	return nil
 }
 
@@ -2164,7 +2395,7 @@ func (s *Store) ReloadAccountsFromDB() error {
 	rows, err := s.db.Query(`SELECT id, provider, label, email, team_id, user_id,
 		access_token, refresh_token, expires_at, api_key, device_id, source,
 		exhausted_at, exhaust_reason, auth_denied_at, auth_denied_reason,
-		client_id, issuer, scope, google_refresh_token, created_at, updated_at FROM accounts`)
+		client_id, issuer, scope, google_refresh_token, google_email, google_password, created_at, updated_at FROM accounts`)
 	if err != nil {
 		return err
 	}
@@ -2177,7 +2408,7 @@ func (s *Store) ReloadAccountsFromDB() error {
 			&a.ID, &a.Provider, &a.Label, &a.Email, &a.TeamID, &a.UserID,
 			&a.AccessToken, &a.RefreshToken, &exp, &a.APIKey, &a.DeviceID, &a.Source,
 			&exh, &a.ExhaustReason, &auth, &a.AuthDeniedReason,
-			&a.ClientID, &a.Issuer, &a.Scope, &a.GoogleRefreshToken, &created, &updated,
+			&a.ClientID, &a.Issuer, &a.Scope, &a.GoogleRefreshToken, &a.GoogleEmail, &a.GooglePassword, &created, &updated,
 		); err != nil {
 			continue
 		}
@@ -2191,16 +2422,16 @@ func (s *Store) ReloadAccountsFromDB() error {
 			a.Provider = ProviderXAI
 		}
 		a.Provider = a.NormalizedProvider()
+		if decryptAccountCredentials(&a) != nil {
+			continue
+		}
 		if a.AccessToken == "" && a.APIKey == "" {
 			continue
 		}
 		if a.NormalizedProvider() == ProviderKimiWork && a.APIKey == "" && strings.HasPrefix(a.AccessToken, "sk-kimi-") {
 			a.APIKey = a.AccessToken
 		}
-		// Merge with the existing in-memory row instead of wholesale replacing:
-		// Google email/password live only in the JSON sidecar (no SQLite column),
-		// and a reload must never strip the Google refresh token that HTTP
-		// re-login depends on, nor the in-flight request counter.
+		// Preserve credentials from an in-flight update and the request counter.
 		if old, ok := s.accounts[a.ID]; ok {
 			if a.GoogleRefreshToken == "" {
 				a.GoogleRefreshToken = old.GoogleRefreshToken
