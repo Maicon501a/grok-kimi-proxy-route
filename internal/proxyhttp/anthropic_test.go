@@ -21,7 +21,19 @@ func anthropicTestEnsure(st *store.Store, seenProv *[]string) func(ctx context.C
 			*seenProv = append(*seenProv, RouteProviderFrom(ctx))
 		}
 		prov := RouteProviderFrom(ctx)
+		// The production picker honors the active account before rotating. Do the
+		// same here; iterating ListAccounts alone is map-order dependent.
+		candidates := make([]store.Account, 0)
+		if active, ok := st.ActiveAccount(); ok && active != nil {
+			candidates = append(candidates, *active)
+		}
 		for _, a := range st.ListAccounts() {
+			if len(candidates) > 0 && a.ID == candidates[0].ID {
+				continue
+			}
+			candidates = append(candidates, a)
+		}
+		for _, a := range candidates {
 			if prov != "" && a.NormalizedProvider() != prov {
 				continue
 			}

@@ -9,15 +9,15 @@ import (
 
 // xAI Responses API accepts only these tool type variants.
 var allowedToolTypes = map[string]bool{
-	"function":          true,
-	"web_search":        true,
-	"x_search":          true,
+	"function":           true,
+	"web_search":         true,
+	"x_search":           true,
 	"collections_search": true,
-	"file_search":       true,
-	"code_execution":    true,
-	"code_interpreter":  true,
-	"mcp":               true,
-	"shell":             true,
+	"file_search":        true,
+	"code_execution":     true,
+	"code_interpreter":   true,
+	"mcp":                true,
+	"shell":              true,
 }
 
 func nativeSearchTools() []any {
@@ -30,9 +30,24 @@ func nativeSearchTools() []any {
 // sanitizeResponsesTools fixes OpenCode/OpenAI tool payloads so xAI accepts them.
 // Rejects unknown types like "namespace" (causes 422: unknown variant `namespace`).
 // Converts nested OpenAI function tools into xAI flat function tools.
-// Always ensures native web_search + x_search are available.
+// Does not inject native web_search / x_search: IDEs (OpenCode, Kilo) send their
+// own function tools and the model must call those, not server-side search.
 func sanitizeResponsesTools(raw any) []any {
-	out := sanitizeResponsesToolsCore(raw)
+	return sanitizeResponsesToolsCore(raw)
+}
+
+func hasFunctionTool(tools []any) bool {
+	for _, item := range tools {
+		m, _ := item.(map[string]any)
+		if strings.EqualFold(asString(m["type"]), "function") {
+			return true
+		}
+	}
+	return false
+}
+
+func withNativeSearch(tools []any) []any {
+	out := append([]any{}, tools...)
 	hasWeb, hasX := false, false
 	for _, item := range out {
 		m, _ := item.(map[string]any)
@@ -293,7 +308,7 @@ func sanitizeChatTools(raw any) []any {
 			"function": map[string]any{
 				"name":        name,
 				"description": desc,
-				"parameters":   params,
+				"parameters":  params,
 			},
 		})
 	}

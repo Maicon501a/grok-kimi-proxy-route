@@ -13,9 +13,34 @@ import (
 
 	"github.com/google/uuid"
 
+	"grok-desktop/internal/codexauth"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
 )
+
+// injectManagedSystemPromptIntoAnthropic preserves the Anthropic system shape
+// while adding the proxy-managed system prompt. Anthropic accepts a string or a
+// list of text blocks for this field.
+func injectManagedSystemPromptIntoAnthropic(req map[string]any, prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	switch current := req["system"].(type) {
+	case string:
+		current = strings.TrimSpace(current)
+		if current == "" {
+			req["system"] = prompt
+		} else {
+			req["system"] = prompt + "\n\n" + current
+		}
+	case []any:
+		block := map[string]any{"type": "text", "text": prompt}
+		req["system"] = append([]any{block}, current...)
+	default:
+		req["system"] = prompt
+	}
+}
 
 // handleMessages implements Anthropic Messages API: POST /v1/messages
 // Routes by client model id (same as the chat endpoints):
@@ -48,7 +73,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Route by client model only — never UI global provider.
 	reqModel := asString(req["model"])
-	settings := s.store.Settings().WithProviderForModel(reqModel)
+	baseSettings := s.store.Settings()
+	settings := baseSettings.WithProviderForModel(reqModel)
+	if isCodexRequest(r) && store.IsBareCodexModel(reqModel) {
+		settings = baseSettings.WithProvider(store.ProviderCodex)
+	}
 	routeProv := settings.NormalizedProvider()
 	ctx := WithRouteProvider(r.Context(), routeProv)
 	ctx = logging.WithRequestID(ctx, uuid.NewString()[:8])
@@ -84,11 +113,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Ollie natively supports Anthropic /v1/messages — passthrough is more faithful.
 	if settings.IsOllie() {
+		injectManagedSystemPromptIntoAnthropic(req, settings.SystemPromptFor(routeProv, model))
+		body, _ = json.Marshal(req)
 		s.proxyOllieAnthropic(w, r, token, settings, body, stream)
 		return
 	}
 
 	messages := anthropicToOpenAIMessages(req)
+	messages = injectManagedSystemPromptIntoMessages(messages, settings.SystemPromptFor(routeProv, model))
 	messages = injectTemporalIntoMessages(messages)
 
 	oaBody := map[string]any{
@@ -124,12 +156,31 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// same machinery the /v1/chat/completions route uses.
 	upstreamPath := "/chat/completions"
 	upBody := oaBody
-	if settings.IsXAI() {
+	if settings.IsXAI() || settings.IsCodex() {
 		upstreamPath = "/responses"
 		rb := chatCompletionsBodyToResponses(oaBody, settings)
-		if _, ok := rb["tools"]; !ok {
-			rb["tools"] = nativeSearchTools()
-			rb["tool_choice"] = "auto"
+		if settings.IsXAI() {
+			if _, ok := rb["tools"]; !ok {
+				rb["tools"] = nativeSearchTools()
+				rb["tool_choice"] = "auto"
+			}
+		}
+		if settings.IsCodex() {
+			rb["store"] = false
+			rb["stream"] = true
+			delete(rb, "previous_response_id")
+			ensureResponsesInclude(rb, "reasoning.encrypted_content")
+			if _, ok := rb["instructions"]; !ok {
+				rb["instructions"] = ""
+			}
+			if reasoning, ok := rb["reasoning"].(map[string]any); ok && strings.HasPrefix(strings.ToLower(model), "gpt-5.6-") {
+				reasoning["context"] = "all_turns"
+			}
+			if strings.HasPrefix(strings.ToLower(model), "gpt-5.6-") {
+				rb["parallel_tool_calls"] = false
+			}
+			delete(rb, "temperature")
+			delete(rb, "top_p")
 		}
 		upBody = rb
 	}
@@ -142,6 +193,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		accountID = acc.ID
 	}
 	authRetried := false
+	codexRefreshTransient := false
 	// rotateCreds adopts credentials from a retry ensure/forceRefresh. Settings
 	// stay pinned to the route; only token/acc swap. Returns false when the
 	// rotated account belongs to another provider — fail instead of sending a
@@ -160,6 +212,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if acc2 != nil {
 			store.TrackInflight(ctx, acc2.ID)
+			if settings.IsCodex() {
+				settings.CodexAccountID = acc2.TeamID
+				settings.CodexFedRAMP = strings.Contains(acc2.Source, "fedramp")
+			}
 		}
 		token, acc = tok2, acc2
 		if acc2 != nil {
@@ -176,7 +232,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setUpstreamAuthHeaders(upReq, token, settings)
-		if stream {
+		if settings.IsCodex() || stream {
 			upReq.Header.Set("Accept", "text/event-stream")
 		} else {
 			upReq.Header.Set("Accept", "application/json")
@@ -199,18 +255,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		_ = resp.Body.Close()
 		resp = nil
 		reason := fmt.Sprintf("HTTP %d: %s", code, string(errBody))
-
-		// Kimi global capacity — fail fast, no account rotate / re-mint spam.
-		if settings.IsKimiWork() && isKimiCapacityBusy(code, errBody) {
-			msgLog.Warn("proxy.kimi.capacity_busy", "detail", truncateForLog(string(errBody), 200))
-			msg := "Too many people are chatting with Kimi right now. Please try again soon."
-			if m, ok := extractUpstreamMessage(errBody); ok && m != "" {
-				msg = m
-			}
-			w.Header().Set("Retry-After", "30")
-			writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", msg)
-			return
-		}
 
 		// Quota first (Kimi billing 403 must not be treated as auth-denied).
 		// NOTE: every ensure/forceRefresh below runs with the route-pinned ctx,
@@ -248,13 +292,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 		// Auth denial: force-refresh same account once, then rotate.
 		if isAuthStatus(code, errBody) && accountID != "" && !isQuotaStatus(code, errBody) {
-		if isCrossProviderAuthMismatch(acc, settings, errBody) {
-			msgLog.Warn("proxy.auth.cross_provider_mismatch", "account_id", accountID, "provider", routeProv)
-		} else {
+			if isCrossProviderAuthMismatch(acc, settings, errBody) {
+				msgLog.Warn("proxy.auth.cross_provider_mismatch", "account_id", accountID, "provider", routeProv)
+			} else {
 				if !authRetried {
 					authRetried = true
 					if fr := s.forceRefreshFn(); fr != nil {
 						tok2, acc2, _, err2 := fr(ctx, accountID)
+						if settings.IsCodex() && err2 != nil && !codexauth.IsInvalidGrant(err2) {
+							codexRefreshTransient = true
+						}
 						if err2 == nil && tok2 != "" && tok2 != token {
 							if !rotateCreds(tok2, acc2) {
 								writeAnthropicCrossProviderError(w, routeProv, acc2)
@@ -276,8 +323,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-				// Mark auth-denied and rotate to another account.
-				if fn := s.authFailHandler(); fn != nil {
+				if codexRefreshTransient {
+					msgLog.Warn("codex.refresh.transient", "account_id", accountID)
+				} else if fn := s.authFailHandler(); fn != nil {
 					if rotated := fn(accountID, reason); rotated {
 						tok2, acc2, _, err2 := s.ensure(ctx)
 						if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
@@ -320,9 +368,19 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	latencyMs := time.Since(startedAt).Milliseconds()
 
 	// xAI: upstream spoke Responses — translate back to Anthropic shapes.
-	if settings.IsXAI() {
+	if settings.IsXAI() || settings.IsCodex() {
 		if !stream {
-			rawResp, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+			var rawResp []byte
+			var readErr error
+			if settings.IsCodex() && (strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") || resp.Header.Get("Content-Type") == "") {
+				rawResp, readErr = completedResponseFromSSE(resp.Body)
+			} else {
+				rawResp, readErr = io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+			}
+			if readErr != nil {
+				writeAnthropicError(w, http.StatusBadGateway, "api_error", readErr.Error())
+				return
+			}
 			s.recordUsageFromJSONBody(rawResp, accountID, routeProv, model, latencyMs)
 			out, err := responsesJSONToAnthropicMessage(rawResp, model)
 			if err != nil {
@@ -516,6 +574,7 @@ func anthropicToOpenAIMessages(req map[string]any) []any {
 			if blocks, ok := m["content"].([]any); ok {
 				var textParts []string
 				var toolCalls []any
+				var reasoningItems []any
 				for _, b := range blocks {
 					bm, ok := b.(map[string]any)
 					if !ok {
@@ -524,6 +583,10 @@ func anthropicToOpenAIMessages(req map[string]any) []any {
 					switch asString(bm["type"]) {
 					case "text":
 						textParts = append(textParts, asString(bm["text"]))
+					case "thinking":
+						if item, ok := reasoningItemFromSignature(asString(bm["signature"])); ok {
+							reasoningItems = append(reasoningItems, item)
+						}
 					case "tool_use":
 						args := bm["input"]
 						argStr, _ := json.Marshal(args)
@@ -540,6 +603,9 @@ func anthropicToOpenAIMessages(req map[string]any) []any {
 				msg := map[string]any{"role": "assistant", "content": strings.Join(textParts, "")}
 				if len(toolCalls) > 0 {
 					msg["tool_calls"] = toolCalls
+				}
+				if len(reasoningItems) > 0 {
+					msg["reasoning_items"] = reasoningItems
 				}
 				out = append(out, msg)
 				continue
@@ -618,6 +684,19 @@ func openAIChatToAnthropicMessage(raw []byte, model string) ([]byte, error) {
 		ch, _ := choices[0].(map[string]any)
 		msg, _ := ch["message"].(map[string]any)
 		if msg != nil {
+			if reasoningItems, ok := msg["reasoning_items"].([]any); ok {
+				for _, raw := range reasoningItems {
+					item, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					if signature := codexReasoningSignature(item); signature != "" {
+						content = append(content, map[string]any{
+							"type": "thinking", "thinking": reasoningSummaryText(item), "signature": signature,
+						})
+					}
+				}
+			}
 			if t := asString(msg["content"]); t != "" {
 				content = append(content, map[string]any{"type": "text", "text": t})
 			}
@@ -737,6 +816,38 @@ func streamResponsesToAnthropic(ctx context.Context, w http.ResponseWriter, body
 			"type": "content_block_delta", "index": openBlock,
 			"delta": map[string]any{"type": "text_delta", "text": delta},
 		}, json.Marshal)
+	}
+	seenReasoning := map[string]bool{}
+	emitReasoning := func(item map[string]any) {
+		signature := codexReasoningSignature(item)
+		if signature == "" {
+			return
+		}
+		key := firstNonEmpty(asString(item["id"]), signature)
+		if seenReasoning[key] {
+			return
+		}
+		seenReasoning[key] = true
+		closeOpen()
+		idx := nextIndex
+		nextIndex++
+		_ = writeSSEJSON(fw, "content_block_start", map[string]any{
+			"type": "content_block_start", "index": idx,
+			"content_block": map[string]any{"type": "thinking", "thinking": ""},
+		}, json.Marshal)
+		if summary := reasoningSummaryText(item); summary != "" {
+			_ = writeSSEJSON(fw, "content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": idx,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": summary},
+			}, json.Marshal)
+		}
+		_ = writeSSEJSON(fw, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": idx,
+			"delta": map[string]any{"type": "signature_delta", "signature": signature},
+		}, json.Marshal)
+		openBlock = idx
+		blockKind = "thinking"
+		closeOpen()
 	}
 	resolveToolIdx := func(keys ...string) (int, bool) {
 		for _, k := range keys {
@@ -894,6 +1005,7 @@ func streamResponsesToAnthropic(ctx context.Context, w http.ResponseWriter, body
 			}
 		case "response.output_item.done":
 			if item, ok := ev["item"].(map[string]any); ok {
+				emitReasoning(item)
 				startTool(item, true)
 			}
 		case "response.function_call_arguments.delta":
@@ -912,6 +1024,11 @@ func streamResponsesToAnthropic(ctx context.Context, w http.ResponseWriter, body
 			emitToolArgs(itemID, callID, args)
 		case "response.completed", "response.done":
 			if respObj, ok := ev["response"].(map[string]any); ok {
+				for _, rawItem := range responsesReasoningItems(respObj) {
+					if item, ok := rawItem.(map[string]any); ok {
+						emitReasoning(item)
+					}
+				}
 				// Harvest function calls in case item events were missed.
 				for _, rawTC := range extractResponsesFunctionCalls(respObj) {
 					if tcm, ok := rawTC.(map[string]any); ok {

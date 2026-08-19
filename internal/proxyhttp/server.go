@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"grok-desktop/internal/accio"
+	"grok-desktop/internal/codexauth"
 	"grok-desktop/internal/gemini"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/store"
@@ -52,7 +53,7 @@ import (
 
 // Multi-route: HTTP clients pick provider by model id on the same base URL
 
-// (e.g. grok-4.5 → xAI, kimi-for-coding → Kimi Work). Global UI "active provider"
+// (e.g. grok-4.6 → xAI, kimi-for-coding → Kimi Work). Global UI "active provider"
 
 // is only a fallback when model is empty/alias.
 
@@ -88,6 +89,8 @@ type Server struct {
 	ln net.Listener
 
 	addr string
+
+	aiStudioBaseURL string
 }
 
 // maxProxyBodyBytes caps inbound request bodies (32 MiB) so a rogue client
@@ -202,6 +205,20 @@ func (s *Server) SetAuthFailHandler(fn func(accountID, reason string) (rotated b
 
 	s.onAuthFail = fn
 
+}
+
+// SetAIStudioBaseURL configures the supervised local AI Studio runtime used by
+// Gemini routes. The child binds exclusively to loopback.
+func (s *Server) SetAIStudioBaseURL(baseURL string) {
+	s.mu.Lock()
+	s.aiStudioBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	s.mu.Unlock()
+}
+
+func (s *Server) getAIStudioBaseURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.aiStudioBaseURL
 }
 
 // SetForceRefresh registers force OAuth refresh (used before marking auth-denied).
@@ -444,10 +461,11 @@ func (s *Server) Start(listen string) error {
 
 		ErrorLog: log.Default(),
 	}
+	srv := s.srv
 
 	go func() {
 
-		if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 
 			log.Printf("proxyhttp serve error (listener stopped): %v", err)
 
@@ -464,23 +482,21 @@ func (s *Server) Start(listen string) error {
 func (s *Server) Stop(ctx context.Context) error {
 
 	s.mu.Lock()
-
-	defer s.mu.Unlock()
-
-	if s.srv == nil {
+	srv := s.srv
+	if srv == nil {
+		s.mu.Unlock()
 
 		return nil
 
 	}
-
-	err := s.srv.Shutdown(ctx)
-
 	s.srv = nil
-
 	s.ln = nil
-
 	s.addr = ""
-
+	s.mu.Unlock()
+	err := srv.Shutdown(ctx)
+	if err != nil {
+		_ = srv.Close()
+	}
 	return err
 
 }
@@ -634,10 +650,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	// --- Grok / xAI (static; avoid ensure side-effects that flip active account) ---
 	xaiModels := []upstream.ModelInfo{
-		{ID: "grok-4.5", Name: "Grok 4.5", Description: "xAI · /v1/responses", APIMode: "responses"},
+		{ID: "grok-4.6", Name: "Grok 4.6", Description: "xAI Build · /v1/responses", APIMode: "responses"},
 	}
 	for _, m := range xaiModels {
 		data = append(data, enrichModelMeta(m, store.ProviderXAI))
+	}
+
+	// --- OpenAI Codex / ChatGPT subscription ---
+	for _, m := range upstream.CodexModels() {
+		data = append(data, enrichModelMeta(m, store.ProviderCodex))
 	}
 
 	// --- OpenCode Zen Free (native/keyless) ---
@@ -645,6 +666,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// base URL and never need a separate `opencode serve` terminal process.
 	for _, m := range upstream.OpenCodeZenFreeModels() {
 		data = append(data, enrichModelMeta(m, store.ProviderOpenCodeZen))
+	}
+	if base.HasOpenCodeGoKey() {
+		for _, m := range openCodeGoModels(base) {
+			data = append(data, enrichModelMeta(m, store.ProviderOpenCodeGo))
+		}
 	}
 
 	// --- Accio ---
@@ -702,9 +728,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			data = append(data, enrichModelMeta(m, store.ProviderOllie))
 		}
 	}
-	if geminiConfigured(base) {
+	if s.getAIStudioBaseURL() != "" || geminiConfigured(base) {
 		for _, id := range gemini.ListModels(r.Context(), base.WithProvider(store.ProviderGemini)) {
-			data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "Vertex AI · ADC", APIMode: "chat"}, store.ProviderGemini))
+			data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "Google AI Studio · local account pool", APIMode: "chat"}, store.ProviderGemini))
 		}
 	}
 
@@ -727,9 +753,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		"route":  "model",
 		"api_policy": map[string]string{
 			"xai":          "responses",
+			"openai_codex": "responses",
 			"kimi_work":    "chat",
 			"deepseek":     "chat",
 			"opencode_zen": "chat",
+			"opencode_go":  "chat",
 		},
 		"note": "Pick model on the client; same baseURL routes Grok vs Kimi automatically.",
 	})
@@ -909,6 +937,57 @@ func deepSeekModels(settings store.Settings) []string {
 	return models
 }
 
+// openCodeGoProbeCache memoizes the OpenCode Go model-list probe so /v1/models
+// never pays more than one short network check per TTL window.
+var openCodeGoProbeCache = struct {
+	sync.Mutex
+	at     time.Time
+	key    string
+	models []upstream.ModelInfo
+}{}
+
+const openCodeGoProbeTTL = 5 * time.Minute
+
+// openCodeGoModels fetches the OpenCode Go model list from the dedicated go
+// gateway (GET zen/go/v1/models with the user key), the same catalog the
+// opencode CLI surfaces.
+// Falls back to the static catalog when the fetch fails or returns nothing,
+// so the namespace never disappears from /v1/models. Cached openCodeGoProbeTTL.
+func openCodeGoModels(settings store.Settings) []upstream.ModelInfo {
+	key := settings.OpenCodeGoAPIKeyPlain()
+	if key == "" {
+		return upstream.OpenCodeGoModels()
+	}
+	cacheKey := "opencode-go|" + key
+	openCodeGoProbeCache.Lock()
+	if openCodeGoProbeCache.key == cacheKey && time.Since(openCodeGoProbeCache.at) < openCodeGoProbeTTL {
+		models := openCodeGoProbeCache.models
+		openCodeGoProbeCache.Unlock()
+		return models
+	}
+	openCodeGoProbeCache.Unlock()
+
+	models := upstream.OpenCodeGoModels()
+	ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Millisecond)
+	defer cancel()
+	if ids, err := upstream.FetchOpenCodeGoModelIDs(ctx, upstreamHTTPClient, key); err == nil && len(ids) > 0 {
+		dynamic := make([]upstream.ModelInfo, 0, len(ids))
+		for _, id := range ids {
+			dynamic = append(dynamic, upstream.ModelInfo{
+				ID: "opencode-go/" + id, Name: id, Description: "OpenCode Go · API key · chat/completions", APIMode: "chat",
+			})
+		}
+		models = dynamic
+	}
+
+	openCodeGoProbeCache.Lock()
+	openCodeGoProbeCache.at = time.Now()
+	openCodeGoProbeCache.key = cacheKey
+	openCodeGoProbeCache.models = models
+	openCodeGoProbeCache.Unlock()
+	return models
+}
+
 // geminiConfigured reports whether Vertex/ADC credentials are plausibly set up
 // (explicit project in settings, or standard Google env vars), so /v1/models
 // can list Gemini models without depending on the global UI provider switch.
@@ -949,6 +1028,14 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 		owner = "OpenCode Zen Free"
 		prov = store.ProviderOpenCodeZen
 		ctxWindow = 131072
+	case store.ProviderOpenCodeGo, "opencode-go":
+		owner = "OpenCode Go"
+		prov = store.ProviderOpenCodeGo
+		ctxWindow = 131072
+	case store.ProviderCodex, "codex", "openai-codex", "chatgpt":
+		owner = "OpenAI"
+		prov = store.ProviderCodex
+		ctxWindow = 272000
 	case store.ProviderAccio, "accio-work", "phoenix":
 		owner = "Accio"
 		prov = store.ProviderAccio
@@ -963,7 +1050,8 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 	default:
 		owner = "xAI"
 		prov = store.ProviderXAI
-		if strings.Contains(strings.ToLower(m.ID), "4.5") {
+		id := strings.ToLower(m.ID)
+		if strings.Contains(id, "4.5") || strings.Contains(id, "4.6") {
 			ctxWindow = 500000
 		}
 	}
@@ -979,6 +1067,13 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 			apiMode = "chat"
 		}
 	}
+	apiBackend := "chat_completions"
+	switch strings.ToLower(strings.TrimSpace(apiMode)) {
+	case "responses":
+		apiBackend = "responses"
+	case "messages":
+		apiBackend = "messages"
+	}
 	out := map[string]any{
 		"id":                       m.ID,
 		"object":                   "model",
@@ -988,6 +1083,8 @@ func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 		"name":                     firstNonEmpty(m.Name, m.ID),
 		"description":              desc,
 		"api_mode":                 apiMode,
+		"api_backend":              apiBackend,
+		"supported_in_api":         true,
 		"root":                     m.Root,
 		"context_window":           firstPositiveInt64(m.ContextWindow, int64(ctxWindow)),
 		"context_length":           firstPositiveInt64(m.ContextWindow, int64(ctxWindow)),
@@ -1009,6 +1106,65 @@ func firstPositiveInt64(value, fallback int64) int64 {
 		return value
 	}
 	return fallback
+}
+
+func clientSetReasoningEffort(body map[string]any) bool {
+	if body == nil {
+		return false
+	}
+	if effort, _ := body["reasoning_effort"].(string); strings.TrimSpace(effort) != "" {
+		return true
+	}
+	if effort, _ := body["reasoningEffort"].(string); strings.TrimSpace(effort) != "" {
+		return true
+	}
+	if reasoning, _ := body["reasoning"].(map[string]any); reasoning != nil {
+		if effort, _ := reasoning["effort"].(string); strings.TrimSpace(effort) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// applyAccioDefaultReasoningEffort injects the strongest effort advertised by
+// the matched Accio model only when the external client omitted an effort.
+// Catalog effort lists are ordered from lowest to highest.
+func applyAccioDefaultReasoningEffort(body map[string]any, modelValue any, models []accio.Model) bool {
+	if clientSetReasoningEffort(body) {
+		return false
+	}
+	modelID, _ := modelValue.(string)
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return false
+	}
+	for _, model := range models {
+		if model.ID != modelID && strings.TrimPrefix(model.ID, "accio/") != strings.TrimPrefix(modelID, "accio/") {
+			continue
+		}
+		for i := len(model.ReasoningEfforts) - 1; i >= 0; i-- {
+			if effort := strings.TrimSpace(model.ReasoningEfforts[i]); effort != "" {
+				body["reasoning_effort"] = effort
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// defaultAccioReasoningEffort loads the per-account Accio catalog and applies
+// its highest supported effort. If the catalog is unavailable, preserve the
+// prior behavior and let the gateway choose its own default.
+func defaultAccioReasoningEffort(ctx context.Context, client *accio.Client, modelValue any, body map[string]any) {
+	if clientSetReasoningEffort(body) {
+		return
+	}
+	models, err := client.Models(ctx)
+	if err != nil {
+		return
+	}
+	applyAccioDefaultReasoningEffort(body, modelValue, models)
 }
 
 func validateAccioReasoning(ctx context.Context, client *accio.Client, modelValue any, body map[string]any) error {
@@ -1104,6 +1260,33 @@ func injectTemporalIntoMessages(msgs []any) []any {
 
 }
 
+// injectManagedSystemPromptIntoMessages prepends the proxy-managed prompt as a
+// regular OpenAI system message. The caller owns the prompt lookup; this helper
+// only shapes an already-authorized local setting for the selected request.
+func injectManagedSystemPromptIntoMessages(msgs []any, prompt string) []any {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return msgs
+	}
+	sys := map[string]any{"role": "system", "content": prompt}
+	return append([]any{sys}, msgs...)
+}
+
+// injectManagedSystemPromptIntoResponses appends the local prompt to Responses
+// instructions without replacing client-provided instructions.
+func injectManagedSystemPromptIntoResponses(body map[string]any, prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	current := strings.TrimSpace(contentToString(body["instructions"]))
+	if current == "" {
+		body["instructions"] = prompt
+		return
+	}
+	body["instructions"] = prompt + "\n\n" + current
+}
+
 func contentToString(c any) string {
 
 	switch t := c.(type) {
@@ -1174,7 +1357,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	stream := false
 	clientPath := path // original path before any rewrite
 	codexClient := isCodexRequest(r)
-	_ = codexClient
 
 	var m map[string]any
 	reqModel := ""
@@ -1191,6 +1373,9 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	// accio/* → Accio, grok-* → xAI, k3-agent/kimi-* → Kimi, qwen* → QwenBridge, empty/alias/unknown → xAI.
 	baseSettings := s.store.Settings()
 	routeSettings := baseSettings.WithProviderForModel(reqModel)
+	if codexClient && store.IsBareCodexModel(reqModel) {
+		routeSettings = baseSettings.WithProvider(store.ProviderCodex)
+	}
 	routeProv := routeSettings.NormalizedProvider()
 	if message := store.ProviderAvailabilityMessage(routeProv); message != "" && store.ProviderAvailabilityBlocksRequests(routeProv) {
 		typ := "provider_disabled"
@@ -1231,6 +1416,10 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	reqLog.Info("proxy.request.start", "model", reqModel, "resolved_model", resolvedModel, "account_id", accountID)
 	// ensure may return store settings; force route from client model again.
 	settings = routeSettings
+	if settings.IsCodex() && acc != nil {
+		settings.CodexAccountID = acc.TeamID
+		settings.CodexFedRAMP = strings.Contains(acc.Source, "fedramp")
+	}
 	var clientStatus int
 	if routeProv == store.ProviderAccio {
 		client := s.accioClient()
@@ -1247,6 +1436,14 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			m = map[string]any{}
 		}
 		m["model"] = settings.ResolveModelForClient(reqModel)
+		resolvedAccioModel, _ := m["model"].(string)
+		if msgs, ok := m["messages"].([]any); ok {
+			m["messages"] = injectManagedSystemPromptIntoMessages(msgs, settings.SystemPromptFor(routeProv, resolvedAccioModel))
+		}
+		// External clients own an explicit effort. When they omit it, use the
+		// highest level advertised by this Accio model instead of the desktop UI
+		// setting or a generic hard-coded value.
+		defaultAccioReasoningEffort(r.Context(), client, m["model"], m)
 		if err := validateAccioReasoning(r.Context(), client, m["model"], m); err != nil {
 			clientStatus = http.StatusBadRequest
 			http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error"}}`, err.Error()), clientStatus)
@@ -1312,6 +1509,12 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	} else if routeProv == store.ProviderOpenCodeZen {
 		settings.UpstreamBase = store.OpenCodeZenUpstream
 		settings.APIMode = "chat"
+	} else if routeProv == store.ProviderOpenCodeGo {
+		settings.UpstreamBase = store.OpenCodeGoUpstream
+		settings.APIMode = "chat"
+	} else if routeProv == store.ProviderCodex {
+		settings.UpstreamBase = store.CodexUpstream
+		settings.APIMode = "responses"
 	} else if routeProv == store.ProviderXAI {
 		settings.UpstreamBase = store.DefaultUpstream
 		// Client often uses /chat/completions; xAI wire still goes /responses.
@@ -1351,8 +1554,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			delete(m, "last_response_id")
 		}
 
-		// Kimi / Ollie / Gemini / Qwen / DeepSeek: /responses → chat/completions
-		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen()) && path == "/responses" {
+		// Kimi / Ollie / Gemini / Qwen / DeepSeek / OpenCode: /responses → chat/completions
+		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo()) && path == "/responses" {
 			path = "/chat/completions"
 			wantClientChat = true
 			wantClientResponses = false
@@ -1368,7 +1571,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		}
 
 		// Grok default path: client chat/completions → xAI /responses (response translated back later)
-		if settings.IsXAI() && path == "/chat/completions" {
+		if (settings.IsXAI() || settings.IsCodex()) && path == "/chat/completions" {
 			path = "/responses"
 			m = chatCompletionsBodyToResponses(m, settings)
 			if mid, ok := m["model"].(string); ok && mid != "" {
@@ -1380,6 +1583,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			if msgs, ok := m["messages"].([]any); ok {
 
+				msgs = injectManagedSystemPromptIntoMessages(msgs, settings.SystemPromptFor(routeProv, resolvedModel))
 				m["messages"] = injectTemporalIntoMessages(msgs)
 
 			}
@@ -1433,17 +1637,37 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 				delete(m, "previous_response_id")
 
-				delete(m, "stream_options")
-
-				delete(m, "tools")
-
-				delete(m, "tool_choice")
+				// Proxy Plus understands OpenAI tools, tool_choice, and stream
+				// usage options natively. Keep them intact for AI Studio.
 
 			}
 
 		}
 
 		if path == "/responses" {
+			injectManagedSystemPromptIntoResponses(m, settings.SystemPromptFor(routeProv, resolvedModel))
+			if settings.IsCodex() {
+				// The subscription-backed Codex endpoint is stateless and mirrors the
+				// official CLI request contract.
+				m["store"] = false
+				m["stream"] = true
+				delete(m, "previous_response_id")
+				delete(m, "temperature")
+				delete(m, "top_p")
+				if input, ok := m["input"]; ok {
+					m["input"] = normalizeCodexResponsesInput(input)
+				}
+				ensureResponsesInclude(m, "reasoning.encrypted_content")
+				if _, ok := m["instructions"]; !ok {
+					m["instructions"] = ""
+				}
+				if reasoning, ok := m["reasoning"].(map[string]any); ok {
+					reasoning["effort"] = normalizeCodexReasoningEffort(asString(reasoning["effort"]))
+				}
+				if effort, ok := m["reasoning_effort"].(string); ok {
+					m["reasoning_effort"] = normalizeCodexReasoningEffort(effort)
+				}
+			}
 
 			if settings.StoreResponses {
 
@@ -1466,17 +1690,33 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 				}
 
 			}
+			if settings.IsCodex() {
+				if reasoning, ok := m["reasoning"].(map[string]any); ok && strings.HasPrefix(strings.ToLower(resolvedModel), "gpt-5.6-") {
+					reasoning["context"] = "all_turns"
+				}
+				delete(m, "reasoning_effort")
+				if strings.HasPrefix(strings.ToLower(resolvedModel), "gpt-5.6-") {
+					m["parallel_tool_calls"] = false
+				}
+			}
 
-			// CRITICAL: sanitize tools (fixes OpenCode 422 unknown variant `namespace`)
-
-			if raw, ok := m["tools"]; ok {
-
-				m["tools"] = sanitizeResponsesTools(raw)
-
+			// Sanitize tools (fixes OpenCode 422 unknown variant `namespace`).
+			// When the client already sent function tools (OpenCode/Kilo), keep
+			// only those — do not inject web_search/x_search or the model
+			// spends the turn on server-side search instead of calling bash.
+			if raw, ok := m["tools"]; ok && !settings.IsCodex() {
+				tools := sanitizeResponsesTools(raw)
+				if settings.IsXAI() && !hasFunctionTool(tools) {
+					tools = withNativeSearch(tools)
+				}
+				if len(tools) == 0 {
+					delete(m, "tools")
+					delete(m, "tool_choice")
+				} else {
+					m["tools"] = tools
+				}
 			} else if settings.IsXAI() {
-
 				m["tools"] = nativeSearchTools()
-
 			}
 
 			if _, ok := m["tool_choice"]; !ok {
@@ -1491,15 +1731,26 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			// CRITICAL: sanitize input (fixes Codex 422 untagged enum ModelInput)
 
-			if raw, ok := m["input"]; ok {
+			if raw, ok := m["input"]; ok && !settings.IsCodex() {
 
 				m["input"] = sanitizeResponsesInput(raw)
 
 			}
 
-			if input, ok := m["input"].([]any); ok {
+			if input, ok := m["input"].([]any); ok && !settings.IsCodex() {
 
 				m["input"] = injectTemporalIntoResponsesInput(input)
+
+			}
+
+			// xAI wire contract: a continuation request carrying both
+			// instructions and previous_response_id is rejected with 400
+			// ("Argument not supported"). On resume the stored conversation
+			// already holds the instructions — keep previous_response_id and
+			// drop instructions.
+			if settings.IsXAI() && asString(m["previous_response_id"]) != "" {
+
+				delete(m, "instructions")
 
 			}
 
@@ -1594,6 +1845,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	}
 
 	authRetried := false
+	codexRefreshTransient := false
+	openCodeThinkingRetried := false
 
 	// rotateCreds adopts credentials from a retry ensure/forceRefresh.
 	// Settings stay pinned to routeSettings; only token/acc swap. Returns false
@@ -1614,6 +1867,10 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		}
 		if acc2 != nil {
 			store.TrackInflight(ctx, acc2.ID)
+			if settings.IsCodex() {
+				settings.CodexAccountID = acc2.TeamID
+				settings.CodexFedRAMP = strings.Contains(acc2.Source, "fedramp")
+			}
 		}
 		token, acc = tok2, acc2
 		if acc2 != nil {
@@ -1625,6 +1882,9 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 
 		url := strings.TrimRight(settings.EffectiveUpstream(), "/") + path
+		if settings.IsOpenCodeGo() {
+			url = strings.TrimRight(store.OpenCodeGoGateway, "/") + path
+		}
 
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
 
@@ -1638,7 +1898,9 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 		setUpstreamAuthHeaders(req, token, settings)
 
-		if v := r.Header.Get("Accept"); v != "" {
+		if settings.IsCodex() {
+			req.Header.Set("Accept", "text/event-stream")
+		} else if v := r.Header.Get("Accept"); v != "" {
 
 			req.Header.Set("Accept", v)
 
@@ -1697,6 +1959,21 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			reason := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(errBody))
 			log.Printf("[AUDIT] upstream error raw: status=%d body=%q", resp.StatusCode, string(errBody))
 
+			// OpenCode Go requires historical reasoning_content when thinking is
+			// enabled. Some OpenAI-compatible clients retain the assistant text but
+			// omit that internal field on a follow-up. It cannot be reconstructed,
+			// so retry once with thinking disabled while preserving the conversation.
+			if settings.IsOpenCodeGo() && !openCodeThinkingRetried && openCodeRequiresReasoningHistory(errBody) && m != nil {
+				if _, configured := m["reasoning_effort"]; configured {
+					delete(m, "reasoning_effort")
+					delete(m, "reasoning")
+					body, _ = json.Marshal(m)
+					openCodeThinkingRetried = true
+					reqLog.Warn("proxy.opencode_go.thinking_disabled", "reason", "missing_reasoning_history")
+					continue
+				}
+			}
+
 			if settings.IsOpenCodeZen() && !warpTried && s.warp != nil && s.warp.Enabled() && warp.ShouldFailover(resp.StatusCode, errBody) {
 				warpTried = true
 				reqLog.Warn("proxy.warp.failover.trigger", "reason", "upstream", "status", resp.StatusCode)
@@ -1706,18 +1983,6 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 					continue
 				}
 				reqLog.Warn("proxy.warp.failover.activation_failed", "status", resp.StatusCode)
-			}
-
-			// Kimi global capacity — fail fast, no account rotate / re-mint spam.
-
-			if settings.IsKimiWork() && isKimiCapacityBusy(resp.StatusCode, errBody) {
-
-				reqLog.Warn("proxy.kimi.capacity_busy", "detail", truncateForLog(string(errBody), 200))
-
-				writeKimiCapacityError(w, errBody)
-
-				return
-
 			}
 
 			// Quota first (Kimi billing 403 must not be treated as auth-denied).
@@ -1767,6 +2032,9 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 						authRetried = true
 						if fr := s.forceRefreshFn(); fr != nil {
 							tok2, acc2, _, err2 := fr(ctx, accountID)
+							if settings.IsCodex() && err2 != nil && !codexauth.IsInvalidGrant(err2) {
+								codexRefreshTransient = true
+							}
 							if err2 == nil && tok2 != "" && tok2 != token {
 								if !rotateCreds(tok2, acc2) {
 									writeCrossProviderError(w, routeProv, acc2)
@@ -1788,8 +2056,11 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 						}
 					}
 
-					// Mark auth-denied and rotate to another account.
-					if fn := s.authFailHandler(); fn != nil {
+					// A transient token-endpoint failure must not permanently poison a
+					// rotating Codex session. Return the original upstream auth error.
+					if codexRefreshTransient {
+						reqLog.Warn("codex.refresh.transient", "account_id", accountID)
+					} else if fn := s.authFailHandler(); fn != nil {
 						if rotated := fn(accountID, reason); rotated {
 							tok2, acc2, _, err2 := s.ensure(ctx)
 							if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
@@ -1854,7 +2125,39 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		// fed to the SSE pipe (it would silently discard the whole answer).
 		// Only assume SSE when the provider omitted Content-Type entirely; a
 		// declared application/json response is a normal non-stream fallback.
-		isSSE := strings.Contains(ct, "text/event-stream") || (stream && ct == "")
+		isSSE := strings.Contains(ct, "text/event-stream") || ((stream || settings.IsCodex()) && ct == "")
+
+		// Codex always returns SSE. Aggregate the terminal response object when
+		// the downstream OpenAI client requested a regular JSON response.
+		if settings.IsCodex() && isSSE && !stream {
+			raw, err := completedResponseFromSSE(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				clientStatus = http.StatusBadGateway
+				writeOpenAIError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			accountID := ""
+			if acc != nil {
+				accountID = acc.ID
+			}
+			s.recordUsageFromJSONBody(raw, accountID, routeProv, resolvedModel, time.Since(startedAt).Milliseconds())
+			w.Header().Set("Content-Type", "application/json")
+			if wantClientChat && !wantClientResponses {
+				out, convErr := responsesJSONToChatCompletion(raw, resolvedModel)
+				if convErr != nil {
+					clientStatus = http.StatusBadGateway
+					writeOpenAIError(w, http.StatusBadGateway, convErr.Error())
+					return
+				}
+				clientStatus = http.StatusOK
+				_ = json.NewEncoder(w).Encode(out)
+				return
+			}
+			clientStatus = http.StatusOK
+			_, _ = w.Write(raw)
+			return
+		}
 
 		// Ollie/Gemini: client asked for Responses but we hit chat/completions — translate wire format.
 		if settings.IsOllie() && clientPath == "/responses" {
@@ -1950,7 +2253,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		}
 
 		// Grok default: client used /chat/completions, upstream was /responses → translate back to chat.
-		if settings.IsXAI() && wantClientChat && !wantClientResponses {
+		if (settings.IsXAI() || settings.IsCodex()) && wantClientChat && !wantClientResponses {
 			accountID := ""
 			if acc != nil {
 				accountID = acc.ID
@@ -2083,6 +2386,36 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	}
 
+}
+
+// normalizeCodexReasoningEffort translates client UI labels to the Codex
+// Responses API vocabulary. ZCode exposes "Extra high" as xhigh, while Codex
+// accepts max for that tier (and uses the same value for legacy ultra).
+func normalizeCodexReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "xhigh", "extra_high", "extra-high", "ultra":
+		return "max"
+	default:
+		return effort
+	}
+}
+
+// normalizeCodexResponsesInput handles clients that send the valid generic
+// Responses shorthand `input: "..."`. The ChatGPT Codex upstream accepts only
+// typed input-item lists, so turn that shorthand into its equivalent message.
+func normalizeCodexResponsesInput(input any) any {
+	text, ok := input.(string)
+	if !ok {
+		return input
+	}
+	return []any{map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{map[string]any{
+			"type": "input_text",
+			"text": text,
+		}},
+	}}
 }
 
 // sanitizeKimiWorkChatBody rewrites HTTP chat bodies for agent-gw:
@@ -2327,6 +2660,11 @@ func isQuotaStatus(code int, body []byte) bool {
 	}
 
 	low := strings.ToLower(string(body))
+	// Kimi capacity is handled through the same account lifecycle as quota:
+	// remote logoff, pool rotation, and automatic re-login.
+	if strings.Contains(low, "too many people are chatting with kimi") {
+		result = true
+	}
 
 	if !result && (strings.Contains(low, "usage balance exhausted") || strings.Contains(low, "balance exhausted") || strings.Contains(low, "credit exhausted") || strings.Contains(low, "no remaining quota") || strings.Contains(low, "diamond") && strings.Contains(low, "insufficient")) {
 		result = true
@@ -2379,7 +2717,8 @@ func isQuotaErrorPayload(payload map[string]any) (bool, string) {
 		return false, ""
 	}
 	low := strings.ToLower(msg)
-	if strings.Contains(low, "usage limit") ||
+	if strings.Contains(low, "too many people are chatting with kimi") ||
+		strings.Contains(low, "usage limit") ||
 		strings.Contains(low, "billing cycle") ||
 		strings.Contains(low, "resource_exhausted") ||
 		strings.Contains(low, "access_terminated") ||
@@ -2436,6 +2775,12 @@ func isAuthStatus(code int, body []byte) bool {
 
 	return false
 
+}
+
+func openCodeRequiresReasoningHistory(body []byte) bool {
+	message := strings.ToLower(string(body))
+	return strings.Contains(message, "reasoning_content") &&
+		(strings.Contains(message, "must be passed back") || strings.Contains(message, "thinking mode"))
 }
 
 // isCrossProviderAuthMismatch reports that an auth error is almost certainly from
@@ -2522,12 +2867,28 @@ func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Sett
 
 	}
 
+	if token == "" && settings.IsOpenCodeGo() {
+
+		token = settings.OpenCodeGoAPIKeyPlain()
+
+	}
+
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	req.Header.Set("Content-Type", "application/json")
+	if settings.IsCodex() {
+		req.Header.Set("ChatGPT-Account-ID", settings.CodexAccountID)
+		req.Header.Set("originator", "codex_cli_rs")
+		req.Header.Set("version", store.CodexClientVersion)
+		req.Header.Set("User-Agent", "codex_cli_rs/"+store.CodexClientVersion)
+		if settings.CodexFedRAMP {
+			req.Header.Set("X-OpenAI-Fedramp", "true")
+		}
+		return
+	}
 
 	// QwenBridge / DeepSeek: Authorization + Content-Type only — no provider-specific headers.
-	if settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() {
+	if settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo() {
 
 		return
 
@@ -2554,11 +2915,9 @@ func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Sett
 	}
 
 	req.Header.Set("x-grok-client-version", version)
-
-	req.Header.Set("x-grok-client-surface", "grok-cli")
-
+	req.Header.Set("x-grok-client-identifier", store.DefaultClientIdentifier)
+	req.Header.Set("x-grok-client-surface", store.DefaultClientSurface)
 	req.Header.Set("User-Agent", "grok/"+version)
-
 }
 
 // chatCompletionsBodyToResponses converts OpenAI chat/completions body into /v1/responses
@@ -2587,7 +2946,6 @@ func chatCompletionsBodyToResponses(m map[string]any, settings store.Settings) m
 	// Client-provided effort only — no global settings fallback on HTTP path.
 	if v, ok := m["reasoning_effort"].(string); ok && strings.TrimSpace(v) != "" {
 		out["reasoning"] = map[string]any{"effort": v, "summary": "auto"}
-		out["reasoning_effort"] = v
 	}
 	// tools: chat function tools → responses tools when possible
 	if tools, ok := m["tools"]; ok {
@@ -2636,6 +2994,15 @@ func chatCompletionsBodyToResponses(m map[string]any, settings store.Settings) m
 				}
 				input = append(input, item)
 				continue
+			}
+			if role == "assistant" {
+				if reasoningItems, ok := msg["reasoning_items"].([]any); ok {
+					for _, rawItem := range reasoningItems {
+						if item, ok := rawItem.(map[string]any); ok && asString(item["type"]) == "reasoning" && asString(item["encrypted_content"]) != "" {
+							input = append(input, item)
+						}
+					}
+				}
 			}
 			// assistant with tool_calls
 			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
@@ -3414,7 +3781,7 @@ func chatCompletionJSONToResponse(raw []byte, model string) (map[string]any, err
 		"output": output,
 	}
 	if u, ok := in["usage"]; ok {
-		out["usage"] = u
+		out["usage"] = normalizeUsageToResponses(u)
 	}
 	return out, nil
 }
@@ -3442,6 +3809,9 @@ func responsesJSONToChatCompletion(raw []byte, model string) (map[string]any, er
 	}
 	msg := map[string]any{
 		"role": "assistant",
+	}
+	if reasoningItems := responsesReasoningItems(in); len(reasoningItems) > 0 {
+		msg["reasoning_items"] = reasoningItems
 	}
 	finish := "stop"
 	if len(toolCalls) > 0 {
@@ -3642,8 +4012,20 @@ func pipeResponsesSSEToChat(ctx context.Context, w http.ResponseWriter, body io.
 
 	toolIndexByKey := map[string]int{}
 	argDeltaSeen := map[string]bool{}
+	seenReasoning := map[string]bool{}
 	nextToolIdx := 0
 	sawToolCall := false
+	emitReasoning := func(item map[string]any) {
+		if asString(item["type"]) != "reasoning" || asString(item["encrypted_content"]) == "" {
+			return
+		}
+		key := firstNonEmpty(asString(item["id"]), asString(item["encrypted_content"]))
+		if seenReasoning[key] {
+			return
+		}
+		seenReasoning[key] = true
+		writeChatDelta(map[string]any{"reasoning_items": []any{item}}, nil)
+	}
 
 	resolveToolIdx := func(keys ...string) (int, bool) {
 		for _, k := range keys {
@@ -3839,6 +4221,7 @@ func pipeResponsesSSEToChat(ctx context.Context, w http.ResponseWriter, body io.
 			}
 		case "response.output_item.done":
 			if item, ok := ev["item"].(map[string]any); ok {
+				emitReasoning(item)
 				emitToolCallStart(item, true)
 			}
 		case "response.function_call_arguments.delta":
@@ -3857,6 +4240,11 @@ func pipeResponsesSSEToChat(ctx context.Context, w http.ResponseWriter, body io.
 			emitToolArgsDelta(itemID, callID, args)
 		case "response.completed", "response.done":
 			if resp, ok := ev["response"].(map[string]any); ok {
+				for _, rawReasoning := range responsesReasoningItems(resp) {
+					if item, ok := rawReasoning.(map[string]any); ok {
+						emitReasoning(item)
+					}
+				}
 				for _, raw := range extractResponsesFunctionCalls(resp) {
 					if tcm, ok := raw.(map[string]any); ok {
 						fn, _ := tcm["function"].(map[string]any)

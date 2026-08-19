@@ -81,11 +81,36 @@ func TestHandleModelsUnifiedCatalog(t *testing.T) {
 	for _, m := range out.Data {
 		seen[m.ID] = m.Provider
 	}
-	if seen["grok-4.5"] != store.ProviderXAI {
-		t.Fatalf("missing grok-4.5: %#v", seen)
+	if seen["grok-4.6"] != store.ProviderXAI {
+		t.Fatalf("missing grok-4.6: %#v", seen)
 	}
 	if seen["k3-agent"] != store.ProviderKimiWork {
 		t.Fatalf("missing k3-agent: %#v", seen)
+	}
+}
+
+func TestHandleModelsListsOpenCodeGoWhenKeyConfigured(t *testing.T) {
+	isolateHome(t)
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.UpdateSettings(func(s *store.Settings) { s.OpenCodeGoAPIKey = "dpapi:test" }); err != nil {
+		t.Fatal(err)
+	}
+	ensure := func(ctx context.Context) (string, *store.Account, store.Settings, error) {
+		return "", nil, st.Settings(), context.Canceled
+	}
+	s := New(st, upstream.New(), ensure)
+	rr := httptest.NewRecorder()
+	s.handleModels(rr, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	if got := decodeModels(t, rr)["opencode-go/deepseek-v4-flash"]; got != store.ProviderOpenCodeGo {
+		t.Fatalf("OpenCode Go catalog missing, provider=%q", got)
 	}
 }
 
@@ -127,7 +152,7 @@ func TestHandleModelsListsOllieRegardlessOfUIProvider(t *testing.T) {
 	if seen["claude-sonnet-5"] != store.ProviderOllie {
 		t.Fatalf("ollie catalog missing with UI provider=kimi_work: %#v", seen)
 	}
-	if seen["grok-4.5"] != store.ProviderXAI || seen["k3-agent"] != store.ProviderKimiWork {
+	if seen["grok-4.6"] != store.ProviderXAI || seen["k3-agent"] != store.ProviderKimiWork {
 		t.Fatalf("static catalog incomplete: %#v", seen)
 	}
 }
@@ -160,7 +185,7 @@ func TestHandleModelsSkipsUnreachableOllie(t *testing.T) {
 	if _, ok := seen["claude-sonnet-5"]; ok {
 		t.Fatalf("unreachable ollie must be omitted: %#v", seen)
 	}
-	if seen["grok-4.5"] != store.ProviderXAI {
+	if seen["grok-4.6"] != store.ProviderXAI {
 		t.Fatalf("static catalog incomplete: %#v", seen)
 	}
 }

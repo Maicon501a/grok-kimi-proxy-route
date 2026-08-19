@@ -243,7 +243,7 @@ func TestHandleModelsQwenUnreachable(t *testing.T) {
 			t.Fatalf("unreachable bridge must be omitted, found %s: %#v", id, seen)
 		}
 	}
-	if seen["grok-4.5"] != store.ProviderXAI {
+	if seen["grok-4.6"] != store.ProviderXAI {
 		t.Fatalf("static catalog incomplete: %#v", seen)
 	}
 }

@@ -46,6 +46,25 @@ func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWrite
 			flusher.Flush()
 		}
 	}
+	writeFailure := func(message, code string) {
+		writeEvent("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id":     respID,
+				"object": "response",
+				"status": "failed",
+				"error": map[string]any{
+					"message": message,
+					"type":    "upstream_error",
+					"code":    code,
+				},
+			},
+		})
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 
 	writeEvent("response.created", map[string]any{
 		"type": "response.created",
@@ -71,6 +90,7 @@ func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWrite
 	var lastUsage any
 	var sawContent bool
 	var sawToolCall bool
+	var sawReasoning bool
 
 	sc := bufio.NewScanner(newContextReader(ctx, body))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -92,24 +112,15 @@ func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWrite
 
 		// Detect mid-stream quota error (upstream sends 200 then an error payload).
 		if isQuota, qmsg := isQuotaPayload(chunk); isQuota {
-			writeEvent("response.failed", map[string]any{
-				"type": "response.failed",
-				"response": map[string]any{
-					"id":     respID,
-					"object": "response",
-					"status": "failed",
-					"error": map[string]any{
-						"message": qmsg,
-						"type":    "upstream_error",
-						"code":    "quota_exhausted",
-					},
-				},
-			})
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			if flusher != nil {
-				flusher.Flush()
-			}
+			writeFailure(qmsg, "quota_exhausted")
 			return fmt.Errorf("sse quota error: %s", qmsg)
+		}
+		// Do not turn an upstream error into a successful but empty Responses
+		// completion. Clients such as Zed otherwise report only
+		// "empty_model_response" and lose Kimi's actual error text.
+		if msg := sseErrorPayloadMessage(chunk); msg != "" {
+			writeFailure(msg, "upstream_error")
+			return fmt.Errorf("sse upstream error: %s", msg)
 		}
 
 		choices, _ := chunk["choices"].([]any)
@@ -129,6 +140,7 @@ func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWrite
 
 		// 1. Reasoning (K3 xHigh emits this heavily)
 		if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+			sawReasoning = true
 			writeEvent("response.reasoning_text.delta", map[string]any{
 				"type":  "response.reasoning_text.delta",
 				"delta": rc,
@@ -240,6 +252,15 @@ func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWrite
 		})
 	}
 
+	if !sawContent && !sawToolCall {
+		msg := "Kimi upstream ended without assistant content, tool calls, or an error payload."
+		if sawReasoning {
+			msg = "Kimi upstream sent reasoning but no final assistant content."
+		}
+		writeFailure(msg, "empty_upstream_response")
+		return fmt.Errorf("sse empty response: %s", msg)
+	}
+
 	// Build output array for completed event.
 	var output []any
 	if sawContent {
@@ -294,6 +315,29 @@ func pipeKimiChatSSEToResponsesContext(ctx context.Context, w http.ResponseWrite
 	}
 
 	return sc.Err()
+}
+
+// sseErrorPayloadMessage extracts an upstream SSE error message even when it
+// is not a quota issue. The caller forwards it as response.failed verbatim.
+func sseErrorPayloadMessage(payload map[string]any) string {
+	raw, exists := payload["error"]
+	if !exists {
+		return ""
+	}
+	if msg, ok := raw.(string); ok {
+		return strings.TrimSpace(msg)
+	}
+	errObj, ok := raw.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if msg, ok := errObj["message"].(string); ok && strings.TrimSpace(msg) != "" {
+		return strings.TrimSpace(msg)
+	}
+	if msg, ok := payload["message"].(string); ok {
+		return strings.TrimSpace(msg)
+	}
+	return ""
 }
 
 // normalizeUsageToResponses adapts chat.usage into Responses-style usage numbers.

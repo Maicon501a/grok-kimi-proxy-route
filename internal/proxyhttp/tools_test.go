@@ -15,7 +15,7 @@ func TestSanitizeResponsesTools_DropsNamespace(t *testing.T) {
 					"function": map[string]any{
 						"name":        "read_file",
 						"description": "read a file",
-						"parameters":   map[string]any{"type": "object"},
+						"parameters":  map[string]any{"type": "object"},
 					},
 				},
 			},
@@ -45,11 +45,31 @@ func TestSanitizeResponsesTools_DropsNamespace(t *testing.T) {
 			}
 		}
 	}
-	if !hasWeb || !hasX {
-		t.Fatalf("missing native search tools: %s", s)
+	if hasWeb || hasX {
+		t.Fatalf("native search must not be injected when the client sent function tools: %s", s)
 	}
 	if !hasRead || !hasBash {
 		t.Fatalf("missing function tools: %s", s)
+	}
+}
+
+func TestSanitizeResponsesTools_EmptyKeepsNoSearch(t *testing.T) {
+	out := sanitizeResponsesTools([]any{})
+	if len(out) != 0 {
+		t.Fatalf("empty tools should stay empty, got %#v", out)
+	}
+}
+
+func TestWithNativeSearch_OnlyWhenNoFunctions(t *testing.T) {
+	fns := sanitizeResponsesTools([]any{
+		map[string]any{"type": "function", "name": "bash", "parameters": map[string]any{"type": "object"}},
+	})
+	if hasFunctionTool(fns) && len(withNativeSearch(fns)) < 3 {
+		t.Fatal("withNativeSearch should still append search when asked")
+	}
+	plain := withNativeSearch(nil)
+	if len(plain) != 2 {
+		t.Fatalf("expected web+x search, got %#v", plain)
 	}
 }
 

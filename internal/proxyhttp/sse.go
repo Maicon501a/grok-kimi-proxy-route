@@ -87,7 +87,8 @@ func isQuotaPayload(payload map[string]any) (bool, string) {
 		return false, ""
 	}
 	low := strings.ToLower(msg)
-	if strings.Contains(low, "usage limit") ||
+	if strings.Contains(low, "too many people are chatting with kimi") ||
+		strings.Contains(low, "usage limit") ||
 		strings.Contains(low, "billing cycle") ||
 		strings.Contains(low, "resource_exhausted") ||
 		strings.Contains(low, "access_terminated") ||

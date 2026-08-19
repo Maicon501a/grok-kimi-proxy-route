@@ -8,35 +8,28 @@ import (
 	"grok-desktop/internal/store"
 )
 
-// isCodexRequest detects OpenAI Codex CLI / Codex VS Code clients.
-// Detection only — model is still whatever the client sent (no global force).
+// isCodexRequest detects first-party OpenAI Codex clients. Keep this narrow:
+// it is used only to disambiguate bare OpenAI model ids for subscription auth.
 func isCodexRequest(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	checks := []string{
-		r.Header.Get("User-Agent"),
-		r.Header.Get("user-agent"),
-		r.Header.Get("Originator"),
-		r.Header.Get("originator"),
-		r.Header.Get("X-Client-Name"),
-		r.Header.Get("x-client-name"),
-		r.Header.Get("X-Title"),
-		r.Header.Get("x-title"),
-		r.Header.Get("OpenAI-Project"),
-		r.Header.Get("openai-project"),
-	}
-	for _, h := range checks {
-		low := strings.ToLower(h)
-		if strings.Contains(low, "codex") {
-			return true
-		}
-	}
-	// Some builds send a dedicated header.
-	if v := strings.TrimSpace(r.Header.Get("X-Codex")); v != "" && v != "0" && !strings.EqualFold(v, "false") {
+	originator := strings.ToLower(strings.TrimSpace(r.Header.Get("Originator")))
+	switch originator {
+	case "codex_cli_rs", "codex_vscode", "codex_app_server", "codex-tui", "codex_exec":
 		return true
 	}
-	return false
+	clientName := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Client-Name")))
+	switch clientName {
+	case "codex_cli_rs", "codex_vscode", "codex_app_server", "codex-tui", "codex_exec":
+		return true
+	}
+	userAgent := strings.ToLower(strings.TrimSpace(r.Header.Get("User-Agent")))
+	return strings.HasPrefix(userAgent, "codex_cli_rs/") ||
+		strings.HasPrefix(userAgent, "openai-codex/") ||
+		strings.HasPrefix(userAgent, "codex/") ||
+		strings.HasPrefix(userAgent, "codex-tui/") ||
+		strings.HasPrefix(userAgent, "codex_exec/")
 }
 
 // tokenAccountForSettings returns credentials for the request-scoped provider
@@ -65,6 +58,12 @@ func tokenAccountForSettings(
 			AccessToken: key,
 			APIKey:      key,
 		}
+	case settings.IsOpenCodeGo():
+		key := settings.OpenCodeGoAPIKeyPlain()
+		return key, &store.Account{
+			ID: "opencode-go", Provider: store.ProviderOpenCodeGo, Label: "OpenCode Go",
+			Email: settings.EffectiveUpstream(), AccessToken: key, APIKey: key,
+		}
 	case settings.IsOllie():
 		return store.OllieAPIKey, &store.Account{
 			ID: "ollie", Label: "OllieChat", Email: "keyless@olliechat",
@@ -86,6 +85,16 @@ func tokenAccountForSettings(
 				if t := a.BearerToken(); t != "" {
 					return t, a
 				}
+			}
+		}
+		return token, acc
+	case settings.IsCodex():
+		if acc != nil && acc.NormalizedProvider() == store.ProviderCodex && acc.Usable() && token != "" {
+			return token, acc
+		}
+		if s != nil && s.store != nil {
+			if a, ok := s.store.PreferUsableAccountForProvider(store.ProviderCodex); ok && a != nil && a.AccessToken != "" {
+				return a.AccessToken, a
 			}
 		}
 		return token, acc

@@ -19,7 +19,7 @@ import (
 //	POST /v1/search
 //	{
 //	  "query": "what is grok 4.5",
-//	  "model": "grok-4.5",           // optional
+//	  "model": "grok-4.6",           // optional
 //	  "sources": ["web","x"],        // optional, default both
 //	  "max_results": 10,             // optional (hint for response shaping)
 //	  "reasoning_effort": "low"      // optional
@@ -117,7 +117,7 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]any{
-				"message": "Native /v1/search (xAI web_search/x_search) requires a Grok model; model \"" + clientModel + "\" routes to provider " + routeProv + ". Send a grok model (e.g. grok-4.5) to use search.",
+				"message": "Native /v1/search (xAI web_search/x_search) requires a Grok model; model \"" + clientModel + "\" routes to provider " + routeProv + ". Send a grok model (e.g. grok-4.6) to use search.",
 				"type":    "invalid_request_error",
 				"code":    "search_requires_xai_model",
 			},
@@ -314,9 +314,9 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		// OpenAI Responses-shaped convenience block
 		"output": []map[string]any{
 			{
-				"type":   "search_results",
-				"query":  req.Query,
-				"status": "completed",
+				"type":    "search_results",
+				"query":   req.Query,
+				"status":  "completed",
 				"results": result.Results,
 			},
 		},
