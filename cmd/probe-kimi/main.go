@@ -76,10 +76,10 @@ func main() {
 		if m.ID == "kimi-for-coding" || m.Provider == store.ProviderKimiWork {
 			hasKimi = true
 		}
-		if m.ID == "grok-4.5" {
+		if m.ID == "grok-4.6" {
 			hasGrok = true
 		}
-		if m.Provider == store.ProviderKimiWork || m.ID == "grok-4.5" || m.ID == "kimi-for-coding" {
+		if m.Provider == store.ProviderKimiWork || m.ID == "grok-4.6" || m.ID == "kimi-for-coding" {
 			fmt.Printf("  model %s provider=%s\n", m.ID, m.Provider)
 		}
 	}

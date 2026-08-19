@@ -55,7 +55,6 @@ settings.json
 tmp_probe/
 scripts/
 mcp-xai-search/
-cmd/signup_probe/
 cmd/selftest/
 build_log*.txt
 *.log

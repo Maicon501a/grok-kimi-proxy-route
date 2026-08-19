@@ -31,7 +31,7 @@ func TestEnsureCredsQwenMissingKey(t *testing.T) {
 		s.Provider = store.ProviderQwen
 		s.QwenAPIKey = ""
 	})
-	tok, acc, _, err := ensureCreds(context.Background(), st, nil, "", false)
+	tok, acc, _, err := ensureCreds(context.Background(), st, nil, nil, "", false)
 	if err == nil {
 		t.Fatalf("want error when qwen key missing, got tok=%q acc=%v", tok, acc)
 	}
@@ -56,7 +56,7 @@ func TestEnsureCredsQwenOK(t *testing.T) {
 		s.QwenAPIKey = "bridge-key"
 		s.QwenUpstream = "http://127.0.0.1:3000"
 	})
-	tok, acc, settings, err := ensureCreds(context.Background(), st, nil, "", false)
+	tok, acc, settings, err := ensureCreds(context.Background(), st, nil, nil, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"grok-desktop/internal/accio"
+	"grok-desktop/internal/codexauth"
 	"grok-desktop/internal/kimi"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/oauth"
@@ -54,6 +55,7 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 	oa := oauth.New()
+	ca := codexauth.New()
 	if v := st.Settings().ClientVersion; v != "" {
 		oa.CLIVersion = v
 	}
@@ -69,10 +71,10 @@ func main() {
 	}
 
 	ensure := func(ctx context.Context) (string, *store.Account, store.Settings, error) {
-		return ensureCreds(ctx, st, oa, "", false)
+		return ensureCreds(ctx, st, oa, ca, "", false)
 	}
 	forceRefresh := func(ctx context.Context, id string) (string, *store.Account, store.Settings, error) {
-		return ensureCreds(ctx, st, oa, id, true)
+		return ensureCreds(ctx, st, oa, ca, id, true)
 	}
 
 	// autoReloginKimi re-registers an exhausted Kimi account via HTTP-only Google
@@ -182,17 +184,94 @@ func main() {
 	logging.Info("proxy.startup",
 		"addr", srv.Addr(), "provider", settings.NormalizedProvider(),
 		"model", settings.ResolveModel("default"), "store", st.Root(),
-		"providers", "xai,kimi_work,ollie,gemini,qwen,deepseek,opencode_zen,accio")
+		"providers", "xai,openai_codex,kimi_work,ollie,gemini,qwen,deepseek,opencode_zen,opencode_go,accio")
 	log.Printf("Ctrl+C to stop")
+
+	janitorCtx, stopJanitor := context.WithCancel(context.Background())
+	defer stopJanitor()
+	startTokenJanitor(janitorCtx, st, oa)
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	<-ch
+	stopJanitor()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Stop(ctx)
 	accio.ShutdownSGDaemon()
 	fmt.Println("stopped")
+}
+
+// startTokenJanitor keeps xAI access tokens perpetually fresh while the proxy
+// is running, mirroring the official Grok CLI (refresh ~5 min before expiry).
+// Without it, access tokens (6h TTL) lapse whenever no traffic arrives — e.g.
+// overnight — and the whole pool looks dead even though every refresh token is
+// still valid. Refresh tokens themselves die after prolonged idleness (~30d),
+// so keeping the chain warm also protects accounts from permanent invalid_grant.
+func startTokenJanitor(ctx context.Context, st *store.Store, oa *oauth.Client) {
+	// Per-account backoff after transient refresh failures (network, 5xx):
+	// a minute-tick hammering a broken upstream looks abusive.
+	backoff := map[string]time.Time{}
+	tick := func() {
+		// Adopt tokens the official CLI refreshed while we were idle before
+		// spending our own (rotating) refresh tokens.
+		_, _ = st.SyncFromGrokCLI()
+		for _, acc := range st.ListAccountsForProvider(store.ProviderXAI) {
+			if ctx.Err() != nil {
+				return
+			}
+			if !acc.Usable() || strings.TrimSpace(acc.RefreshToken) == "" {
+				continue
+			}
+			if !acc.Expired() && !acc.ExpiresSoon(5*time.Minute) {
+				continue
+			}
+			if retry, ok := backoff[acc.ID]; ok && time.Now().Before(retry) {
+				continue
+			}
+			cp := acc
+			if err := refreshXAIAccount(ctx, st, oa, &cp, false); err != nil {
+				if oauth.IsInvalidGrant(err) {
+					// Dead RT: stop retrying every tick.
+					delete(backoff, acc.ID)
+					_, _ = st.MarkAuthDenied(acc.ID, "invalid_grant: "+err.Error())
+					logging.Warn("xai.janitor.invalid_grant", "account_id", acc.ID, "err", err.Error())
+				} else {
+					backoff[acc.ID] = time.Now().Add(10 * time.Minute)
+					logging.Warn("xai.janitor.refresh_failed", "account_id", acc.ID, "err", err.Error())
+				}
+			} else {
+				delete(backoff, acc.ID)
+				logging.Info("xai.janitor.refreshed", "account_id", acc.ID)
+			}
+			// Stagger so a freshly-created pool does not burst auth.x.ai.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1500 * time.Millisecond):
+			}
+		}
+	}
+	go func() {
+		// First pass soon after launch: heal any pool that lapsed while the
+		// proxy was down (access tokens only live 6h).
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(8 * time.Second):
+		}
+		tick()
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
 }
 
 // reloginKimiViaGoogleHTTP re-registers a Kimi user over HTTP (Google refresh →
@@ -289,6 +368,7 @@ func ensureCreds(
 	ctx context.Context,
 	st *store.Store,
 	oa *oauth.Client,
+	ca *codexauth.Client,
 	preferID string,
 	forceRefresh bool,
 ) (string, *store.Account, store.Settings, error) {
@@ -333,6 +413,17 @@ func ensureCreds(
 		}
 		return store.OpenCodeZenAPIKey, acc, settings, nil
 	}
+	if settings.IsOpenCodeGo() {
+		key := settings.OpenCodeGoAPIKeyPlain()
+		if key == "" {
+			return "", nil, settings, fmt.Errorf("opencode go: API key não configurada — configure no app desktop")
+		}
+		acc := &store.Account{
+			ID: "opencode-go", Provider: store.ProviderOpenCodeGo, Label: "OpenCode Go",
+			Email: store.OpenCodeGoUpstream, AccessToken: key, APIKey: key,
+		}
+		return key, acc, settings, nil
+	}
 	if settings.IsOllie() {
 		acc := &store.Account{
 			ID: "ollie", Label: "OllieChat", Email: "keyless@olliechat",
@@ -348,6 +439,44 @@ func ensureCreds(
 			AccessToken: store.GeminiCredMarker,
 		}
 		return store.GeminiCredMarker, acc, settings, nil
+	}
+	if settings.IsCodex() {
+		var acc *store.Account
+		if preferID != "" {
+			if candidate, ok := st.GetAccount(preferID); ok && candidate != nil && candidate.NormalizedProvider() == store.ProviderCodex && candidate.Usable() {
+				acc = candidate
+			}
+		}
+		if acc == nil {
+			acc = st.PickAccountForProvider(store.ProviderCodex, st.GetLoadBalancerStrategy(store.ProviderCodex))
+		}
+		if acc == nil {
+			return "", nil, settings, fmt.Errorf("nenhuma conta Codex - faça login no app desktop")
+		}
+		st.IncAccountRequestCount(acc.ID)
+		if forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired() || acc.AccessToken == "" {
+			if err := refreshCodexAccount(ctx, st, ca, acc, forceRefresh); err != nil {
+				if codexauth.IsInvalidGrant(err) {
+					_, _ = st.MarkAuthDenied(acc.ID, "codex refresh: "+err.Error())
+					st.DecAccountRequestCount(acc.ID)
+					if next := st.NextUsableAccountID(acc.ID); next != "" {
+						return ensureCreds(ctx, st, oa, ca, next, false)
+					}
+					return "", nil, settings, fmt.Errorf("sessão Codex expirada: %w", err)
+				}
+				if forceRefresh || acc.Expired() {
+					st.DecAccountRequestCount(acc.ID)
+					return "", nil, settings, fmt.Errorf("refresh Codex temporariamente indisponível: %w", err)
+				}
+			}
+		}
+		if acc.AccessToken == "" || acc.Expired() {
+			st.DecAccountRequestCount(acc.ID)
+			return "", nil, settings, fmt.Errorf("sessão Codex expirada - faça login novamente")
+		}
+		settings.CodexAccountID = acc.TeamID
+		settings.CodexFedRAMP = strings.Contains(acc.Source, "fedramp")
+		return acc.AccessToken, acc, settings, nil
 	}
 	if settings.IsKimiWork() {
 		// Load-balance across the Kimi pool (request-scoped routing; never flip
@@ -408,7 +537,7 @@ func ensureCreds(
 		st.DecAccountRequestCount(acc.ID)
 		_, _ = st.MarkAuthDenied(acc.ID, "bot_flag_source")
 		if next := st.NextUsableAccountID(acc.ID); next != "" {
-			return ensureCreds(ctx, st, oa, next, false)
+			return ensureCreds(ctx, st, oa, ca, next, false)
 		}
 		return "", nil, settings, fmt.Errorf("conta bloqueada (bot flag)")
 	}
@@ -441,7 +570,7 @@ func ensureCreds(
 					st.DecAccountRequestCount(acc.ID)
 					if next := st.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
 						logging.Info("xai.refresh.rotate_after_invalid_grant", "from", acc.ID, "to", next)
-						return ensureCreds(ctx, st, oa, next, false)
+						return ensureCreds(ctx, st, oa, ca, next, false)
 					}
 					return "", nil, settings, fmt.Errorf("token expirado: %v", err)
 				}
@@ -449,7 +578,7 @@ func ensureCreds(
 				st.DecAccountRequestCount(acc.ID)
 				if next := st.NextUsableAccountID(acc.ID); next != "" && next != acc.ID {
 					logging.Info("xai.refresh.rotate_after_fail", "from", acc.ID, "to", next, "err", err.Error())
-					return ensureCreds(ctx, st, oa, next, false)
+					return ensureCreds(ctx, st, oa, ca, next, false)
 				}
 				return "", nil, settings, fmt.Errorf("token expirado: %v", err)
 			}
@@ -511,4 +640,56 @@ func refreshXAIAccount(ctx context.Context, st *store.Store, oa *oauth.Client, a
 		logging.Warn("xai.refresh.cli_write_failed", "account_id", acc.ID, "err", err.Error())
 	}
 	return nil
+}
+
+func refreshCodexAccount(ctx context.Context, st *store.Store, ca *codexauth.Client, acc *store.Account, force bool) error {
+	if acc == nil || acc.RefreshToken == "" || ca == nil {
+		return fmt.Errorf("no Codex refresh token")
+	}
+	mu := accountRefreshMu(acc.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	return st.WithAccountRefreshLock(ctx, acc.ID, func() error {
+		if latest, ok := st.GetAccount(acc.ID); ok && latest != nil {
+			if !latest.ExpiresSoon(5*time.Minute) && latest.AccessToken != "" && latest.AccessToken != acc.AccessToken {
+				*acc = *latest
+				return nil
+			}
+			*acc = *latest
+		}
+		tok, err := ca.Refresh(ctx, acc.RefreshToken)
+		if err != nil {
+			return err
+		}
+		acc.AccessToken = tok.AccessToken
+		if tok.RefreshToken != "" {
+			acc.RefreshToken = tok.RefreshToken
+		}
+		claims := codexauth.ParseClaims(tok.AccessToken)
+		if !claims.ExpiresAt.IsZero() {
+			acc.ExpiresAt = claims.ExpiresAt
+		}
+		if tok.IDToken != "" {
+			identity := codexauth.ParseClaims(tok.IDToken)
+			if identity.Email != "" {
+				acc.Email = identity.Email
+			}
+			if identity.UserID != "" {
+				acc.UserID = identity.UserID
+			}
+			if identity.AccountID != "" {
+				acc.TeamID = identity.AccountID
+			}
+			if identity.FedRAMP {
+				acc.Source = "codex_oauth_fedramp"
+			}
+		}
+		acc.UpdatedAt = time.Now().UTC()
+		acc.AuthDeniedAt = time.Time{}
+		acc.AuthDeniedReason = ""
+		if err := st.UpsertAccount(*acc); err != nil {
+			return err
+		}
+		return st.ClearAuthDenied(acc.ID)
+	})
 }
