@@ -23,6 +23,10 @@ export function CancelChat():Promise<void>;
 
 export function CancelDeviceLogin():Promise<void>;
 
+export function CancelGeminiLogin(arg1:string):Promise<void>;
+
+export function CompleteGeminiLogin(arg1:string):Promise<Record<string, any>>;
+
 export function CreateSkill(arg1:string,arg2:string,arg3:string):Promise<skills.Skill>;
 
 export function DeleteMCPServer(arg1:string):Promise<void>;
@@ -32,6 +36,8 @@ export function DeleteSkill(arg1:string):Promise<void>;
 export function GetAccountGoogleCredentials(arg1:string):Promise<string|string>;
 
 export function GetActiveRequest():Promise<main.ActiveRequest>;
+
+export function GetAutoCreateMinAccounts():Promise<number>;
 
 export function GetAutoCreateOnExhausted():Promise<boolean>;
 
@@ -48,6 +54,8 @@ export function GetSettings():Promise<store.Settings>;
 export function GetSkill(arg1:string):Promise<skills.Skill>;
 
 export function GetStats():Promise<Record<string, any>>;
+
+export function GetSystemPrompt(arg1:string,arg2:string):Promise<string>;
 
 export function GetUsage():Promise<Record<string, store.UsageTotals>>;
 
@@ -81,17 +89,25 @@ export function SetAccountGoogleCredentials(arg1:string,arg2:string,arg3:string)
 
 export function SetActiveAccount(arg1:string):Promise<void>;
 
+export function SetAutoCreateMinAccounts(arg1:number):Promise<void>;
+
 export function SetAutoCreateOnExhausted(arg1:boolean):Promise<void>;
 
 export function SetGoogleCredentials(arg1:string,arg2:string):Promise<void>;
 
 export function SetKimiStealthHeadless(arg1:boolean):Promise<void>;
 
+export function SetSystemPrompt(arg1:string,arg2:string,arg3:string):Promise<void>;
+
 export function StartAccioLogin():Promise<string>;
 
 export function StartAutoSignup():Promise<void>;
 
+export function StartCodexLogin():Promise<main.deviceLoginState>;
+
 export function StartDeviceLogin():Promise<main.deviceLoginState>;
+
+export function StartGeminiLogin(arg1:string,arg2:string,arg3:string):Promise<Record<string, any>>;
 
 export function StartKimiBrowserLogin():Promise<Record<string, any>>;
 
@@ -101,6 +117,7 @@ export function StartKimiStealthLoginForAccount(arg1:string,arg2:boolean):Promis
 
 export function StartKimiStealthLoginNewAccount(arg1:boolean):Promise<Record<string, any>>;
 
+export function StartSignupBatch(arg1:number):Promise<void>;
 
 export function SyncGrokCLI():Promise<Record<string, any>>;
 

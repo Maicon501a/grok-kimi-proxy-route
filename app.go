@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,14 +19,17 @@ import (
 
 	"grok-desktop/internal/accio"
 	"grok-desktop/internal/accmgr"
+	"grok-desktop/internal/aistudioproxy"
+	"grok-desktop/internal/codexauth"
+	"grok-desktop/internal/gemini"
 	"grok-desktop/internal/kimi"
 	"grok-desktop/internal/logging"
 	"grok-desktop/internal/mcpconfig"
 	"grok-desktop/internal/oauth"
 	"grok-desktop/internal/pricing"
 	"grok-desktop/internal/proxyhttp"
+	"grok-desktop/internal/register"
 	"grok-desktop/internal/secure"
-	"grok-desktop/internal/signup"
 	"grok-desktop/internal/skills"
 	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
@@ -39,9 +43,11 @@ type App struct {
 	upstream *upstream.Client
 	proxy    *proxyhttp.Server
 	accio    *accio.Client
+	codex    *codexauth.Client
 	accMgr   *accmgr.Manager
 	skills   *skills.Store
 	mcp      *mcpconfig.Store
+	aiStudio *aistudioproxy.Manager
 
 	mu            sync.Mutex
 	deviceCancel  context.CancelFunc
@@ -51,6 +57,13 @@ type App struct {
 	signupRunning bool
 	signupCancel  context.CancelFunc
 	autoCreate    bool
+	// autoCreateMin is the xAI pool floor: when usable xAI accounts drop below
+	// it, the signup supervisor creates accounts until the pool recovers.
+	autoCreateMin int
+	// signupSupervisor dedupes the pool top-up loop; signupSupervisorStop is
+	// set by CancelAutoSignup so a user cancel also stops pending creations.
+	signupSupervisor     bool
+	signupSupervisorStop bool
 	// kimiReloginCount limits concurrent Kimi auto re-logins (max 2).
 	kimiReloginCount int
 	// kimiReloginInFlight dedupes re-logins per account (queued or running).
@@ -72,6 +85,7 @@ type App struct {
 }
 
 type deviceLoginState struct {
+	LoginID         string `json:"login_id,omitempty"`
 	DeviceCode      string `json:"device_code"`
 	UserCode        string `json:"user_code"`
 	VerificationURL string `json:"verification_url"`
@@ -126,7 +140,21 @@ func (a *App) startup(ctx context.Context) {
 		return
 	}
 	a.store = st
+	a.aiStudio = aistudioproxy.New(st.Root())
+	legacyAIStudio := strings.TrimSpace(os.Getenv("AISTUDIO_LEGACY_PROJECT_DIR"))
+	if legacyAIStudio == "" {
+		candidate := `D:\proxy plus`
+		if _, statErr := os.Stat(filepath.Join(candidate, "profiles.json")); statErr == nil {
+			legacyAIStudio = candidate
+		}
+	}
+	if err := a.aiStudio.Start(ctx, legacyAIStudio, st.Settings().IsGemini()); err != nil {
+		runtime.LogErrorf(ctx, "AI Studio runtime: %v", err)
+	} else {
+		gemini.SetBaseURL(a.aiStudio.BaseURL())
+	}
 	a.oauth = oauth.New()
+	a.codex = codexauth.New()
 	// Align OAuth client surface version with the installed Grok CLI default.
 	if v := st.Settings().ClientVersion; v != "" {
 		a.oauth.CLIVersion = v
@@ -151,10 +179,12 @@ func (a *App) startup(ctx context.Context) {
 		a.accMgr = accmgr.New(ac, accmgr.Config{
 			MinCredits:     envInt("ACCIO_MIN_CREDITS", 300),
 			MaxAccounts:    envInt("ACCIO_MAX_ACCOUNTS", 10),
-			CreateCooldown: envDur("ACCIO_CREATE_COOLDOWN", 3*time.Minute),
-			CheckEvery:     envDur("ACCIO_CHECK_EVERY", 2*time.Minute),
-			WARP:           os.Getenv("ACCIO_USE_WARP") != "0",
-			Headless:       os.Getenv("ACCIO_SIGNUP_VISIBLE") != "1",
+			CreateCooldown: envDur("ACCIO_CREATE_COOLDOWN", time.Minute),
+			CheckEvery:     envDur("ACCIO_CHECK_EVERY", time.Minute),
+			// WARP is opt-in: the risk system keys on the browser profile, not
+			// the IP, and rotation adds up to ~30s per creation.
+			WARP:     os.Getenv("ACCIO_USE_WARP") == "1",
+			Headless: os.Getenv("ACCIO_SIGNUP_VISIBLE") != "1",
 		})
 		// Import the existing standalone proxy credential once, without logging it.
 		standalone := filepath.Join(filepath.Dir(st.Root()), "accio-proxy", "token.json")
@@ -170,6 +200,9 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.proxy = proxyhttp.New(st, a.upstream, a.ensureCreds)
+	if a.aiStudio != nil {
+		a.proxy.SetAIStudioBaseURL(a.aiStudio.BaseURL())
+	}
 	a.proxy.SetAccio(a.accio)
 	a.proxy.SetForceRefresh(a.forceRefreshAccount)
 	// Start the Accio account top-up loop (no-op unless accounts exist and
@@ -203,6 +236,23 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	settings := st.Settings()
+	// Restore the xAI auto-create pool settings persisted in settings.json.
+	a.mu.Lock()
+	a.autoCreate = settings.AutoCreateOnExhausted
+	a.autoCreateMin = settings.AutoCreateMinAccounts
+	a.mu.Unlock()
+	if a.autoCreate {
+		// Pool top-up on launch: give the proxy a moment, then refill if the
+		// usable xAI pool is below the floor.
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
+			}
+			a.maybeAutoCreate("startup pool check")
+		}()
+	}
 	if settings.ProxyEnabled {
 		listen := settings.ProxyListen
 		if listen == "" {
@@ -222,16 +272,10 @@ func (a *App) startup(ctx context.Context) {
 			runtime.LogInfof(ctx, "OpenAI proxy listening on http://%s", a.proxy.Addr())
 		}
 	}
+	a.startTokenJanitor(ctx)
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	accio.ShutdownSGDaemon()
-	if a.accMgr != nil {
-		a.accMgr.Stop()
-	}
-	if a.proxy != nil {
-		_ = a.proxy.Stop(context.Background())
-	}
 	a.mu.Lock()
 	if a.deviceCancel != nil {
 		a.deviceCancel()
@@ -239,7 +283,27 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.reqCancel != nil {
 		a.reqCancel()
 	}
+	if a.signupCancel != nil {
+		a.signupCancel()
+	}
 	a.mu.Unlock()
+	if a.accMgr != nil {
+		a.accMgr.Stop()
+	}
+	if a.proxy != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		_ = a.proxy.Stop(stopCtx)
+		cancel()
+	}
+	if a.aiStudio != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		_ = a.aiStudio.Stop(stopCtx)
+		cancel()
+	}
+	accio.ShutdownSGDaemon()
+	if a.store != nil {
+		_ = a.store.Close()
+	}
 }
 
 // ---------- Public API for frontend ----------
@@ -263,12 +327,14 @@ func (a *App) GetBootstrap() map[string]any {
 			"id": "ollie", "email": "keyless@olliechat", "label": "OllieChat", "provider": store.ProviderOllie, "auth_mode": store.AuthModeAPIKey,
 		}
 	} else if s.IsGemini() {
-		active = map[string]any{
-			"id": "gemini-adc", "email": s.EffectiveGeminiProject(), "label": "Gemini ADC", "provider": store.ProviderGemini, "auth_mode": store.AuthModeAPIKey,
-		}
+		active = map[string]any{}
 	} else if s.IsOpenCodeZen() {
 		active = map[string]any{
 			"id": "opencode-zen-free", "email": "keyless@opencode.ai", "label": "OpenCode Zen Free", "provider": store.ProviderOpenCodeZen, "auth_mode": store.AuthModeAPIKey,
+		}
+	} else if s.IsOpenCodeGo() {
+		active = map[string]any{
+			"id": "opencode-go", "email": store.OpenCodeGoUpstream, "label": "OpenCode Go", "provider": store.ProviderOpenCodeGo, "auth_mode": store.AuthModeAPIKey,
 		}
 	} else if acc, ok := a.store.ActiveAccount(); ok && acc != nil {
 		active = map[string]any{
@@ -297,9 +363,24 @@ func (a *App) GetBootstrap() map[string]any {
 	masked := s
 	masked.QwenAPIKey = maskQwenAPIKey(s.QwenAPIKey)
 	masked.DeepSeekAPIKey = maskDeepSeekAPIKey(s.DeepSeekAPIKey)
+	masked.OpenCodeGoAPIKey = maskDeepSeekAPIKey(s.OpenCodeGoAPIKey)
+	accounts := a.store.PublicAccountsForProvider(s.NormalizedProvider())
+	if s.IsGemini() && a.aiStudio != nil {
+		ctx, cancel := context.WithTimeout(a.appContext(), 3*time.Second)
+		if rows, err := a.aiStudio.Accounts(ctx); err == nil {
+			accounts = rows
+			for _, row := range rows {
+				if selected, _ := row["active"].(bool); selected {
+					active = row
+					break
+				}
+			}
+		}
+		cancel()
+	}
 	return map[string]any{
 		"settings":       masked,
-		"accounts":       a.store.PublicAccountsForProvider(s.NormalizedProvider()),
+		"accounts":       accounts,
 		"active":         active,
 		"usage":          a.store.UsageSnapshot(),
 		"proxy_addr":     proxyAddr,
@@ -344,10 +425,32 @@ func (a *App) GetSettings() store.Settings {
 	s := a.store.Settings()
 	s.QwenAPIKey = maskQwenAPIKey(s.QwenAPIKey)
 	s.DeepSeekAPIKey = maskDeepSeekAPIKey(s.DeepSeekAPIKey)
+	s.OpenCodeGoAPIKey = maskDeepSeekAPIKey(s.OpenCodeGoAPIKey)
 	return s
 }
 
+// GetSystemPrompt returns the locally managed prompt for the provider/model
+// selected by the settings UI. Provider/model aliases are normalized by store.
+func (a *App) GetSystemPrompt(provider, model string) string {
+	if a.store == nil {
+		return ""
+	}
+	return a.store.Settings().SystemPromptFor(provider, model)
+}
+
+// SetSystemPrompt persists or clears a system prompt for one provider/model.
+// Passing an empty prompt deletes the entry.
+func (a *App) SetSystemPrompt(provider, model, prompt string) error {
+	if a.store == nil {
+		return fmt.Errorf("store not ready")
+	}
+	return a.store.UpdateSettings(func(s *store.Settings) {
+		s.SetSystemPrompt(provider, model, prompt)
+	})
+}
+
 func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
+	previous := a.store.Settings()
 	// DeepSeek API key: encrypt BEFORE persisting so the on-disk blob is always
 	// ciphertext (DPAPI on Windows). The masked sentinel means "unchanged" and
 	// an explicit empty string clears the stored key. The encrypted blob is
@@ -376,6 +479,29 @@ func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
 			deepSeekKeyEnc = enc
 		}
 	}
+	var openCodeGoKeyEnc string
+	var hasOpenCodeGoKeyPatch bool
+	if v, ok := patch["opencode_go_api_key"].(string); ok {
+		hasOpenCodeGoKeyPatch = true
+		switch {
+		case v == qwenKeyMask:
+			// unchanged
+		case strings.TrimSpace(v) == "":
+			openCodeGoKeyEnc = ""
+			if err := a.store.WriteOpenCodeGoKeyFile(""); err != nil {
+				return store.Settings{}, fmt.Errorf("opencode go: falha ao limpar API key: %w", err)
+			}
+		default:
+			enc, err := secure.Encrypt(strings.TrimSpace(v))
+			if err != nil {
+				return store.Settings{}, fmt.Errorf("opencode go: falha ao criptografar API key: %w", err)
+			}
+			if err := a.store.WriteOpenCodeGoKeyFile(enc); err != nil {
+				return store.Settings{}, fmt.Errorf("opencode go: falha ao salvar API key: %w", err)
+			}
+			openCodeGoKeyEnc = enc
+		}
+	}
 	err := a.store.UpdateSettings(func(s *store.Settings) {
 		if v, ok := patch["provider"].(string); ok && v != "" {
 			// Full switch: resets model + upstream for that provider (no leftover ids).
@@ -383,6 +509,9 @@ func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
 		}
 		if hasDeepSeekKeyPatch {
 			s.DeepSeekAPIKey = deepSeekKeyEnc
+		}
+		if hasOpenCodeGoKeyPatch {
+			s.OpenCodeGoAPIKey = openCodeGoKeyEnc
 		}
 		if v, ok := patch["default_model"].(string); ok && v != "" {
 			s.DefaultModel = v
@@ -446,8 +575,19 @@ func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
 	// and could leave the UI looking "dead".
 	s := a.store.Settings()
 	a.reconcileProxy(s)
+	// Managed AI Studio Chrome is only useful while Gemini is selected. Close
+	// all opened profile browsers on provider switch; they will start lazily if
+	// Gemini is selected again.
+	if previous.IsGemini() && !s.IsGemini() && a.aiStudio != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			a.aiStudio.ShutdownManagedBrowsers(ctx)
+		}()
+	}
 	s.QwenAPIKey = maskQwenAPIKey(s.QwenAPIKey)
 	s.DeepSeekAPIKey = maskDeepSeekAPIKey(s.DeepSeekAPIKey)
+	s.OpenCodeGoAPIKey = maskDeepSeekAPIKey(s.OpenCodeGoAPIKey)
 	return s, nil
 }
 
@@ -503,6 +643,13 @@ func (a *App) ListAccounts() []map[string]any {
 
 // ListAccountsForProvider returns accounts for a specific provider (UI modal).
 func (a *App) ListAccountsForProvider(provider string) []map[string]any {
+	if (store.Settings{Provider: provider}).IsGemini() && a.aiStudio != nil {
+		rows, err := a.aiStudio.Accounts(a.appContext())
+		if err == nil {
+			return rows
+		}
+		return []map[string]any{}
+	}
 	if a.store == nil {
 		return nil
 	}
@@ -515,6 +662,12 @@ func (a *App) ListProviders() []map[string]any {
 }
 
 func (a *App) SetActiveAccount(id string) error {
+	if aistudioproxy.IsAccountID(id) {
+		if a.aiStudio == nil {
+			return fmt.Errorf("AI Studio runtime is not ready")
+		}
+		return a.aiStudio.SetDefault(a.appContext(), id)
+	}
 	if a.store == nil {
 		return fmt.Errorf("store not ready")
 	}
@@ -532,6 +685,12 @@ func (a *App) SetActiveAccount(id string) error {
 }
 
 func (a *App) RemoveAccount(id string) error {
+	if aistudioproxy.IsAccountID(id) {
+		if a.aiStudio == nil {
+			return fmt.Errorf("AI Studio runtime is not ready")
+		}
+		return a.aiStudio.Delete(a.appContext(), id)
+	}
 	if a.store == nil {
 		return fmt.Errorf("store not ready")
 	}
@@ -547,9 +706,9 @@ func (a *App) RemoveAccount(id string) error {
 	return a.store.RemoveAccount(id)
 }
 
-// LogoffKimiAccount permanently deletes the Kimi user on kimi.com (Settings → Delete Account)
-// using the stored web JWT, then removes the local pool entry. Requires access/refresh session
-// (Google login or paste JWT) — sk-kimi-only accounts cannot remote-delete.
+// LogoffKimiAccount always removes the local pool entry. When the current web JWT is
+// still accepted, it also deletes the Kimi user remotely. Remote auth failure must not
+// leave an unwanted local account stuck in the UI.
 func (a *App) LogoffKimiAccount(id string) (map[string]any, error) {
 	if a.store == nil {
 		return nil, fmt.Errorf("store not ready")
@@ -561,31 +720,86 @@ func (a *App) LogoffKimiAccount(id string) (map[string]any, error) {
 	if acc.NormalizedProvider() != store.ProviderKimiWork {
 		return nil, fmt.Errorf("só contas Kimi Work podem ser deletadas no site")
 	}
-	if !kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
-		return nil, fmt.Errorf("esta conta não tem sessão web (só sk-kimi). Faça login Google ou cole o JWT para poder deletar no kimi.com")
-	}
-	// Refresh web JWT if needed, then DELETE /api/user/logoff.
-	if _, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken); err != nil {
-		return nil, fmt.Errorf("falha ao deletar no kimi.com: %w", err)
-	}
 	email := acc.Email
 	label := acc.Label
-	_ = a.store.RemoveAccount(id)
+	remote := false
+	remoteWarning := ""
+	if kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) || strings.TrimSpace(acc.GoogleRefreshToken) != "" {
+		if err := a.logoffKimiAccountWithGoogleFallback(acc); err != nil {
+			remoteWarning = err.Error()
+		} else {
+			remote = true
+		}
+	}
+	if err := a.store.RemoveAccount(id); err != nil {
+		return nil, fmt.Errorf("falha ao remover conta do proxy: %w", err)
+	}
 	a.safeEmit("account:logoff", map[string]any{
-		"id": id, "email": email, "reason": "manual_ui", "remote": true,
+		"id": id, "email": email, "reason": "manual_ui", "remote": remote,
 	})
-	return map[string]any{
-		"id": id, "email": email, "label": label, "remote": true, "removed": true,
-	}, nil
+	result := map[string]any{
+		"id": id, "email": email, "label": label, "remote": remote, "removed": true,
+	}
+	if remoteWarning != "" {
+		result["remote_warning"] = remoteWarning
+	}
+	return result, nil
 }
 
 func (a *App) RenameAccount(id, label string) error {
+	if aistudioproxy.IsAccountID(id) {
+		if a.aiStudio == nil {
+			return fmt.Errorf("AI Studio runtime is not ready")
+		}
+		return a.aiStudio.Rename(a.appContext(), id, label)
+	}
 	acc, ok := a.store.GetAccount(id)
 	if !ok {
 		return fmt.Errorf("account not found")
 	}
 	acc.Label = label
 	return a.store.UpsertAccount(*acc)
+}
+
+func (a *App) StartGeminiLogin(accountID, label, email string) (map[string]any, error) {
+	if a.aiStudio == nil {
+		return nil, fmt.Errorf("AI Studio runtime is not ready")
+	}
+	ctx, cancel := context.WithTimeout(a.appContext(), 45*time.Second)
+	defer cancel()
+	return a.aiStudio.StartLogin(ctx, accountID, label, email)
+}
+
+func (a *App) CompleteGeminiLogin(accountID string) (map[string]any, error) {
+	if a.aiStudio == nil {
+		return nil, fmt.Errorf("AI Studio runtime is not ready")
+	}
+	ctx, cancel := context.WithTimeout(a.appContext(), 45*time.Second)
+	defer cancel()
+	return a.aiStudio.CompleteLogin(ctx, accountID)
+}
+
+func (a *App) CancelGeminiLogin(accountID string) error {
+	if a.aiStudio == nil {
+		return fmt.Errorf("AI Studio runtime is not ready")
+	}
+	return a.aiStudio.CancelLogin(a.appContext(), accountID)
+}
+
+func (a *App) ValidateGeminiAccount(accountID string) (map[string]any, error) {
+	if a.aiStudio == nil {
+		return nil, fmt.Errorf("AI Studio runtime is not ready")
+	}
+	ctx, cancel := context.WithTimeout(a.appContext(), 60*time.Second)
+	defer cancel()
+	return a.aiStudio.Validate(ctx, accountID)
+}
+
+func (a *App) appContext() context.Context {
+	if a.ctx != nil {
+		return a.ctx
+	}
+	return context.Background()
 }
 
 // StartKimiBrowserLogin mirrors Kimi Desktop Google login:
@@ -1036,6 +1250,10 @@ func (a *App) addKimiSession(accessToken, refreshToken, googleRefreshToken strin
 // StartDeviceLogin begins OAuth device flow. Frontend shows URL + code.
 func (a *App) StartDeviceLogin() (*deviceLoginState, error) {
 	a.mu.Lock()
+	if a.signupRunning {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("cadastro automático em andamento")
+	}
 	if a.deviceCancel != nil {
 		a.deviceCancel()
 	}
@@ -1053,6 +1271,7 @@ func (a *App) StartDeviceLogin() (*deviceLoginState, error) {
 		url = start.VerificationURI
 	}
 	st := &deviceLoginState{
+		LoginID:         uuid.NewString(),
 		DeviceCode:      start.DeviceCode,
 		UserCode:        start.UserCode,
 		VerificationURL: url,
@@ -1073,57 +1292,235 @@ func (a *App) StartDeviceLogin() (*deviceLoginState, error) {
 			}
 			return
 		}
-		acc := oauth.AccountFromToken(tok, a.oauth.ClientID, a.oauth.Issuer)
-		email, uid := a.oauth.UserInfo(context.Background(), tok.AccessToken, a.oauth.Issuer)
-		if email != "" {
-			acc.Email = email
-		}
-		if uid != "" {
-			acc.UserID = uid
-			acc.ID = uid
-		}
-		// Re-login same xAI user → refresh tokens; keep custom label if any.
-		if prev, ok := a.store.GetAccount(acc.ID); ok && prev != nil {
-			lowLabel := strings.ToLower(prev.Label)
-			if prev.Label != "" && prev.Label != prev.Email && prev.Label != "Grok account" &&
-				!strings.Contains(lowLabel, "esgotada") && !strings.Contains(lowLabel, "auth-denied") {
-				acc.Label = prev.Label
-			}
-			acc.CreatedAt = prev.CreatedAt
-			// Fresh OAuth after re-auth clears quota / auth-denied marks.
-			acc.ExhaustedAt = time.Time{}
-			acc.ExhaustReason = ""
-			acc.AuthDeniedAt = time.Time{}
-			acc.AuthDeniedReason = ""
-		}
-		if acc.Label == "" || acc.Label == "Grok account" {
-			if acc.Email != "" {
-				acc.Label = acc.Email
-			} else if len(acc.ID) >= 8 {
-				acc.Label = "Conta " + acc.ID[:8]
-			} else {
-				acc.Label = "Conta"
-			}
-		}
-		acc.Provider = store.ProviderXAI
-		acc.Source = "oauth"
-		if err := a.store.UpsertAccount(acc); err != nil {
+		acc, err := a.persistXAIToken(context.Background(), tok, "", "oauth")
+		if err != nil {
 			runtime.EventsEmit(a.ctx, "auth:error", err.Error())
 			return
 		}
-		// New account (or re-auth) becomes the active one for the next request.
-		_ = a.store.SetActiveAccount(acc.ID)
-		runtime.EventsEmit(a.ctx, "auth:success", map[string]any{
-			"id":       acc.ID,
-			"email":    acc.Email,
-			"label":    acc.Label,
-			"provider": store.ProviderXAI,
-			"accounts": a.store.PublicAccountsForProvider(store.ProviderXAI),
-			"count":    len(a.store.ListAccountsForProvider(store.ProviderXAI)),
-		})
+		a.emitXAIAuthSuccess(acc, st.LoginID, nil)
 		a.mu.Lock()
 		a.deviceState = nil
 		a.mu.Unlock()
+	}()
+
+	return st, nil
+}
+
+// persistXAIToken is shared by manual and automated xAI device OAuth.
+func (a *App) persistXAIToken(ctx context.Context, tok *oauth.TokenResponse, fallbackEmail, source string) (*store.Account, error) {
+	if a.store == nil || a.oauth == nil || tok == nil || strings.TrimSpace(tok.AccessToken) == "" {
+		return nil, fmt.Errorf("xAI OAuth token inválido")
+	}
+	acc := oauth.AccountFromToken(tok, a.oauth.ClientID, a.oauth.Issuer)
+	infoCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	email, uid := a.oauth.UserInfo(infoCtx, tok.AccessToken, a.oauth.Issuer)
+	if email == "" {
+		email = strings.TrimSpace(fallbackEmail)
+	}
+	if email != "" {
+		acc.Email = email
+	}
+	if uid != "" {
+		acc.UserID = uid
+		acc.ID = uid
+	}
+	if prev, ok := a.store.GetAccount(acc.ID); ok && prev != nil {
+		lowLabel := strings.ToLower(prev.Label)
+		if prev.Label != "" && prev.Label != prev.Email && prev.Label != "Grok account" &&
+			!strings.Contains(lowLabel, "esgotada") && !strings.Contains(lowLabel, "auth-denied") {
+			acc.Label = prev.Label
+		}
+		acc.CreatedAt = prev.CreatedAt
+	}
+	acc.ExhaustedAt = time.Time{}
+	acc.ExhaustReason = ""
+	acc.AuthDeniedAt = time.Time{}
+	acc.AuthDeniedReason = ""
+	if acc.Label == "" || acc.Label == "Grok account" {
+		switch {
+		case acc.Email != "":
+			acc.Label = acc.Email
+		case len(acc.ID) >= 8:
+			acc.Label = "Conta " + acc.ID[:8]
+		default:
+			acc.Label = "Conta"
+		}
+	}
+	acc.Provider = store.ProviderXAI
+	acc.Source = firstNonEmpty(source, "oauth")
+	if err := a.store.UpsertAccount(acc); err != nil {
+		return nil, err
+	}
+	if err := a.store.SetActiveAccount(acc.ID); err != nil {
+		return nil, err
+	}
+	return &acc, nil
+}
+
+func (a *App) emitXAIAuthSuccess(acc *store.Account, loginID string, extra map[string]any) {
+	if acc == nil {
+		return
+	}
+	payload := map[string]any{
+		"id": acc.ID, "login_id": loginID, "email": acc.Email, "label": acc.Label,
+		"provider": store.ProviderXAI,
+		"accounts": a.store.PublicAccountsForProvider(store.ProviderXAI),
+		"count":    len(a.store.ListAccountsForProvider(store.ProviderXAI)),
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	a.safeEmit("auth:success", payload)
+}
+
+// warmXAIBilling mirrors the official CLI's credits read on launch. On fresh
+// accounts this provisions the free-tier billing object; without it the first
+// /v1/responses can return 403 permission-denied. Best effort: errors are only
+// logged because the model probe remains the real acceptance check.
+func (a *App) warmXAIBilling(ctx context.Context, token string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://cli-chat-proxy.grok.com/v1/billing?format=credits", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("x-grok-client-version", store.DefaultClientVersion)
+	req.Header.Set("x-grok-client-identifier", store.DefaultClientIdentifier)
+	req.Header.Set("x-grok-client-surface", store.DefaultClientSurface)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("warmXAIBilling: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
+	log.Printf("warmXAIBilling: status=%d", resp.StatusCode)
+}
+
+// probeXAIModel validates the new account through the same upstream path used
+// by desktop chat and the OpenAI-compatible proxy.
+func (a *App) probeXAIModel(ctx context.Context, acc *store.Account, model string) (string, error) {
+	if acc == nil || a.upstream == nil || a.store == nil {
+		return "", fmt.Errorf("probe xAI não inicializado")
+	}
+	settings := a.store.Settings().WithProvider(store.ProviderXAI)
+	settings.DefaultModel = model
+	settings.APIMode = "responses"
+	var content strings.Builder
+	err := a.upstream.StreamChat(ctx, acc.AccessToken, settings, acc.Label, acc.Email, upstream.ChatRequest{
+		Model: model, Input: "Reply with exactly: GROK_4_6_OK", Stream: true,
+		ReasoningEffort: "low", APIMode: "responses", MaxTokens: 32,
+	}, func(event upstream.StreamEvent) {
+		if event.Type == "content" {
+			content.WriteString(event.Text)
+		}
+	})
+	if err != nil {
+		return "", err
+	}
+	answer := strings.TrimSpace(content.String())
+	if answer == "" {
+		return "", fmt.Errorf("Grok 4.6 respondeu sem conteúdo")
+	}
+	return truncText(answer, 240), nil
+}
+
+// StartCodexLogin begins the official browser + localhost callback flow used by
+// Codex. OAuth tokens are persisted server-side and never reach the webview.
+func (a *App) StartCodexLogin() (*deviceLoginState, error) {
+	if a.codex == nil || a.store == nil {
+		return nil, fmt.Errorf("codex auth is not initialized")
+	}
+	a.mu.Lock()
+	if a.signupRunning {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("cadastro automático xAI em andamento")
+	}
+	if a.deviceCancel != nil {
+		a.deviceCancel()
+	}
+	// Detach the superseded goroutine before publishing the next login state;
+	// its deferred cleanup must not clear the new cancel function.
+	a.deviceState = nil
+	a.deviceCancel = nil
+	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Minute)
+	login, err := a.codex.StartBrowser()
+	if err != nil {
+		cancel()
+		a.mu.Unlock()
+		return nil, err
+	}
+	st := &deviceLoginState{
+		LoginID:         uuid.NewString(),
+		DeviceCode:      "browser_callback",
+		VerificationURL: login.AuthURL,
+		ExpiresIn:       15 * 60,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+	a.deviceCancel = cancel
+	a.deviceState = st
+	a.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer func() {
+			a.mu.Lock()
+			if a.deviceState == st {
+				a.deviceState = nil
+				a.deviceCancel = nil
+			}
+			a.mu.Unlock()
+		}()
+		emitError := func(message string) {
+			a.safeEmit("auth:error", map[string]any{"login_id": st.LoginID, "error": message})
+		}
+		tok, err := login.Wait(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				emitError("Codex: " + err.Error())
+			}
+			return
+		}
+		acc := codexauth.AccountFromToken(tok)
+		if strings.TrimSpace(acc.TeamID) == "" {
+			emitError("Codex OAuth não retornou o workspace ChatGPT (chatgpt_account_id)")
+			return
+		}
+		if prev, ok := a.store.GetAccount(acc.ID); ok && prev != nil {
+			if prev.Label != "" && prev.Label != prev.Email && prev.Label != "ChatGPT Codex" {
+				acc.Label = prev.Label
+			}
+			acc.CreatedAt = prev.CreatedAt
+		}
+		acc.ExhaustedAt = time.Time{}
+		acc.ExhaustReason = ""
+		acc.AuthDeniedAt = time.Time{}
+		acc.AuthDeniedReason = ""
+		a.mu.Lock()
+		if a.deviceState != st {
+			a.mu.Unlock()
+			return
+		}
+		if err := a.store.UpsertAccount(acc); err != nil {
+			a.mu.Unlock()
+			emitError(err.Error())
+			return
+		}
+		_ = a.store.UpdateSettings(func(s *store.Settings) {
+			s.ApplyProviderDefaults(store.ProviderCodex)
+			s.ActiveAccountID = acc.ID
+		})
+		_ = a.store.SetActiveAccount(acc.ID)
+		payload := map[string]any{
+			"id": acc.ID, "email": acc.Email, "label": acc.Label,
+			"provider": store.ProviderCodex, "login_id": st.LoginID,
+			"accounts": a.store.PublicAccountsForProvider(store.ProviderCodex),
+			"count":    len(a.store.ListAccountsForProvider(store.ProviderCodex)),
+		}
+		a.deviceState = nil
+		a.deviceCancel = nil
+		a.mu.Unlock()
+		a.safeEmit("auth:success", payload)
 	}()
 
 	return st, nil
@@ -1237,9 +1634,9 @@ func (a *App) SetAccioManagerConfig(enabled bool, minCredits, maxAccounts int) {
 	a.accMgr.SetConfig(accmgr.Config{
 		MinCredits:     minCredits,
 		MaxAccounts:    maxAccounts,
-		CreateCooldown: envDur("ACCIO_CREATE_COOLDOWN", 3*time.Minute),
-		CheckEvery:     envDur("ACCIO_CHECK_EVERY", 2*time.Minute),
-		WARP:           os.Getenv("ACCIO_USE_WARP") != "0",
+		CreateCooldown: envDur("ACCIO_CREATE_COOLDOWN", time.Minute),
+		CheckEvery:     envDur("ACCIO_CHECK_EVERY", time.Minute),
+		WARP:           os.Getenv("ACCIO_USE_WARP") == "1",
 		Headless:       os.Getenv("ACCIO_SIGNUP_VISIBLE") != "1",
 	})
 	logging.Info("app.accmgr.config", "enabled", enabled, "min_credits", minCredits, "max_accounts", maxAccounts)
@@ -1250,7 +1647,7 @@ func (a *App) AccioTopUpNow() (map[string]any, error) {
 	if a.accMgr == nil {
 		return nil, fmt.Errorf("accio manager is not initialized")
 	}
-	ctx, cancel := context.WithTimeout(a.ctx, 7*time.Minute)
+	ctx, cancel := context.WithTimeout(a.ctx, 12*time.Minute)
 	defer cancel()
 	if err := a.accMgr.TopUpNow(ctx); err != nil {
 		return nil, err
@@ -1359,8 +1756,11 @@ func (a *App) GetStats() map[string]any {
         "baseURL": "%s",
         "apiKey": "%s"
       },
-      "models": {
-        "grok-4.5": { "name": "Grok 4.5 (xAI · /v1/responses)" },
+		"models": {
+			"grok-4.6": { "name": "Grok 4.6 (xAI · /v1/responses)" },
+			"codex/gpt-5.6-sol": { "name": "GPT-5.6-Sol (ChatGPT Codex)" },
+			"codex/gpt-5.6-terra": { "name": "GPT-5.6-Terra (ChatGPT Codex)" },
+			"codex/gpt-5.6-luna": { "name": "GPT-5.6-Luna (ChatGPT Codex)" },
         "k3-agent": { "name": "K3 Max (Work)" },
         "k3-agent-low": { "name": "K3 Max Low Think" },
         "k3-agent-medium": { "name": "K3 Max Medium Think" },
@@ -1373,6 +1773,8 @@ func (a *App) GetStats() map[string]any {
 		"k2d6-agent-xhigh": { "name": "K2.6 Agent Extra High Think" },
 		"opencode/deepseek-v4-flash-free": { "name": "DeepSeek V4 Flash Free (OpenCode Zen)" },
 		"opencode/big-pickle": { "name": "Big Pickle (OpenCode Zen)" },
+		"opencode-go/deepseek-v4-flash": { "name": "DeepSeek V4 Flash (OpenCode Go)" },
+		"opencode-go/deepseek-v4-pro": { "name": "DeepSeek V4 Pro (OpenCode Go)" },
 		"opencode/mimo-v2.5-free": { "name": "MiMo V2.5 Free (OpenCode Zen)" },
 		"opencode/nemotron-3-ultra-free": { "name": "Nemotron 3 Ultra Free (OpenCode Zen)" },
 		"opencode/north-mini-code-free": { "name": "North Mini Code Free (OpenCode Zen)" },
@@ -1391,7 +1793,7 @@ func (a *App) GetStats() map[string]any {
 4. Models:    o Kilo chama GET %s
               e lista o que o proxy devolve (Grok + Kimi juntos).
 5. Escolha o model no dropdown do Kilo:
-   • grok-4.5          → Grok (POST /v1/responses)
+   • grok-4.6          → Grok (POST /v1/responses)
    • k3-agent          → K3 Max (padrão)
    • k3-agent-low      → K3 Max Low Think
    • k3-agent-medium   → K3 Max Medium Think
@@ -1413,7 +1815,7 @@ OPENAI_BASE_URL=%s
 OPENAI_API_KEY=%s
 
 # Escolha UM model por request:
-# Grok:  OPENAI_MODEL=grok-4.5          → use /v1/responses
+# Grok:  OPENAI_MODEL=grok-4.6          → use /v1/responses
 # Kimi:  OPENAI_MODEL=kimi-for-coding   → use /v1/chat/completions`, baseURL, apiKey)
 
 	curlExample := fmt.Sprintf(`# Listar models (Grok + Kimi)
@@ -1423,7 +1825,7 @@ curl %s
 curl %s/responses \
   -H "Authorization: Bearer %s" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"grok-4.5\",\"stream\":true,\"input\":\"Olá\"}"
+  -d "{\"model\":\"grok-4.6\",\"stream\":true,\"input\":\"Olá\"}"
 
 # Kimi Work (chat/completions)
 curl %s/chat/completions \
@@ -1440,7 +1842,7 @@ curl %s/chat/completions \
    • Base URL: %s
    • API Key:  %s
 3. Models (add all or pick the ones you want):
-   • grok-4.5
+   • grok-4.6
    • kimi-for-coding
    • k3-agent
    • k3-agent-low
@@ -1449,7 +1851,7 @@ curl %s/chat/completions \
    • k3-agent-xhigh
 
 Tip: The proxy auto-routes by model id.
-   grok-4.5 → xAI /responses
+   grok-4.6 → xAI /responses
    kimi-*   → Kimi Work /chat/completions`, baseURL, apiKey)
 
 	return map[string]any{
@@ -1473,8 +1875,8 @@ Tip: The proxy auto-routes by model id.
 			"opencode":       openCodeJSON,
 			"kilo":           kiloGuide,
 			"curl":           curlExample,
-			"models_note":    "GET /v1/models lista Grok + Kimi + OpenCode Zen Free. O client escolhe o model; o proxy roteia.",
-			"models_example": []string{"grok-4.5", "kimi-for-coding", "k3-agent", "opencode/deepseek-v4-flash-free", "opencode/mimo-v2.5-free"},
+			"models_note":    "GET /v1/models lista Grok + Kimi + OpenCode Zen Free e OpenCode Go quando a chave estiver configurada. O client escolhe o model; o proxy roteia.",
+			"models_example": []string{"grok-4.6", "kimi-for-coding", "k3-agent", "opencode/deepseek-v4-flash-free", "opencode-go/deepseek-v4-flash"},
 		},
 		"data_dir": a.store.Root(),
 	}
@@ -1533,7 +1935,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		req.APIMode = settings.APIMode
 	}
 	// Kimi Work agent-gw has no /responses — always chat/completions.
-	if settings.IsAccio() || settings.IsDeepSeek() || settings.IsOpenCodeZen() {
+	if settings.IsAccio() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo() {
 		req.APIMode = "chat"
 	}
 	if settings.IsKimiWork() {
@@ -1542,7 +1944,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		if req.Model == "" || req.Model == "default" {
 			req.Model = store.KimiWorkDefaultModel
 		}
-	} else if settings.IsXAI() {
+	} else if settings.IsXAI() || settings.IsCodex() {
 		req.APIMode = "responses"
 	}
 
@@ -1692,7 +2094,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		}
 		// xAI: Responses + native search.
 		// Kimi Work / Ollie / Gemini / Qwen / DeepSeek: OpenAI chat/completions only.
-		if settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsAccio() {
+		if settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo() || settings.IsAccio() {
 			req.APIMode = "chat"
 		} else {
 			req.APIMode = "responses"
@@ -1703,6 +2105,10 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			if req.Model == "" {
 				req.Model = store.KimiWorkDefaultModel
 			}
+		}
+
+		if prompt := settings.SystemPromptFor(route.NormalizedProvider(), req.Model); prompt != "" {
+			req.Messages = append([]upstream.ChatMessage{{Role: "system", Content: prompt}}, req.Messages...)
 		}
 
 		// Inject skills + MCP catalog into conversation context.
@@ -1803,7 +2209,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		err := a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, emit)
 		if err != nil && ctx.Err() == nil {
 			// Gemini uses ADC (no multi-account rotate).
-			if settings.IsGemini() || settings.IsOpenCodeZen() || settings.IsOllie() || settings.IsQwen() || settings.IsDeepSeek() {
+			if settings.IsGemini() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo() || settings.IsOllie() || settings.IsQwen() || settings.IsDeepSeek() {
 				logging.Error("chat.ui.error", "provider", route.NormalizedProvider(), "model", req.Model, "account_id", acc.ID, "err", err, "duration_ms", time.Since(chatT0).Milliseconds())
 				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
 				runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
@@ -1993,6 +2399,18 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		}
 		return store.OpenCodeZenAPIKey, acc, settings, nil
 	}
+	if settings.IsOpenCodeGo() {
+		key := settings.OpenCodeGoAPIKeyPlain()
+		if key == "" {
+			return "", nil, settings, fmt.Errorf("opencode go: API key não configurada — selecione o provedor e cole a chave de opencode.ai/auth")
+		}
+		acc := &store.Account{
+			ID: "opencode-go", Provider: store.ProviderOpenCodeGo, Label: "OpenCode Go",
+			Email: store.OpenCodeGoUpstream, AccessToken: key, APIKey: key,
+			ClientID: "opencode-go", Issuer: store.OpenCodeGoUpstream,
+		}
+		return key, acc, settings, nil
+	}
 	// OllieChat is keyless — no xAI OAuth account required.
 	if settings.IsOllie() {
 		acc := &store.Account{
@@ -2018,6 +2436,45 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 			Issuer:      "https://accounts.google.com",
 		}
 		return store.GeminiCredMarker, acc, settings, nil
+	}
+	if settings.IsCodex() {
+		strategy := a.store.GetLoadBalancerStrategy(store.ProviderCodex)
+		var acc *store.Account
+		if preferID != "" {
+			if candidate, ok := a.store.GetAccount(preferID); ok && candidate != nil && candidate.NormalizedProvider() == store.ProviderCodex && candidate.Usable() {
+				acc = candidate
+			}
+		}
+		if acc == nil {
+			acc = a.store.PickAccountForProvider(store.ProviderCodex, strategy)
+		}
+		if acc == nil {
+			return "", nil, settings, fmt.Errorf("nenhuma conta Codex - faça login com ChatGPT em Contas")
+		}
+		a.store.IncAccountRequestCount(acc.ID)
+		if forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired() || acc.AccessToken == "" {
+			if err := a.refreshCodexAccountLocked(ctx, acc, forceRefresh); err != nil {
+				if codexauth.IsInvalidGrant(err) {
+					_, _ = a.store.MarkAuthDenied(acc.ID, "codex refresh: "+err.Error())
+					a.store.DecAccountRequestCount(acc.ID)
+					if next := a.store.NextUsableAccountID(acc.ID); next != "" {
+						return a.ensureCredsInner(ctx, next, false)
+					}
+					return "", nil, settings, fmt.Errorf("sessão Codex expirada - faça login novamente: %w", err)
+				}
+				if forceRefresh || acc.Expired() {
+					a.store.DecAccountRequestCount(acc.ID)
+					return "", nil, settings, fmt.Errorf("refresh Codex temporariamente indisponível: %w", err)
+				}
+			}
+		}
+		if acc.AccessToken == "" || acc.Expired() {
+			a.store.DecAccountRequestCount(acc.ID)
+			return "", nil, settings, fmt.Errorf("sessão Codex expirada - faça login novamente")
+		}
+		settings.CodexAccountID = acc.TeamID
+		settings.CodexFedRAMP = strings.Contains(acc.Source, "fedramp")
+		return acc.AccessToken, acc, settings, nil
 	}
 	// Kimi Work: multi-account pool (1–3 accounts). Works with any count; no minimum.
 	if settings.IsKimiWork() {
@@ -2209,6 +2666,62 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 	return acc.AccessToken, acc, settings, nil
 }
 
+func (a *App) refreshCodexAccountLocked(ctx context.Context, acc *store.Account, force bool) error {
+	if acc == nil || acc.RefreshToken == "" || a.codex == nil {
+		return fmt.Errorf("no Codex refresh token")
+	}
+	mu := a.accountRefreshMu(acc.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	return a.store.WithAccountRefreshLock(ctx, acc.ID, func() error {
+		if latest, ok := a.store.GetAccount(acc.ID); ok && latest != nil {
+			if !latest.ExpiresSoon(5*time.Minute) && latest.AccessToken != "" && latest.AccessToken != acc.AccessToken {
+				*acc = *latest
+				return nil
+			}
+			*acc = *latest
+		}
+		logging.Info("codex.refresh.start", "account_id", acc.ID, "force", force)
+		tok, err := a.codex.Refresh(ctx, acc.RefreshToken)
+		if err != nil {
+			logging.Error("codex.refresh.failed", "account_id", acc.ID, "err", err.Error())
+			return err
+		}
+		acc.AccessToken = tok.AccessToken
+		if tok.RefreshToken != "" {
+			acc.RefreshToken = tok.RefreshToken
+		}
+		claims := codexauth.ParseClaims(tok.AccessToken)
+		if tok.IDToken != "" {
+			identity := codexauth.ParseClaims(tok.IDToken)
+			if identity.Email != "" {
+				acc.Email = identity.Email
+			}
+			if identity.UserID != "" {
+				acc.UserID = identity.UserID
+			}
+			if identity.AccountID != "" {
+				acc.TeamID = identity.AccountID
+			}
+			if identity.FedRAMP {
+				acc.Source = "codex_oauth_fedramp"
+			}
+		}
+		if !claims.ExpiresAt.IsZero() {
+			acc.ExpiresAt = claims.ExpiresAt
+		}
+		acc.UpdatedAt = time.Now().UTC()
+		acc.AuthDeniedAt = time.Time{}
+		acc.AuthDeniedReason = ""
+		if err := a.store.UpsertAccount(*acc); err != nil {
+			return err
+		}
+		_ = a.store.ClearAuthDenied(acc.ID)
+		logging.Info("codex.refresh.ok", "account_id", acc.ID)
+		return nil
+	})
+}
+
 func (a *App) accountRefreshMu(id string) *sync.Mutex {
 	v, _ := a.refreshGates.LoadOrStore(id, &sync.Mutex{})
 	return v.(*sync.Mutex)
@@ -2270,6 +2783,89 @@ func (a *App) ensureCredsFor(ctx context.Context, id string) (string, *store.Acc
 	return a.ensureCredsInner(ctx, id, false)
 }
 
+// startTokenJanitor keeps xAI access tokens perpetually fresh while the app is
+// running, mirroring the official Grok CLI (refresh ~5 min before expiry).
+// Without it, access tokens (6h TTL) lapse whenever no traffic arrives — e.g.
+// overnight — and the whole pool shows "token exp." even though every refresh
+// token is still valid. Refresh tokens themselves die after prolonged idleness
+// (~30d), so keeping the chain warm also protects the account from permanent
+// invalid_grant death.
+func (a *App) startTokenJanitor(ctx context.Context) {
+	// Per-account backoff after transient refresh failures (network, 5xx):
+	// a minute-tick hammering a broken upstream looks abusive.
+	backoff := map[string]time.Time{}
+	tick := func() {
+		if a.store == nil || a.oauth == nil {
+			return
+		}
+		// Adopt tokens the official CLI refreshed while we were idle before
+		// spending our own (rotating) refresh tokens.
+		_, _ = a.store.SyncFromGrokCLI()
+		changed := false
+		for _, acc := range a.store.ListAccountsForProvider(store.ProviderXAI) {
+			if ctx.Err() != nil {
+				return
+			}
+			if !acc.Usable() || strings.TrimSpace(acc.RefreshToken) == "" {
+				continue
+			}
+			if !acc.Expired() && !acc.ExpiresSoon(5*time.Minute) {
+				continue
+			}
+			if retry, ok := backoff[acc.ID]; ok && time.Now().Before(retry) {
+				continue
+			}
+			cp := acc
+			if err := a.refreshAccountLocked(ctx, &cp); err != nil {
+				if oauth.IsInvalidGrant(err) {
+					// Dead RT: stop retrying every tick and surface it in the UI.
+					delete(backoff, acc.ID)
+					if _, merr := a.store.MarkAuthDenied(acc.ID, "invalid_grant: "+err.Error()); merr == nil {
+						changed = true
+					}
+					logging.Warn("xai.janitor.invalid_grant", "account_id", acc.ID, "err", err.Error())
+				} else {
+					backoff[acc.ID] = time.Now().Add(10 * time.Minute)
+					logging.Warn("xai.janitor.refresh_failed", "account_id", acc.ID, "err", err.Error())
+				}
+			} else {
+				delete(backoff, acc.ID)
+				changed = true
+				logging.Info("xai.janitor.refreshed", "account_id", acc.ID)
+			}
+			// Stagger so a freshly-created pool does not burst auth.x.ai.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1500 * time.Millisecond):
+			}
+		}
+		if changed {
+			a.safeEmit("accounts:changed", map[string]any{"source": "token_janitor"})
+		}
+	}
+	go func() {
+		// First pass soon after launch: heal any pool that lapsed while the app
+		// was closed (access tokens only live 6h).
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(8 * time.Second):
+		}
+		tick()
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -2311,63 +2907,169 @@ func truncText(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// StartAutoSignup creates a web account via chrome isolate + darkemail, then starts device OAuth.
+// StartAutoSignup runs the embedded adaptation of xinxinshuhao-create/grok-register:
+// direct HTTP registration + local/optional paid Turnstile + configured inbox provider, followed
+// by SSO-backed device authorization and a real Grok 4.6 acceptance request.
 func (a *App) StartAutoSignup() error {
+	if a.store == nil || a.oauth == nil || a.upstream == nil {
+		return fmt.Errorf("app ainda não inicializado")
+	}
+	provider := register.EmailProvider()
+	if err := register.ValidateEnvironment(provider); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	if a.signupRunning {
 		a.mu.Unlock()
 		return fmt.Errorf("signup já em andamento")
 	}
 	a.signupRunning = true
-	ctx, cancel := context.WithTimeout(a.ctx, 8*time.Minute)
+	if a.deviceCancel != nil {
+		a.deviceCancel()
+		a.deviceCancel = nil
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 12*time.Minute)
 	a.signupCancel = cancel
 	a.mu.Unlock()
 
 	go func() {
+		loginID := ""
+		defer cancel()
 		defer func() {
 			a.mu.Lock()
 			a.signupRunning = false
 			a.signupCancel = nil
+			if a.deviceState != nil && a.deviceState.LoginID == loginID {
+				a.deviceState = nil
+			}
 			a.mu.Unlock()
 		}()
 		emit := func(msg string) {
-			runtime.EventsEmit(a.ctx, "signup:progress", map[string]any{"message": msg})
+			a.safeEmit("signup:progress", map[string]any{"message": msg})
 		}
-		emit("iniciando criação automática…")
-		res, err := signup.RunFullCapture(ctx, "", "", "", "Alex", "Rivera", false, emit)
+		emit("preparando automação grok-register…")
+		botDir, err := register.ExtractEmbeddedBot(a.store.Root())
 		if err != nil {
-			runtime.EventsEmit(a.ctx, "signup:error", err.Error())
+			a.safeEmit("signup:error", "extrair automação: "+err.Error())
 			return
 		}
-		email, password, userID := "", "", ""
-		if res != nil {
-			email = res.Email
-			password = res.Password
-			userID = signup.ExtractUserIDFromCookies(res.Cookies)
-			if userID == "" {
-				userID = signup.ExtractUserIDFromCookies(res.Credentials.Cookie)
+		emit("iniciando OAuth device antes do cadastro…")
+		start, err := a.oauth.StartDevice(ctx)
+		if err != nil {
+			a.safeEmit("signup:error", "device OAuth: "+err.Error())
+			return
+		}
+		verificationURL := firstNonEmpty(start.VerificationURIComplete, start.VerificationURI)
+		loginID = uuid.NewString()
+		state := &deviceLoginState{
+			LoginID: loginID, DeviceCode: start.DeviceCode, UserCode: start.UserCode,
+			VerificationURL: verificationURL, Interval: start.Interval, ExpiresIn: start.ExpiresIn,
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		a.mu.Lock()
+		a.deviceState = state
+		a.mu.Unlock()
+
+		type pollOutcome struct {
+			token *oauth.TokenResponse
+			err   error
+		}
+		pollCh := make(chan pollOutcome, 1)
+		go func() {
+			token, pollErr := a.oauth.PollDevice(ctx, start.DeviceCode, start.Interval)
+			pollCh <- pollOutcome{token: token, err: pollErr}
+		}()
+
+		runner := register.New("", botDir)
+		runner.DataRoot = a.store.Root()
+		runner.EmailProvider = provider
+		runner.MaxAttempts = envInt("GROK_SIGNUP_MAX_ATTEMPTS", 2)
+		result, err := runner.CreateAccount(ctx, verificationURL, start.UserCode, func(p register.Progress) {
+			msg := strings.TrimSpace(p.Step)
+			if p.Message != "" {
+				msg += " · " + p.Message
+			}
+			emit(msg)
+		})
+		if err != nil {
+			a.safeEmit("signup:error", err.Error())
+			return
+		}
+		if result == nil || result.Status != "success" {
+			reason := "automação terminou sem resultado"
+			if result != nil {
+				reason = firstNonEmpty(result.Reason, reason)
+			}
+			a.safeEmit("signup:error", reason)
+			return
+		}
+		email, password := result.Creds["email"], result.Creds["password"]
+		a.safeEmit("signup:web_ok", map[string]any{
+			"email": email, "password": password, "provider": result.Creds["provider"],
+		})
+		emit("conta web criada; aguardando tokens OAuth…")
+		var polled pollOutcome
+		select {
+		case polled = <-pollCh:
+		case <-ctx.Done():
+			a.safeEmit("signup:error", ctx.Err().Error())
+			return
+		}
+		if polled.err != nil {
+			a.safeEmit("signup:error", "device OAuth: "+polled.err.Error())
+			return
+		}
+		acc, err := a.persistXAIToken(ctx, polled.token, email, "auto_signup:grok-register@36f379a")
+		if err != nil {
+			a.safeEmit("signup:error", "salvar conta: "+err.Error())
+			return
+		}
+		emit("conta adicionada ao pool: " + firstNonEmpty(acc.Email, acc.Label, acc.ID))
+		logging.Info("signup.account.persisted", "account_id", acc.ID, "email", acc.Email, "provider", store.ProviderXAI)
+		emit("tokens válidos; provisionando billing e testando o Grok 4.6…")
+		probeCtx, probeCancel := context.WithTimeout(ctx, 4*time.Minute)
+		// The official CLI reads credits on launch; doing the same provisions the
+		// free-tier billing object so a fresh account's first /v1/responses is
+		// accepted instead of returning 403 permission-denied.
+		a.warmXAIBilling(probeCtx, polled.token.AccessToken)
+		var answer string
+		var probeErr error
+		for attempt := 1; attempt <= 4; attempt++ {
+			answer, probeErr = a.probeXAIModel(probeCtx, acc, "grok-4.6")
+			if probeErr == nil {
+				break
+			}
+			// Fresh accounts can take a minute before the chat entitlement lands.
+			emit(fmt.Sprintf("Grok 4.6 ainda indisponível (tentativa %d/4); aguardando…", attempt))
+			select {
+			case <-probeCtx.Done():
+				break
+			case <-time.After(30 * time.Second):
+			}
+			if probeCtx.Err() != nil {
+				break
 			}
 		}
-		emit("conta web criada: " + email)
-		href := ""
-		if res != nil {
-			href = res.FinalUI.Href
+		probeCancel()
+		claims := oauth.ParseAccessClaims(polled.token.AccessToken)
+		extra := map[string]any{
+			"signup_provider": provider, "model_probe": "grok-4.6", "probe_ok": probeErr == nil,
+			"oauth_tier": claims.Tier, "oauth_bot_flag": claims.BotFlag, "oauth_scope": claims.Scope,
 		}
-		runtime.EventsEmit(a.ctx, "signup:web_ok", map[string]any{
-			"email": email, "password": password, "user_id": userID, "href": href,
-		})
-		emit("iniciando device OAuth para tokens da API…")
-		st, err := a.StartDeviceLogin()
-		if err != nil {
-			runtime.EventsEmit(a.ctx, "signup:error", "web ok, device login falhou: "+err.Error())
+		if answer != "" {
+			extra["probe_response"] = answer
+		}
+		a.emitXAIAuthSuccess(acc, loginID, extra)
+		if probeErr != nil {
+			a.safeEmit("signup:done", map[string]any{
+				"email": email, "phase": "created_api_unavailable", "model": "grok-4.6",
+				"model_valid": false, "reason": probeErr.Error(),
+				"oauth_tier": claims.Tier, "oauth_bot_flag": claims.BotFlag,
+			})
 			return
 		}
-		runtime.EventsEmit(a.ctx, "signup:device", map[string]any{
-			"email": email, "password": password,
-			"user_code": st.UserCode, "verification_url": st.VerificationURL,
-		})
-		runtime.EventsEmit(a.ctx, "signup:done", map[string]any{
-			"email": email, "password": password, "phase": "waiting_device_oauth",
+		a.safeEmit("signup:done", map[string]any{
+			"email": email, "phase": "validated", "model": "grok-4.6", "model_valid": true, "response": answer,
 		})
 	}()
 	return nil
@@ -2378,9 +3080,9 @@ func (a *App) CancelAutoSignup() {
 	defer a.mu.Unlock()
 	if a.signupCancel != nil {
 		a.signupCancel()
-		a.signupCancel = nil
 	}
-	a.signupRunning = false
+	a.signupSupervisorStop = true
+	a.deviceState = nil
 }
 
 func (a *App) IsSignupRunning() bool {
@@ -2393,12 +3095,71 @@ func (a *App) SetAutoCreateOnExhausted(enabled bool) {
 	a.mu.Lock()
 	a.autoCreate = enabled
 	a.mu.Unlock()
+	if a.store != nil {
+		_ = a.store.UpdateSettings(func(s *store.Settings) {
+			s.AutoCreateOnExhausted = enabled
+		})
+	}
+	if enabled {
+		// Turning the pool on should top it up right away if it is below floor.
+		go a.maybeAutoCreate("toggle enabled")
+	}
 }
 
 func (a *App) GetAutoCreateOnExhausted() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.autoCreate
+}
+
+// SetAutoCreateMinAccounts sets the xAI pool floor (1..10). When the number of
+// usable xAI accounts drops below it, the supervisor creates accounts until the
+// pool is back at the floor.
+func (a *App) SetAutoCreateMinAccounts(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 10 {
+		n = 10
+	}
+	a.mu.Lock()
+	a.autoCreateMin = n
+	a.mu.Unlock()
+	if a.store != nil {
+		_ = a.store.UpdateSettings(func(s *store.Settings) {
+			s.AutoCreateMinAccounts = n
+		})
+	}
+	go a.maybeAutoCreate("min changed")
+}
+
+func (a *App) GetAutoCreateMinAccounts() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.autoCreateMinValue()
+}
+
+// autoCreateMinValue returns the configured pool floor (default 3). Caller must
+// hold a.mu or accept a racy read of an int (fine for a floor).
+func (a *App) autoCreateMinValue() int {
+	if a.autoCreateMin < 1 {
+		return 3
+	}
+	return a.autoCreateMin
+}
+
+// usableXAICount counts xAI accounts that can serve a request right now.
+func (a *App) usableXAICount() int {
+	if a.store == nil {
+		return 0
+	}
+	n := 0
+	for _, acc := range a.store.ListAccountsForProvider(store.ProviderXAI) {
+		if acc.Usable() {
+			n++
+		}
+	}
+	return n
 }
 
 func (a *App) GetKimiStealthHeadless() bool {
@@ -2592,7 +3353,7 @@ func (a *App) tryKimiLogoffOnQuota(acc *store.Account, reason string) bool {
 		_, _ = a.store.MarkExhausted(acc.ID, reason)
 		return false
 	}
-	_, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken)
+	err := a.logoffKimiAccountWithGoogleFallback(acc)
 	if err != nil {
 		log.Printf("kimi logoff failed for %s: %v — falling back to exhausted mark", acc.ID, err)
 		runtime.EventsEmit(a.ctx, "account:logoff_failed", map[string]any{
@@ -2622,6 +3383,48 @@ func (a *App) tryKimiLogoffOnQuota(acc *store.Account, reason string) bool {
 	// No other usable account: wait for re-login (HTTP Google refresh, else clean Playwright profile).
 	a.waitAutoKimiRelogin(id, reason)
 	return true
+}
+
+// logoffKimiAccountWithGoogleFallback deletes the remote Kimi user with the
+// stored web session first. Kimi web refresh tokens can expire before a Work
+// key hits its quota, so a failed web refresh falls back to the account's
+// Google refresh token to acquire a fresh consumer session for the same
+// logoff endpoint.
+func (a *App) logoffKimiAccountWithGoogleFallback(acc *store.Account) error {
+	if acc == nil {
+		return fmt.Errorf("no Kimi account")
+	}
+	if _, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken); err == nil {
+		return nil
+	} else {
+		webErr := err
+		googleRefresh := strings.TrimSpace(acc.GoogleRefreshToken)
+		if googleRefresh == "" {
+			return webErr
+		}
+		gl, gerr := kimi.LoginWithGoogleRefresh(googleRefresh)
+		if gerr != nil || gl == nil || strings.TrimSpace(gl.AccessToken) == "" {
+			if gerr == nil {
+				gerr = fmt.Errorf("Google refresh returned no Kimi access token")
+			}
+			return fmt.Errorf("web logoff failed (%v); Google session recovery failed: %w", webErr, gerr)
+		}
+		// Google refresh tokens can rotate. Persist the newest one before the
+		// delete so the automatic re-login path still has valid recovery state.
+		if next := strings.TrimSpace(gl.GoogleRefreshToken); next != "" && next != acc.GoogleRefreshToken {
+			acc.GoogleRefreshToken = next
+			acc.UpdatedAt = time.Now().UTC()
+			if a.store != nil {
+				if serr := a.store.UpsertAccount(*acc); serr != nil {
+					return fmt.Errorf("persist refreshed Google token before logoff: %w", serr)
+				}
+			}
+		}
+		if lerr := kimi.LogoffAccount(gl.AccessToken); lerr != nil {
+			return fmt.Errorf("web logoff failed (%v); logoff with recovered Google session failed: %w", webErr, lerr)
+		}
+		return nil
+	}
 }
 
 // maybeAutoKimiRelogin starts Kimi re-login in background (HTTP refresh first, clean profile fallback).
@@ -2915,15 +3718,156 @@ func (a *App) markAccountAuthDenied(id, reason string) {
 	// Do not auto-create on auth denial by default — user should re-login the real account.
 }
 
+// maybeAutoCreate starts the pool supervisor when the usable xAI pool is below
+// the configured floor. It replaces the old "create one when everything died"
+// behavior: the pool is kept topped up continuously, not only on total drought.
 func (a *App) maybeAutoCreate(reason string) {
 	a.mu.Lock()
 	auto := a.autoCreate
-	running := a.signupRunning
+	min := a.autoCreateMinValue()
+	supervisor := a.signupSupervisor
 	a.mu.Unlock()
-	if auto && !running {
-		runtime.EventsEmit(a.ctx, "signup:auto_triggered", map[string]any{"reason": reason})
-		_ = a.StartAutoSignup()
+	if !auto || supervisor {
+		return
 	}
+	usable := a.usableXAICount()
+	if usable >= min {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "signup:auto_triggered", map[string]any{
+		"reason": reason, "usable": usable, "target": min,
+	})
+	go a.autoCreateSupervisor(min)
+}
+
+func (a *App) autoCreateSupervisor(min int) {
+	if !a.beginSignupSupervisor() {
+		return
+	}
+	defer a.endSignupSupervisor()
+	a.signupLoop(min*2+3, func(created, usable int) bool { return usable >= min })
+}
+
+// StartSignupBatch creates exactly count new xAI accounts into the pool,
+// regardless of the current floor. This is the explicit user-driven "make me
+// N accounts" action from the UI. Sequential: each creation drives a real
+// Chrome + Turnstile + device OAuth, so runs are serialized.
+func (a *App) StartSignupBatch(count int) error {
+	if a.store == nil || a.oauth == nil || a.upstream == nil {
+		return fmt.Errorf("app ainda não inicializado")
+	}
+	if count < 1 || count > 10 {
+		return fmt.Errorf("quantidade inválida (1 a 10)")
+	}
+	if err := register.ValidateEnvironment(register.EmailProvider()); err != nil {
+		return err
+	}
+	if !a.beginSignupSupervisor() {
+		return fmt.Errorf("já existe uma criação de contas em andamento")
+	}
+	runtime.EventsEmit(a.ctx, "signup:auto_triggered", map[string]any{
+		"reason": "lote manual", "usable": a.usableXAICount(), "target": count,
+	})
+	go func() {
+		defer a.endSignupSupervisor()
+		a.signupLoop(count*2+2, func(created, usable int) bool { return created >= count })
+	}()
+	return nil
+}
+
+func (a *App) beginSignupSupervisor() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.signupSupervisor {
+		return false
+	}
+	a.signupSupervisor = true
+	a.signupSupervisorStop = false
+	return true
+}
+
+func (a *App) endSignupSupervisor() {
+	a.mu.Lock()
+	a.signupSupervisor = false
+	a.signupSupervisorStop = false
+	a.mu.Unlock()
+}
+
+// signupLoop runs the grok-register signup sequentially until done(created,
+// usable) reports the goal, with a hard attempt cap and a consecutive-failure
+// breaker so a broken flow cannot loop forever. `created` counts NEW account
+// rows added during the loop (robust against accounts exhausting mid-run);
+// `usable` is the live count of accounts that can serve requests.
+func (a *App) signupLoop(maxAttempts int, done func(created, usable int) bool) {
+	stopped := func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.signupSupervisorStop
+	}
+	waitSignupIdle := func() {
+		for a.IsSignupRunning() && !stopped() {
+			time.Sleep(3 * time.Second)
+		}
+	}
+	createdCount := func() int {
+		if a.store == nil {
+			return 0
+		}
+		return len(a.store.ListAccountsForProvider(store.ProviderXAI))
+	}
+
+	totalBefore := createdCount()
+	consecutiveFailures := 0
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if stopped() {
+			return
+		}
+		created := createdCount() - totalBefore
+		usable := a.usableXAICount()
+		if done(created, usable) {
+			runtime.EventsEmit(a.ctx, "signup:pool_ready", map[string]any{
+				"usable": usable, "created": created,
+			})
+			return
+		}
+		runtime.EventsEmit(a.ctx, "signup:batch_progress", map[string]any{
+			"created": created, "usable": usable,
+		})
+		// A manual signup (UI button) may already be running — wait for it.
+		waitSignupIdle()
+		if stopped() {
+			return
+		}
+		usableBefore := a.usableXAICount()
+		createdBefore := createdCount()
+		if err := a.StartAutoSignup(); err != nil {
+			consecutiveFailures++
+			runtime.EventsEmit(a.ctx, "signup:pool_retry", map[string]any{
+				"error": err.Error(), "failures": consecutiveFailures,
+			})
+		} else {
+			waitSignupIdle()
+			if a.usableXAICount() > usableBefore || createdCount() > createdBefore {
+				consecutiveFailures = 0
+			} else {
+				consecutiveFailures++
+			}
+		}
+		if consecutiveFailures >= 3 {
+			runtime.EventsEmit(a.ctx, "signup:pool_incomplete", map[string]any{
+				"usable": a.usableXAICount(), "reason": "3 falhas seguidas na criação",
+			})
+			return
+		}
+		if stopped() {
+			return
+		}
+		// Breathe between creations: each one spins a real Chrome + Turnstile.
+		time.Sleep(10 * time.Second)
+	}
+	runtime.EventsEmit(a.ctx, "signup:pool_incomplete", map[string]any{
+		"usable": a.usableXAICount(), "reason": "limite de tentativas atingido",
+	})
 }
 
 func (a *App) pickNonExhausted(except string) string {
@@ -2938,6 +3882,9 @@ func isQuotaExhaustedErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "too many people are chatting with kimi") {
+		return true
+	}
 	if strings.Contains(s, "usage balance exhausted") || strings.Contains(s, "balance exhausted") {
 		return true
 	}

@@ -24,7 +24,9 @@ export async function submit() {
   const pNow = (state.settings?.provider || "xai").toLowerCase();
   const sessionAuth =
     pNow === "xai" || pNow === "grok" || pNow === "kimi_work" || pNow === "kimi" ||
-    pNow === "kimi-work" || pNow === "accio" || pNow === "accio-work" || pNow === "phoenix";
+		pNow === "kimi-work" || pNow === "accio" || pNow === "accio-work" || pNow === "phoenix" ||
+		pNow === "openai_codex" || pNow === "codex" || pNow === "openai-codex";
+	const isCodex = pNow === "openai_codex" || pNow === "codex" || pNow === "openai-codex";
   if (sessionAuth && !activeAccount()) {
     alert("Adicione e selecione uma conta primeiro.");
     return;
@@ -47,6 +49,7 @@ export async function submit() {
     searches: [],
     search: null,
     citations: [],
+		reasoningItems: [],
   });
   promptEl.value = "";
   const { autoGrow } = await import("./shell.js");
@@ -83,15 +86,23 @@ export async function submit() {
   if (apiMode === "chat") {
     payload.messages = state.messages
       .filter((m) => m.role === "user" || (m.role === "assistant" && m.content && !m.streaming))
-      .map((m) => ({ role: m.role, content: m.content }));
+			.map((m) => ({
+				role: m.role,
+				content: m.content,
+				...(m.reasoningItems?.length ? { reasoning_items: m.reasoningItems } : {}),
+			}));
     if (payload.messages.at(-1)?.role === "assistant") payload.messages.pop();
-  } else if (state.lastResponseId) {
+	} else if (state.lastResponseId && !isCodex) {
     payload.last_response_id = state.lastResponseId;
     payload.messages = [{ role: "user", content: text }];
   } else {
     payload.messages = state.messages
       .filter((m) => m.role === "user" || (m.role === "assistant" && m.content && !m.streaming))
-      .map((m) => ({ role: m.role, content: m.content }));
+			.map((m) => ({
+				role: m.role,
+				content: m.content,
+				...(m.reasoningItems?.length ? { reasoning_items: m.reasoningItems } : {}),
+			}));
     if (payload.messages.at(-1)?.role === "assistant") payload.messages.pop();
   }
 
@@ -115,7 +126,12 @@ export function onChatEvent(ev) {
 
   if (onChatEventTool(ev)) return;
 
-  if (ev.type === "thinking") {
+	if (ev.type === "reasoning_item" && ev.payload) {
+		last.reasoningItems = last.reasoningItems || [];
+		if (!last.reasoningItems.some((item) => item.id && item.id === ev.payload.id)) {
+			last.reasoningItems.push(ev.payload);
+		}
+	} else if (ev.type === "thinking") {
     last.thinking = (last.thinking || "") + (ev.text || "");
     thinkChars += (ev.text || "").length;
     const approx = Math.max(0, Math.round(thinkChars / 4));

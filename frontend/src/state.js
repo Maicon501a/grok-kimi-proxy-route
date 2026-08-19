@@ -18,10 +18,10 @@ export const state = {
   picks: {
     effort: "high",
     api: "chat",
-    model: "grok-4.5",
+    model: "grok-4.6",
     cEffort: "high",
     cApi: "chat",
-    cModel: "grok-4.5",
+    cModel: "grok-4.6",
   },
   menus: {},
 };

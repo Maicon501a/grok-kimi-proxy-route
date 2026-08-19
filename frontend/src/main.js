@@ -13,12 +13,15 @@ import {
   RemoveAccount,
   RenameAccount,
   StartDeviceLogin,
+  StartCodexLogin,
   CancelDeviceLogin,
   StartAccioLogin,
   AccioStatus,
   AccioCredits,
   OpenExternal,
   UpdateSettings,
+  GetSystemPrompt,
+  SetSystemPrompt,
   SendChat,
   CancelChat,
   GetStats,
@@ -27,6 +30,9 @@ import {
   IsSignupRunning,
   SetAutoCreateOnExhausted,
   GetAutoCreateOnExhausted,
+  SetAutoCreateMinAccounts,
+  GetAutoCreateMinAccounts,
+  StartSignupBatch,
   GetGoogleCredentials,
   SetGoogleCredentials,
   GetAccountGoogleCredentials,
@@ -37,6 +43,10 @@ import {
   AddKimiFromJWT,
   AddKimiAPIKey,
   LogoffKimiAccount,
+  StartGeminiLogin,
+  CompleteGeminiLogin,
+  CancelGeminiLogin,
+  ValidateGeminiAccount,
 } from "../wailsjs/go/main/App";
 import { openStatsModal } from "./stats.js";
 import { EventsOn } from "../wailsjs/runtime/runtime";
@@ -72,10 +82,10 @@ const state = {
   picks: {
     effort: "high",
     api: "chat",
-    model: "grok-4.5",
+    model: "grok-4.6",
     cEffort: "high",
     cApi: "chat",
-    cModel: "grok-4.5",
+    cModel: "grok-4.6",
   },
   menus: {},
 };
@@ -136,6 +146,51 @@ function fallbackModels(prov) {
       { id: "deepseek-v4-pro", name: "deepseek-v4-pro" },
     ];
   }
+  if (["openai_codex", "codex", "openai-codex", "chatgpt"].includes(p)) {
+    return [
+      { id: "codex/gpt-5.6-sol", name: "GPT-5.6-Sol" },
+      { id: "codex/gpt-5.6-terra", name: "GPT-5.6-Terra" },
+      { id: "codex/gpt-5.6-luna", name: "GPT-5.6-Luna" },
+      { id: "codex/gpt-5.5", name: "GPT-5.5" },
+      { id: "codex/gpt-5.2", name: "GPT-5.2" },
+    ];
+  }
+  if (p === "opencode_go" || p === "opencode-go") {
+    return [
+      { id: "opencode-go/deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+      { id: "opencode-go/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+      { id: "opencode-go/gpt-5.6-luna", name: "GPT-5.6 Luna" },
+      { id: "opencode-go/grok-4.5", name: "Grok 4.5" },
+      { id: "opencode-go/hy3", name: "Hy3" },
+      { id: "opencode-go/kimi-k2.5", name: "Kimi K2.5" },
+      { id: "opencode-go/kimi-k2.6", name: "Kimi K2.6" },
+      { id: "opencode-go/kimi-k2.7-code", name: "Kimi K2.7 Code" },
+      { id: "opencode-go/kimi-k3", name: "Kimi K3" },
+      { id: "opencode-go/glm-5", name: "GLM 5" },
+      { id: "opencode-go/glm-5.1", name: "GLM 5.1" },
+      { id: "opencode-go/glm-5.2", name: "GLM 5.2" },
+      { id: "opencode-go/mimo-v2.5", name: "MiMo V2.5" },
+      { id: "opencode-go/mimo-v2.5-pro", name: "MiMo V2.5 Pro" },
+      { id: "opencode-go/mimo-v2-omni", name: "MiMo V2 Omni" },
+      { id: "opencode-go/mimo-v2-pro", name: "MiMo V2 Pro" },
+      { id: "opencode-go/minimax-m2.5", name: "MiniMax M2.5" },
+      { id: "opencode-go/minimax-m2.7", name: "MiniMax M2.7" },
+      { id: "opencode-go/minimax-m3", name: "MiniMax M3" },
+      { id: "opencode-go/qwen3.5-plus", name: "Qwen3.5 Plus" },
+      { id: "opencode-go/qwen3.6-plus", name: "Qwen3.6 Plus" },
+      { id: "opencode-go/qwen3.7-plus", name: "Qwen3.7 Plus" },
+      { id: "opencode-go/qwen3.7-max", name: "Qwen3.7 Max" },
+      { id: "opencode-go/qwen3.8-max", name: "Qwen3.8 Max" },
+      { id: "opencode-go/big-pickle", name: "Big Pickle" },
+      { id: "opencode-go/deepseek-v4-flash-free", name: "DeepSeek V4 Flash Free" },
+      { id: "opencode-go/laguna-s-2.1-free", name: "Laguna S 2.1" },
+      { id: "opencode-go/ling-3.0-tiny-free", name: "Ling 3.0 Tiny" },
+      { id: "opencode-go/longcat-2.0-free", name: "LongCat 2.0" },
+      { id: "opencode-go/mimo-v2.5-free", name: "MiMo V2.5 Free" },
+      { id: "opencode-go/nemotron-3-ultra-free", name: "Nemotron 3 Ultra" },
+      { id: "opencode-go/nemotron-3.5-lightning-free", name: "Nemotron 3.5 Lightning" },
+    ];
+  }
   if (p === "accio" || p === "accio-work" || p === "phoenix") {
     return [{ id: "accio/1Nexus-R36W8qJ5vB6h", name: "Accio Nexus" }];
   }
@@ -160,18 +215,13 @@ function fallbackModels(prov) {
   }
   if (p === "gemini" || p === "google" || p === "vertex") {
     return [
-      { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview" },
-      { id: "gemini-3-flash-preview", name: "gemini-3-flash-preview" },
+      { id: "gemini-3.7-flash", name: "gemini-3.7-flash" },
+      { id: "gemini-3.6-flash", name: "gemini-3.6-flash" },
       { id: "gemini-3.5-flash", name: "gemini-3.5-flash" },
-      { id: "gemini-3.1-flash-lite", name: "gemini-3.1-flash-lite" },
-      { id: "gemini-3.1-flash-image", name: "gemini-3.1-flash-image" },
-      { id: "gemini-3-pro-image", name: "gemini-3-pro-image" },
+      { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview" },
       { id: "gemini-2.5-pro", name: "gemini-2.5-pro" },
       { id: "gemini-2.5-flash", name: "gemini-2.5-flash" },
-      { id: "gemini-2.5-flash-lite", name: "gemini-2.5-flash-lite" },
-      { id: "gemini-2.0-flash-001", name: "gemini-2.0-flash-001" },
-      { id: "gemini-2.0-flash-lite-001", name: "gemini-2.0-flash-lite-001" },
-      { id: "gemini-1.5-pro-002", name: "gemini-1.5-pro-002" },
+      { id: "gemini-2.5-flash-image", name: "gemini-2.5-flash-image" },
     ];
   }
   if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
@@ -186,8 +236,8 @@ function fallbackModels(prov) {
     ];
   }
   return [
-    { id: "grok-4.5", name: "Grok 4.5" },
-    { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
+    { id: "grok-4.6", name: "Grok 4.6" },
+    { id: "grok-4.6-responses", name: "Grok 4.6 (Responses)" },
   ];
 }
 
@@ -509,6 +559,7 @@ function ensureShell() {
           <div class="accounts" id="accounts"></div>
           <div class="rail-actions" style="margin-top:10px; gap:8px; display:flex; flex-direction:column">
             <button class="btn btn-solid" id="btn-add">+ Adicionar</button>
+            <button class="btn btn-quiet" id="btn-pool">Criar em lote</button>
             <button class="btn btn-quiet" id="btn-accounts">Ver contas</button>
           </div>
         </div>
@@ -546,6 +597,21 @@ function ensureShell() {
             <span class="field-label">Modelo</span>
             <div id="set-model"></div>
           </div>
+          <section class="system-prompt-card" aria-labelledby="system-prompt-heading">
+            <div class="system-prompt-card-head">
+              <div>
+                <span class="field-label" id="system-prompt-heading">System prompt</span>
+                <span class="system-prompt-scope" id="system-prompt-scope">—</span>
+              </div>
+              <span class="system-prompt-count" id="system-prompt-count">0</span>
+            </div>
+            <textarea id="system-prompt-input" rows="7" spellcheck="false" placeholder="Instruções adicionadas pelo proxy a este modelo…"></textarea>
+            <div class="system-prompt-actions">
+              <button class="btn btn-quiet system-prompt-clear" id="system-prompt-clear" type="button">Apagar</button>
+              <button class="btn btn-solid system-prompt-save" id="system-prompt-save" type="button">Salvar</button>
+            </div>
+            <p class="system-prompt-note">Aplicado no chat do app e em toda chamada que usar este provedor + modelo.</p>
+          </section>
           <div class="field" id="qwen-fields" style="display:none">
             <span class="field-label">QwenBridge URL</span>
             <input id="qwen-upstream" type="text" placeholder="http://127.0.0.1:3000/v1"
@@ -609,6 +675,7 @@ function ensureShell() {
   `;
 
   $("#btn-add").onclick = showAddAccountChooser;
+  $("#btn-pool").onclick = showPoolBatchModal;
   $("#btn-accounts").onclick = openAccountsModal;
   $("#btn-stats").onclick = openStatsModal;
   $("#btn-stats-top").onclick = openStatsModal;
@@ -655,11 +722,13 @@ function ensureShell() {
   };
   const providerOpts = [
     { value: "xai", label: "Grok · Auth" },
+    { value: "openai_codex", label: "OpenAI Codex · ChatGPT Auth" },
     { value: "kimi_work", label: "Kimi Work · Auth" },
     { value: "ollie", label: "OllieChat · API key", status: "disabled", statusLabel: "Indispon\u00edvel" },
-    { value: "gemini", label: "Gemini · API key", status: "disabled", statusLabel: "Indispon\u00edvel" },
+    { value: "gemini", label: "Gemini AI Studio · Auth" },
     { value: "qwen", label: "Qwen · API key", status: "disabled", statusLabel: "Indispon\u00edvel" },
     { value: "deepseek", label: "DeepSeek · API key" },
+    { value: "opencode_go", label: "OpenCode Go · API key" },
     { value: "accio", label: "Accio · Auth", status: "maintenance", statusLabel: "Em manuten\u00e7\u00e3o" },
   ];
   providerOpts.splice(providerOpts.length - 1, 0, {
@@ -676,6 +745,58 @@ function ensureShell() {
       label: shortModelLabel(m.name || m.id, m.id),
     }));
 
+  const systemPromptInput = () => $("#system-prompt-input");
+  const selectedSystemPromptScope = () => ({
+    provider: state.settings?.provider || "xai",
+    model: selectedModelId(false) || state.settings?.default_model || "default",
+  });
+  let systemPromptLoad = 0;
+  async function loadSystemPrompt() {
+    const input = systemPromptInput();
+    if (!input) return;
+    const scope = selectedSystemPromptScope();
+    const loadId = ++systemPromptLoad;
+    const scopeLabel = $("#system-prompt-scope");
+    if (scopeLabel) scopeLabel.textContent = `${scope.provider} · ${shortModelLabel(scope.model, scope.model)}`;
+    input.disabled = true;
+    try {
+      const prompt = await GetSystemPrompt(scope.provider, scope.model);
+      if (loadId !== systemPromptLoad) return;
+      input.value = prompt || "";
+      updateSystemPromptCounter();
+    } catch (error) {
+      console.warn("system prompt", error);
+    } finally {
+      if (loadId === systemPromptLoad) input.disabled = false;
+    }
+  }
+  function updateSystemPromptCounter() {
+    const input = systemPromptInput();
+    const count = $("#system-prompt-count");
+    if (input && count) count.textContent = `${input.value.length.toLocaleString("pt-BR")} caracteres`;
+  }
+  async function saveSystemPrompt(clear = false) {
+    const input = systemPromptInput();
+    if (!input) return;
+    const scope = selectedSystemPromptScope();
+    const value = clear ? "" : input.value;
+    const save = $("#system-prompt-save");
+    const clearButton = $("#system-prompt-clear");
+    if (save) save.disabled = true;
+    if (clearButton) clearButton.disabled = true;
+    try {
+      await SetSystemPrompt(scope.provider, scope.model, value);
+      input.value = value.trim();
+      updateSystemPromptCounter();
+    } catch (error) {
+      console.error("salvar system prompt", error);
+      alert(`Não foi possível salvar o system prompt: ${error?.message || error}`);
+    } finally {
+      if (save) save.disabled = false;
+      if (clearButton) clearButton.disabled = false;
+    }
+  }
+
   async function switchProvider(v) {
     const statusInfo = providerStatusInfo(v);
     if (statusInfo) {
@@ -688,14 +809,16 @@ function ensureShell() {
         return;
       }
     }
-    if (v === "deepseek") {
+    if (v === "deepseek" || v === "opencode_go") {
       // Chave já salva → conecta direto (sem modal). Modal só quando não há chave.
-      const hasKey = !!state.settings?.deepseek_api_key;
+      const hasKey = v === "deepseek"
+        ? !!state.settings?.deepseek_api_key
+        : !!state.settings?.opencode_go_api_key;
       if (!hasKey) {
-        const res = await showDeepSeekKeyModal();
+        const res = await showAPIKeyModal(v);
         if (!res) return;
         const patch = { provider: v };
-        if (res.key != null) patch.deepseek_api_key = res.key;
+        if (res.key != null) patch[v === "deepseek" ? "deepseek_api_key" : "opencode_go_api_key"] = res.key;
         await saveGlobal(patch);
       } else {
         await saveGlobal({ provider: v });
@@ -737,7 +860,7 @@ function ensureShell() {
     state.menus["c-model"]?.setValue(prefer);
     // Grok: Responses. Kimi Work: chat/completions only (no responses on agent-gw).
     const isKimi = v === "kimi_work" || v === "kimi" || v === "kimi-work";
-    const api = v === "xai" ? "responses" : "chat";
+    const api = v === "xai" || v === "openai_codex" ? "responses" : "chat";
     if (state.settings.api_mode !== api) {
       await saveGlobal({ api_mode: api });
     }
@@ -751,6 +874,7 @@ function ensureShell() {
     }
     updateProviderChrome();
     await refreshBootstrap(false);
+    await loadSystemPrompt();
   }
 
   const effortOpts = () => {
@@ -797,8 +921,14 @@ function ensureShell() {
       state.menus["c-model"]?.setValue(v);
       saveGlobal({ default_model: v });
       syncEffortMenus();
+      loadSystemPrompt();
     },
   });
+
+  systemPromptInput()?.addEventListener("input", updateSystemPromptCounter);
+  $("#system-prompt-save")?.addEventListener("click", () => saveSystemPrompt());
+  $("#system-prompt-clear")?.addEventListener("click", () => saveSystemPrompt(true));
+  loadSystemPrompt();
 
   // QwenBridge settings (visible only when provider=qwen — see updateProviderChrome).
   const qwenSave = $("#qwen-save");
@@ -903,7 +1033,7 @@ function fillModels() {
   // custom menus re-render options via refresh
   state.menus["set-model"]?.refresh?.();
   state.menus["c-model"]?.refresh?.();
-  const prefer = state.settings.default_model || state.picks.model || "grok-4.5";
+  const prefer = state.settings.default_model || state.picks.model || "grok-4.6";
   if (state.menus["set-model"]) state.menus["set-model"].setValue(prefer);
   if (state.menus["c-model"] && !state.picks.cModelTouched) {
     state.menus["c-model"].setValue(prefer);
@@ -960,9 +1090,9 @@ async function confirmAndLogoffKimi(account) {
     if (!ok) return;
     try {
       setStatus("Deletando conta no kimi.com…");
-      await LogoffKimiAccount(account.id);
+      const result = await LogoffKimiAccount(account.id);
       await refreshBootstrap(false);
-      setStatus("Conta deletada no kimi.com");
+      setStatus(result?.remote ? "Conta deletada no kimi.com e removida do proxy" : "Conta removida do proxy");
     } catch (e) {
       alert("Falha ao deletar: " + e);
       setStatus("Erro ao deletar conta");
@@ -1158,7 +1288,21 @@ function paintChrome() {
       : "Clique em <b>+ Conta Grok</b> para OAuth xAI.";
     list.innerHTML = `<div class="account empty-hint">Nenhuma conta neste provedor.<br/>${how}</div>`;
   } else {
-    state.accounts.forEach((a) => {
+    // Keep healthy accounts visible at the top of a large pool. Previously the
+    // store order put old exhausted rows immediately below the active account,
+    // making newly-created usable accounts look like they were never imported.
+    const orderedAccounts = [...state.accounts].sort((a, b) => {
+      const rank = (item) => {
+        if (item.active) return 0;
+        if (!item.exhausted && !item.chat_denied && !item.needs_login) return 1;
+        if (!item.exhausted) return 2;
+        return 3;
+      };
+      const diff = rank(a) - rank(b);
+      if (diff) return diff;
+      return String(b.created_at || b.updated_at || "").localeCompare(String(a.created_at || a.updated_at || ""));
+    });
+    orderedAccounts.forEach((a) => {
       const u = a.usage || {};
       const card = document.createElement("div");
       card.className = "account" + (a.active ? " active" : "");
@@ -1170,7 +1314,8 @@ function paintChrome() {
             <div class="meta-line">
               ${a.active ? `<span class="badge badge-live">ativa</span>` : `<span class="badge badge-ok">salva</span>`}
               ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
-              ${a.expired ? `<span class="badge badge-warn">token exp.</span>` : ""}
+              ${a.expired && a.has_refresh === false ? `<span class="badge badge-warn" title="Sem refresh token — faça login de novo.">login expirado</span>` : ""}
+              ${a.expired && a.has_refresh !== false ? `<span class="badge" title="Access token expirado; renovação automática via refresh.">renova auto</span>` : ""}
               ${kimiUI && a.has_web_session ? `<span class="badge badge-ok" title="Sessão web (pode deletar no site)">web</span>` : ""}
               <span>${escapeHtml((a.email || "").split("@")[0] || a.id.slice(0, 8))}</span>
             </div>
@@ -1232,7 +1377,7 @@ function paintChrome() {
   // sync pick values from settings
   state.picks.effort = state.settings.reasoning_effort || state.picks.effort || "high";
   state.picks.api = state.settings.api_mode || state.picks.api || "chat";
-  state.picks.model = state.settings.default_model || state.picks.model || "grok-4.5";
+  state.picks.model = state.settings.default_model || state.picks.model || "grok-4.6";
   if (!state.picks.cEffort) state.picks.cEffort = state.picks.effort;
   if (!state.picks.cApi) state.picks.cApi = state.picks.api;
   if (!state.picks.cModel) state.picks.cModel = state.picks.model;
@@ -1417,17 +1562,6 @@ function providerStatusInfo(provider) {
       detail: "OllieChat est\u00e1 temporariamente fora da rota do Grok Desktop.",
     };
   }
-  if (p === "gemini" || p === "google" || p === "vertex") {
-    return {
-      name: "Gemini",
-      status: "disabled",
-      badge: "PROVEDOR DESATIVADO",
-      label: "Indispon\u00edvel",
-      symbol: "G",
-      message: "Sinto muito, mas infelizmente esse provedor se encontra desabilitado por enquanto. Tente outro.",
-      detail: "Gemini est\u00e1 temporariamente fora da rota do Grok Desktop.",
-    };
-  }
   if (p === "qwen" || p === "qwenbridge") {
     return {
       name: "Qwen",
@@ -1486,8 +1620,13 @@ function showProviderStatusModal(provider) {
 
 function providerAuthMode(p) {
   p = (p || state.settings?.provider || "xai").toLowerCase();
-  if (p === "xai" || p === "grok" || p === "kimi_work" || p === "kimi" || p === "kimi-work" || p === "accio" || p === "accio-work" || p === "phoenix") return "auth";
+  if (p === "xai" || p === "grok" || p === "openai_codex" || p === "codex" || p === "openai-codex" || p === "chatgpt" || p === "kimi_work" || p === "kimi" || p === "kimi-work" || p === "accio" || p === "accio-work" || p === "phoenix" || isGeminiProvider(p)) return "auth";
   return "api_key";
+}
+
+function isGeminiProvider(provider = state.settings?.provider) {
+  const p = (provider || "").toLowerCase();
+  return p === "gemini" || p === "google" || p === "vertex";
 }
 
 function updateProviderChrome() {
@@ -1503,15 +1642,18 @@ function updateProviderChrome() {
       el.textContent = `Qwen · API key · ${shortModelLabel(model, model)}`;
     } else if (p === "deepseek") {
       el.textContent = `DeepSeek · API key ${state.settings?.deepseek_api_key ? "🔒" : "⚠"} · ${shortModelLabel(model, model)}`;
+    } else if (["openai_codex", "codex", "openai-codex", "chatgpt"].includes(p)) {
+      el.textContent = `OpenAI Codex · ChatGPT Auth · ${shortModelLabel(model, model)}`;
+    } else if (p === "opencode_go" || p === "opencode-go") {
+      el.textContent = `OpenCode Go · API key ${state.settings?.opencode_go_api_key ? "🔒" : "⚠"} · ${shortModelLabel(model, model)}`;
     } else if (p === "accio" || p === "accio-work" || p === "phoenix") {
       el.textContent = `Accio · Auth · ${shortModelLabel(model, model)}`;
     } else if (["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
       el.textContent = `OpenCode Zen Free - keyless - ${shortModelLabel(model, model)}`;
     } else if (p === "ollie" || p === "olliechat") {
       el.textContent = `Ollie · API key · ${shortModelLabel(model, model)}`;
-    } else if (p === "gemini" || p === "google" || p === "vertex") {
-      const proj = state.settings?.gemini_project || "ADC project";
-      el.textContent = `Gemini · API key · ${shortModelLabel(model, model)} · ${proj}`;
+    } else if (isGeminiProvider(p)) {
+      el.textContent = `Gemini AI Studio · Auth · ${shortModelLabel(model, model)}`;
     } else if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
       el.textContent = `Kimi Work · Auth · ${shortModelLabel(model, model)}`;
     } else {
@@ -1533,10 +1675,16 @@ function updateProviderChrome() {
     // Accio maintenance is advisory: account login/management remains usable.
     // Only providers explicitly marked disabled hide these controls.
     addBtn.style.display = disabled ? "none" : mode === "auth" ? "" : "none";
-    addBtn.textContent = p.startsWith("kimi") ? "+ Conta Kimi" : (p === "accio" || p === "accio-work" || p === "phoenix" ? "Login Accio" : "+ Conta Grok");
+    addBtn.textContent = p.startsWith("kimi") ? "+ Conta Kimi" : isGeminiProvider(p) ? "+ Conta Gemini" : (p === "accio" || p === "accio-work" || p === "phoenix" ? "Login Accio" : (["openai_codex", "codex", "openai-codex", "chatgpt"].includes(p) ? "+ Conta ChatGPT" : "+ Conta Grok"));
   }
   if (accBtn) {
     accBtn.style.display = disabled ? "none" : mode === "auth" ? "" : "none";
+  }
+  // Pool batch creation only exists for the Grok/xAI provider (grok-register).
+  const poolBtn = $("#btn-pool");
+  if (poolBtn) {
+    const isGrok = p === "xai" || p === "grok" || p === "";
+    poolBtn.style.display = !disabled && isGrok ? "" : "none";
   }
   const hint = document.querySelector(".tool-hint");
   if (hint) {
@@ -1549,6 +1697,12 @@ function updateProviderChrome() {
     } else if (p === "deepseek") {
       hint.textContent = "DeepSeek";
       hint.title = "DeepSeek API oficial · chat/completions · chave criptografada";
+    } else if (["openai_codex", "codex", "openai-codex", "chatgpt"].includes(p)) {
+      hint.textContent = "Codex Responses";
+      hint.title = "Backend oficial do Codex usando a assinatura ChatGPT da conta";
+    } else if (p === "opencode_go" || p === "opencode-go") {
+      hint.textContent = "OpenCode Go";
+      hint.title = "OpenCode direto · chave de opencode.ai/auth · chat/completions";
     } else if (p === "accio" || p === "accio-work" || p === "phoenix") {
       hint.textContent = "Accio";
       hint.title = "Accio/Phoenix · login no Accio · chat/completions";
@@ -1558,9 +1712,9 @@ function updateProviderChrome() {
     } else if (p === "ollie" || p === "olliechat") {
       hint.textContent = "OllieChat";
       hint.title = "Upstream OllieChat (sem chave)";
-    } else if (p === "gemini" || p === "google" || p === "vertex") {
-      hint.textContent = "Gemini ADC";
-      hint.title = "Vertex AI via Application Default Credentials (gcloud)";
+    } else if (isGeminiProvider(p)) {
+      hint.textContent = "Gemini AI Studio";
+      hint.title = "Sessões Google AI Studio · multi-conta · rotação local";
     } else if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
       hint.textContent = "chat/completions";
       hint.title = "Kimi Work agent-gw · só /v1/chat/completions (sem Responses nativo)";
@@ -1613,6 +1767,14 @@ function closeOverlay() {
 
 function showAddAccountChooser() {
   const p = (state.settings?.provider || "xai").toLowerCase();
+  if (isGeminiProvider(p)) {
+    showGeminiLoginModal();
+    return;
+  }
+  if (["openai_codex", "codex", "openai-codex", "chatgpt"].includes(p)) {
+    startCodexLogin();
+    return;
+  }
   if (p === "accio" || p === "accio-work" || p === "phoenix") {
     StartAccioLogin().catch((e) => alert("Falha ao iniciar login Accio: " + e));
     return;
@@ -1621,25 +1783,27 @@ function showAddAccountChooser() {
     showAddKimiChooser();
     return;
   }
-  if (p === "deepseek") {
-    showDeepSeekKeyModal().then(async (res) => {
+  if (p === "deepseek" || p === "opencode_go" || p === "opencode-go") {
+    const isOpenCodeGo = p === "opencode_go" || p === "opencode-go";
+    showAPIKeyModal(isOpenCodeGo ? "opencode_go" : "deepseek").then(async (res) => {
       if (!res) return;
-      const patch = { provider: "deepseek" };
-      if (res.key != null) patch.deepseek_api_key = res.key;
+      const patch = { provider: isOpenCodeGo ? "opencode_go" : "deepseek" };
+      if (res.key != null) patch[isOpenCodeGo ? "opencode_go_api_key" : "deepseek_api_key"] = res.key;
       await saveGlobal(patch);
       await refreshBootstrap(false);
-      setStatus(res.key ? "DeepSeek conectado — chave criptografada e salva" : "DeepSeek — chave mantida");
+      const name = isOpenCodeGo ? "OpenCode Go" : "DeepSeek";
+      setStatus(res.key ? `${name} conectado — chave criptografada e salva` : `${name} — chave mantida`);
     });
     return;
   }
-  if (p === "ollie" || p === "gemini" || p === "google" || p === "vertex" || p === "qwen" || p === "qwenbridge" || ["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
+  if (p === "ollie" || p === "qwen" || p === "qwenbridge" || ["opencode_zen", "opencode-zen", "opencode", "zen", "zen-free"].includes(p)) {
     closeOverlay();
     const overlay = document.createElement("div");
     overlay.className = "overlay overlay-glass";
     overlay.innerHTML = `
       <div class="sheet sheet-choose">
         <h3>Provedor API key</h3>
-        <p>Ollie, Gemini e Qwen não usam pool de contas de sessão. Configure o provedor em <b>Global</b> — a credencial é direta (keyless / ADC / bridge local).</p>
+        <p>Este provedor não usa pool de contas de sessão. Configure a credencial em <b>Global</b>.</p>
         <div class="sheet-actions">
           <button class="btn btn-quiet" id="m-cancel">Fechar</button>
         </div>
@@ -1661,7 +1825,7 @@ function showAddAccountChooser() {
       <div class="choose-grid">
         <button type="button" class="choose-card" id="m-auto">
           <strong>Automática</strong>
-          <span>Cria conta com darkemail + Chrome isolate, depois pede device OAuth pros tokens da API.</span>
+          <span>Cria conta com mailtm + Turnstile no Chrome real, autoriza o device OAuth e valida no grok-4.6.</span>
         </button>
         <button type="button" class="choose-card" id="m-manual">
           <strong>Manual</strong>
@@ -1670,7 +1834,9 @@ function showAddAccountChooser() {
       </div>
       <label class="auto-toggle">
         <input type="checkbox" id="m-auto-quota" />
-        Criar conta automática quando a cota acabar (402 / balance exhausted)
+        Manter pool de contas — quando a cota acabar, criar até ter pelo menos
+        <input type="number" id="m-auto-min" min="1" max="10" step="1" value="3" class="auto-min-input" />
+        contas válidas
       </label>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Fechar</button>
@@ -1691,6 +1857,16 @@ function showAddAccountChooser() {
   $("#m-auto-quota", overlay).onchange = (e) => {
     SetAutoCreateOnExhausted(!!e.target.checked).catch(() => {});
   };
+  GetAutoCreateMinAccounts()
+    .then((v) => {
+      const el = $("#m-auto-min", overlay);
+      if (el && v > 0) el.value = v;
+    })
+    .catch(() => {});
+  $("#m-auto-min", overlay).onchange = (e) => {
+    const n = parseInt(e.target.value, 10);
+    if (Number.isFinite(n)) SetAutoCreateMinAccounts(n).catch(() => {});
+  };
   $("#m-manual", overlay).onclick = () => {
     overlay.remove();
     startLogin();
@@ -1699,6 +1875,131 @@ function showAddAccountChooser() {
     overlay.remove();
     startAutoSignupUI();
   };
+}
+
+// Modal do botão "Criar em lote" (só visível com o provedor Grok selecionado):
+// escolhe quantas contas novas a automação deve criar para o pool.
+function showPoolBatchModal() {
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  const usableNow = (state.accounts || []).filter(
+    (a) => (a.provider || "xai") === "xai" && !a.exhausted && !a.chat_denied && !a.needs_login
+  ).length;
+  overlay.innerHTML = `
+    <div class="sheet sheet-choose" style="width:min(460px,92vw)">
+      <h3>Criar contas Grok em lote</h3>
+      <p><span class="mode-pill mode-auth">Auth</span> Automação grok-register — cada conta leva ~2-3 min (Chrome + Turnstile + OAuth), criadas em sequência.</p>
+      <label class="field">
+        <span>Quantas contas criar agora (1-10)</span>
+        <input id="pool-count" type="number" class="input" min="1" max="10" step="1" value="3" />
+      </label>
+      <div class="empty-hint" id="pool-status" style="margin-top:8px">
+        Pool atual: ${usableNow} conta(s) utilizável(is).
+      </div>
+      <div class="sheet-actions">
+        <button class="btn btn-quiet" id="pool-cancel">Cancelar</button>
+        <button class="btn btn-solid" id="pool-start">Criar contas</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  $("#pool-cancel", overlay).onclick = close;
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  const startBtn = $("#pool-start", overlay);
+  const countInput = $("#pool-count", overlay);
+  const statusEl = $("#pool-status", overlay);
+  startBtn.onclick = async () => {
+    let n = parseInt(countInput.value, 10);
+    if (!Number.isFinite(n) || n < 1) n = 1;
+    if (n > 10) n = 10;
+    startBtn.disabled = true;
+    statusEl.textContent = `Iniciando criação de ${n} conta(s)…`;
+    try {
+      await StartSignupBatch(n);
+      const st = $("#status-text");
+      if (st) st.innerHTML = `Lote Grok · criando <strong>${n}</strong> conta(s)…`;
+      close();
+    } catch (err) {
+      statusEl.textContent = "Erro: " + (err?.message || err);
+      startBtn.disabled = false;
+    }
+  };
+}
+
+async function showGeminiLoginModal(accountID = "") {
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  const relogin = !!accountID;
+  overlay.innerHTML = `
+    <div class="sheet sheet-choose" style="width:min(500px,92vw)">
+      <h3>${relogin ? "Entrar novamente no Gemini" : "Adicionar conta Gemini"}</h3>
+      <p>O Grok Desktop abrirá um Chrome dedicado. Entre no Google e aguarde o AI Studio carregar; depois volte aqui para concluir.</p>
+      ${relogin ? "" : `
+        <label class="field"><span>Nome da conta (opcional)</span><input id="gemini-login-label" class="input" placeholder="Conta pessoal" /></label>
+        <label class="field"><span>E-mail (opcional)</span><input id="gemini-login-email" class="input" placeholder="voce@gmail.com" /></label>`}
+      <div id="gemini-login-status" class="empty-hint" style="margin-top:12px">Pronto para abrir o navegador.</div>
+      <div class="sheet-actions">
+        <button class="btn btn-quiet" id="gemini-login-cancel">Cancelar</button>
+        <button class="btn btn-solid" id="gemini-login-start">Abrir Chrome</button>
+        <button class="btn btn-solid" id="gemini-login-complete" style="display:none">Concluir login</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  let pendingID = accountID;
+  const status = $("#gemini-login-status", overlay);
+  const start = $("#gemini-login-start", overlay);
+  const complete = $("#gemini-login-complete", overlay);
+  const cancel = $("#gemini-login-cancel", overlay);
+  start.onclick = async () => {
+    start.disabled = true;
+    status.textContent = "Abrindo Chrome dedicado…";
+    try {
+      const result = await StartGeminiLogin(
+        accountID,
+        $("#gemini-login-label", overlay)?.value?.trim() || "",
+        $("#gemini-login-email", overlay)?.value?.trim() || "",
+      );
+      pendingID = `gemini:${result.profile_id}`;
+      status.textContent = "Chrome aberto. Faça login no Google/AI Studio e clique em Concluir login.";
+      start.style.display = "none";
+      complete.style.display = "";
+    } catch (error) {
+      status.textContent = `Não foi possível abrir o Chrome: ${error?.message || error}`;
+      start.disabled = false;
+    }
+  };
+  complete.onclick = async () => {
+    complete.disabled = true;
+    status.textContent = "Validando a sessão do AI Studio…";
+    try {
+      const result = await CompleteGeminiLogin(pendingID);
+      if (result?.status === "warning") {
+        status.textContent = `Login ainda não detectado: ${result.message || "termine o login no Chrome"}`;
+        complete.disabled = false;
+        return;
+      }
+      status.textContent = `Conta conectada${result?.email ? `: ${result.email}` : ""}.`;
+      await refreshBootstrap(false);
+      overlay.remove();
+      openAccountsModal();
+    } catch (error) {
+      status.textContent = `Falha ao validar: ${error?.message || error}`;
+      complete.disabled = false;
+    }
+  };
+  cancel.onclick = async () => {
+    if (pendingID) {
+      try { await CancelGeminiLogin(pendingID); } catch (_) {}
+    }
+    overlay.remove();
+  };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) cancel.click();
+  });
 }
 
 async function showAddKimiChooser() {
@@ -1817,17 +2118,19 @@ function showKimiPasteModal(kind) {
  * persistir. Retorna { key } com a chave nova, { key: null } para manter a
  * salva, ou null se o usuário cancelou.
  */
-function showDeepSeekKeyModal() {
+function showAPIKeyModal(provider) {
   return new Promise((resolve) => {
-    const hasKey = !!state.settings?.deepseek_api_key;
+    const isOpenCodeGo = provider === "opencode_go";
+    const providerName = isOpenCodeGo ? "OpenCode Go" : "DeepSeek";
+    const hasKey = isOpenCodeGo ? !!state.settings?.opencode_go_api_key : !!state.settings?.deepseek_api_key;
     const overlay = document.createElement("div");
     overlay.className = "overlay overlay-glass";
     overlay.innerHTML = `
       <div class="sheet sheet-deepseek">
         <div class="ds-hero">
           <div class="ds-logo"><span>DS</span></div>
-          <h3>Conectar ao DeepSeek</h3>
-          <p>API oficial DeepSeek · chat/completions</p>
+          <h3>Conectar ao ${providerName}</h3>
+          <p>${isOpenCodeGo ? "API key do OpenCode Go · chat/completions" : "API oficial DeepSeek · chat/completions"}</p>
         </div>
         <div class="ds-body">
           <div class="field" style="margin-bottom:14px">
@@ -1847,7 +2150,7 @@ function showDeepSeekKeyModal() {
           </p>
           <p id="ds-error" class="ds-error" style="display:none"></p>
           <div class="ds-actions">
-            <a href="#" id="ds-link">Criar chave no platform.deepseek.com</a>
+            <a href="#" id="ds-link">${isOpenCodeGo ? "Criar chave em opencode.ai/auth" : "Criar chave no platform.deepseek.com"}</a>
             <div class="sheet-actions" style="margin-top:4px">
               <button class="btn btn-solid btn-ds" id="ds-save" type="button">Conectar</button>
               <button class="btn btn-quiet" id="ds-cancel" type="button">Cancelar</button>
@@ -1874,7 +2177,7 @@ function showDeepSeekKeyModal() {
     $("#ds-link", overlay).onclick = (e) => {
       e.preventDefault();
       try {
-        OpenExternal("https://platform.deepseek.com/api_keys");
+        OpenExternal(isOpenCodeGo ? "https://opencode.ai/auth" : "https://platform.deepseek.com/api_keys");
       } catch (_) {}
     };
     const cancel = () => {
@@ -1891,7 +2194,7 @@ function showDeepSeekKeyModal() {
     $("#ds-save", overlay).onclick = async () => {
       const raw = (keyInput?.value || "").trim();
       if (!raw && !hasKey) {
-        fail("Cole a API key do DeepSeek (sk-…) para conectar.");
+        fail(`Cole a API key do ${providerName} para conectar.`);
         return;
       }
       overlay.remove();
@@ -2012,8 +2315,10 @@ async function openAccountsModal() {
     accounts = (await ListAccountsForProvider(p)) || accounts;
   } catch (_) {}
     const kimiUI = isKimiProvider(p);
+    const geminiUI = isGeminiProvider(p);
     const accioUI = p === "accio" || p === "accio-work" || p === "phoenix";
-    const title = kimiUI ? "Contas Kimi Work" : accioUI ? "Contas Accio" : "Contas Grok";
+    const codexUI = ["openai_codex", "codex", "openai-codex", "chatgpt"].includes(p);
+    const title = geminiUI ? "Contas Gemini AI Studio" : kimiUI ? "Contas Kimi Work" : accioUI ? "Contas Accio" : codexUI ? "Contas ChatGPT Codex" : "Contas Grok";
 
   const overlay = document.createElement("div");
   overlay.className = "overlay overlay-glass";
@@ -2032,6 +2337,9 @@ async function openAccountsModal() {
             else statusBadges.push(`<span class="badge badge-ok">salva</span>`);
             if (a.exhausted) statusBadges.push(`<span class="badge badge-danger">esgotada</span>`);
             if (a.auth_denied) statusBadges.push(`<span class="badge badge-danger">auth negada</span>`);
+            if (geminiUI && a.is_valid) statusBadges.push(`<span class="badge badge-ok">sessão válida</span>`);
+            if (geminiUI && !a.is_valid) statusBadges.push(`<span class="badge badge-danger">login necessário</span>`);
+            if (geminiUI && a.default) statusBadges.push(`<span class="badge badge-live">padrão</span>`);
             if (kimiUI && a.has_web_session) statusBadges.push(`<span class="badge badge-ok">sessão web</span>`);
             if (accioUI) statusBadges.push(`<span class="badge badge-ok">pool Accio</span>`);
             if (a.has_google_refresh) statusBadges.push(`<span class="badge badge-ok" title="Google refresh token salvo">google refresh</span>`);
@@ -2051,8 +2359,9 @@ async function openAccountsModal() {
                 </div>
               </div>
               <div class="acc-card-actions">
-                ${a.active ? `<button type="button" class="btn btn-xs btn-disabled" disabled>Em uso</button>` : `<button type="button" class="btn btn-xs btn-solid" data-act="use">Usar</button>`}
+                ${a.active ? `<button type="button" class="btn btn-xs btn-disabled" disabled>${geminiUI ? "Padrão" : "Em uso"}</button>` : `<button type="button" class="btn btn-xs btn-solid" data-act="use">${geminiUI ? "Tornar padrão" : "Usar"}</button>`}
                 <button type="button" class="btn btn-xs btn-quiet" data-act="rename">Renomear</button>
+                ${geminiUI ? `<button type="button" class="btn btn-xs btn-quiet" data-act="validate">Validar</button><button type="button" class="btn btn-xs btn-quiet" data-act="relogin">Login</button>` : ""}
                 ${kimiUI ? `<button type="button" class="btn btn-xs btn-quiet" data-act="creds" title="Configurar credenciais Google para auto-login">Credenciais Google</button>` : ""}
                 ${a.has_google_refresh ? `<button type="button" class="btn btn-xs btn-quiet" data-act="test-google-refresh" title="Google refresh token salvo">Google Refresh OK</button>` : ""}
                 ${kimiUI
@@ -2068,7 +2377,7 @@ async function openAccountsModal() {
       <div class="sheet-head" style="margin-bottom:14px">
         <div>
           <h3 style="font-size:18px;margin-bottom:4px">${title}</h3>
-          <p style="font-size:12px;opacity:.7;margin:0"><span class="mode-pill mode-auth">Auth</span> pool · ${accounts.length}${kimiUI ? "/3" : ""} conta(s) · rotação + re-login automático</p>
+          <p style="font-size:12px;opacity:.7;margin:0"><span class="mode-pill mode-auth">${geminiUI ? "AI Studio" : "Auth"}</span> pool · ${accounts.length}${kimiUI ? "/3" : ""} conta(s) · ${geminiUI ? "Chrome dedicado + rotação local" : (codexUI ? "refresh OAuth automático" : "rotação + re-login automático")}</p>
         </div>
         <button class="btn btn-quiet" id="m-close" style="height:30px">Fechar</button>
       </div>
@@ -2108,7 +2417,6 @@ async function openAccountsModal() {
           if (a) {
             overlay.remove();
             await showAccountCredsModal(a);
-            openAccountsModal();
           }
         } else if (act === "logoff") {
           const a = accounts.find((x) => x.id === id);
@@ -2117,6 +2425,20 @@ async function openAccountsModal() {
             await confirmAndLogoffKimi(a);
             openAccountsModal();
           }
+        } else if (act === "validate") {
+          btn.disabled = true;
+          try {
+            const result = await ValidateGeminiAccount(id);
+            alert(result?.status === "ok" ? "Conta Gemini validada." : `Validação: ${result?.message || "sessão inválida"}`);
+            await refreshBootstrap(false);
+            openAccountsModal();
+          } catch (error) {
+            alert(`Falha ao validar conta Gemini: ${error?.message || error}`);
+            btn.disabled = false;
+          }
+        } else if (act === "relogin") {
+          overlay.remove();
+          showGeminiLoginModal(id);
         } else if (act === "remove") {
           if (confirm("Remover esta conta?")) {
             await RemoveAccount(id);
@@ -2149,6 +2471,26 @@ async function startLogin() {
   }
 }
 
+async function startCodexLogin() {
+  try {
+    const st = await StartCodexLogin();
+    state.device = st;
+    showDeviceModal(st, {
+      title: "Entrar com ChatGPT",
+      providerName: "OpenAI",
+		instruction: "Entre na sua conta ChatGPT no navegador. Ao concluir, esta tela fecha automaticamente.",
+		browserOnly: true,
+    });
+    if (st.verification_url) {
+      try {
+        await OpenExternal(st.verification_url);
+      } catch (_) {}
+    }
+  } catch (e) {
+    alert("Falha ao iniciar login Codex: " + e);
+  }
+}
+
 function showDeviceModal(st, extra = {}) {
   closeOverlay();
   const overlay = document.createElement("div");
@@ -2156,15 +2498,17 @@ function showDeviceModal(st, extra = {}) {
   const emailHint = extra.email
     ? `<p class="hint-email">Use a conta <strong>${escapeHtml(extra.email)}</strong>${extra.password ? ` · senha <code id="m-pass">${escapeHtml(extra.password)}</code>` : ""}</p>`
     : "";
+	const codeBlock = extra.browserOnly ? "" : `<div class="code">${escapeHtml(st.user_code)}</div>`;
+	const copyButton = extra.browserOnly ? "" : `<button class="btn btn-quiet" id="m-copy">Copiar código</button>`;
   overlay.innerHTML = `
     <div class="sheet">
       <h3>${extra.title || "Adicionar conta"}</h3>
-      <p>Confirme o código na página da xAI. O app completa sozinho.</p>
+      <p>${escapeHtml(extra.instruction || `Confirme o código na página da ${extra.providerName || "xAI"}. O app completa sozinho.`)}</p>
       ${emailHint}
-      <div class="code">${escapeHtml(st.user_code)}</div>
+		${codeBlock}
       <div class="sheet-actions">
         <button class="btn btn-solid" id="m-open">Abrir login</button>
-        <button class="btn btn-quiet" id="m-copy">Copiar código</button>
+			${copyButton}
         ${extra.password ? `<button class="btn btn-quiet" id="m-copy-pass">Copiar senha</button>` : ""}
         <button class="btn btn-quiet" id="m-cancel">Cancelar</button>
       </div>
@@ -2174,9 +2518,12 @@ function showDeviceModal(st, extra = {}) {
   `;
   document.body.appendChild(overlay);
   $("#m-open", overlay).onclick = () => OpenExternal(st.verification_url);
-  $("#m-copy", overlay).onclick = async () => {
-    await navigator.clipboard.writeText(st.user_code);
-  };
+	const copyCode = $("#m-copy", overlay);
+	if (copyCode) {
+		copyCode.onclick = async () => {
+			await navigator.clipboard.writeText(st.user_code);
+		};
+	}
   const cp = $("#m-copy-pass", overlay);
   if (cp) {
     cp.onclick = async () => {
@@ -2200,7 +2547,7 @@ async function startAutoSignupUI() {
   overlay.innerHTML = `
     <div class="sheet">
       <h3>Criação automática</h3>
-      <p>Chrome isolate + darkemail. Pode levar 1–3 min. Não feche o app.</p>
+      <p>grok-register + OAuth Device Flow + teste real no Grok 4.6. Pode levar alguns minutos.</p>
       <div class="signup-log" id="m-log">preparando…</div>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Cancelar</button>
@@ -2252,6 +2599,7 @@ async function submit() {
     state.menus["c-effort"]?.getValue?.() || state.picks.cEffort || state.settings.reasoning_effort;
   const isKimi =
     pNow === "kimi_work" || pNow === "kimi" || pNow === "kimi-work";
+	const isCodex = pNow === "openai_codex" || pNow === "codex" || pNow === "openai-codex";
   let apiMode =
     state.menus["c-api"]?.getValue?.() || state.picks.cApi || state.settings.api_mode;
   if (isKimi) apiMode = "chat";
@@ -2266,6 +2614,7 @@ async function submit() {
     searches: [],
     search: null,
     citations: [],
+		reasoningItems: [],
   });
   promptEl.value = "";
   autoGrow(promptEl);
@@ -2302,17 +2651,25 @@ async function submit() {
   if (apiMode === "chat") {
     payload.messages = state.messages
       .filter((m) => m.role === "user" || (m.role === "assistant" && m.content && !m.streaming))
-      .map((m) => ({ role: m.role, content: m.content }));
+			.map((m) => ({
+				role: m.role,
+				content: m.content,
+				...(m.reasoningItems?.length ? { reasoning_items: m.reasoningItems } : {}),
+			}));
     // last user already included; drop incomplete assistant
     if (payload.messages.at(-1)?.role === "assistant") payload.messages.pop();
-  } else if (state.lastResponseId) {
+	} else if (state.lastResponseId && !isCodex) {
     payload.last_response_id = state.lastResponseId;
     payload.messages = [{ role: "user", content: text }];
   } else {
     // first responses turn — can send conversation so far as messages
     payload.messages = state.messages
       .filter((m) => m.role === "user" || (m.role === "assistant" && m.content && !m.streaming))
-      .map((m) => ({ role: m.role, content: m.content }));
+			.map((m) => ({
+				role: m.role,
+				content: m.content,
+				...(m.reasoningItems?.length ? { reasoning_items: m.reasoningItems } : {}),
+			}));
     if (payload.messages.at(-1)?.role === "assistant") payload.messages.pop();
   }
 
@@ -2693,7 +3050,12 @@ function onChatEvent(ev) {
   // sees the request progressing even when the bubble render is stuck.
   logChatEventThrottled(ev);
 
-  if (ev.type === "thinking") {
+	if (ev.type === "reasoning_item" && ev.payload) {
+		last.reasoningItems = last.reasoningItems || [];
+		if (!last.reasoningItems.some((item) => item.id && item.id === ev.payload.id)) {
+			last.reasoningItems.push(ev.payload);
+		}
+	} else if (ev.type === "thinking") {
     last.thinking = (last.thinking || "") + (ev.text || "");
     thinkChars += (ev.text || "").length;
     const approx = Math.max(0, Math.round(thinkChars / 4));
@@ -2940,9 +3302,10 @@ function wireEvents() {
   });
   EventsOn("auth:success", async (payload) => {
     addLog("auth", "Auth success", payload);
+		await refreshBootstrap(true);
+		if (payload?.login_id && state.device?.login_id && payload.login_id !== state.device.login_id) return;
     state.device = null;
     document.querySelector(".overlay")?.remove();
-    await refreshBootstrap(true);
     const n = payload?.count || state.accounts.length;
     // soft toast via status line
     const st = $("#status-text");
@@ -2951,9 +3314,12 @@ function wireEvents() {
     }
   });
 
-  EventsOn("auth:error", (msg) => {
-    addLog("auth", "Auth error", { error: msg });
-    alert("Auth error: " + msg);
+	EventsOn("auth:error", (msg) => {
+		const loginID = typeof msg === "object" ? msg?.login_id : "";
+		const errorText = typeof msg === "object" ? msg?.error || "Falha de autenticação" : msg;
+		if (loginID && state.device?.login_id && loginID !== state.device.login_id) return;
+		addLog("auth", "Auth error", { error: errorText });
+		alert("Auth error: " + errorText);
     state.device = null;
     document.querySelector(".overlay")?.remove();
   });
@@ -2988,12 +3354,37 @@ function wireEvents() {
   EventsOn("signup:done", (p) => {
     addLog("signup", "Done", p);
     const st = $("#status-text");
-    if (st) st.innerHTML = `Signup · fase <strong>${escapeHtml(p?.phase || "done")}</strong>`;
+    if (st && p?.model_valid === false) {
+      const tier = Number.isFinite(Number(p?.oauth_tier)) ? `tier ${Number(p.oauth_tier)}` : "sem entitlement";
+      st.innerHTML = `Conta criada · <strong>API Grok indisponível (${escapeHtml(tier)})</strong>`;
+    } else if (st) {
+      st.innerHTML = `Signup · fase <strong>${escapeHtml(p?.phase || "done")}</strong>`;
+    }
   });
-  EventsOn("signup:auto_triggered", () => {
-    addLog("signup", "Auto triggered (quota exhausted)");
+  EventsOn("signup:auto_triggered", (p) => {
+    addLog("signup", "Auto triggered (pool below floor)", p);
     const st = $("#status-text");
-    if (st) st.innerHTML = `Cota esgotada — <strong>criando conta nova…</strong>`;
+    const usable = p?.usable ?? 0;
+    const target = p?.target ?? 3;
+    if (st) st.innerHTML = `Pool Grok · <strong>${usable}/${target}</strong> contas válidas — criando conta…`;
+  });
+  EventsOn("signup:pool_ready", (p) => {
+    addLog("signup", "Pool ready", p);
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Pool Grok OK · <strong>${escapeHtml(String(p?.usable ?? ""))}</strong> contas válidas`;
+  });
+  EventsOn("signup:pool_retry", (p) => {
+    addLog("signup", "Pool retry", p);
+  });
+  EventsOn("signup:batch_progress", (p) => {
+    addLog("signup", "Batch progress", p);
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Lote Grok · <strong>${escapeHtml(String(p?.created ?? 0))}</strong> criadas · ${escapeHtml(String(p?.usable ?? 0))} utilizáveis`;
+  });
+  EventsOn("signup:pool_incomplete", (p) => {
+    addLog("signup", "Pool incomplete", p);
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Pool Grok incompleto · <strong>${escapeHtml(String(p?.usable ?? 0))}/${escapeHtml(String(p?.target ?? 3))}</strong> · ${escapeHtml(p?.reason || "")}`;
   });
   EventsOn("kimi:relogin", async (p) => {
     addLog("kimi-relogin", p?.message || "relogin", p);
@@ -3029,6 +3420,10 @@ function wireEvents() {
     await refreshBootstrap(false);
     const st = $("#status-text");
     if (st) st.innerHTML = `Trocou pra conta <strong>${escapeHtml(p?.id || "")}</strong>`;
+  });
+  EventsOn("accounts:changed", async (p) => {
+    addLog("account", "Changed", p);
+    await refreshBootstrap(false);
   });
 }
 

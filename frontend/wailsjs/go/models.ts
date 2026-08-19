@@ -25,6 +25,7 @@ export namespace main {
 	    }
 	}
 	export class deviceLoginState {
+	    login_id?: string;
 	    device_code: string;
 	    user_code: string;
 	    verification_url: string;
@@ -38,6 +39,7 @@ export namespace main {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.login_id = source["login_id"];
 	        this.device_code = source["device_code"];
 	        this.user_code = source["user_code"];
 	        this.verification_url = source["verification_url"];
@@ -96,11 +98,15 @@ export namespace store {
 	    qwen_upstream?: string;
 	    qwen_api_key?: string;
 	    deepseek_api_key?: string;
+	    opencode_go_api_key?: string;
 	    theme_accent?: string;
 	    kimi_stealth_headless: boolean;
 	    google_email?: string;
 	    google_password?: string;
 	    load_balancer_strategies?: Record<string, string>;
+	    system_prompts?: Record<string, any>;
+	    auto_create_on_exhausted: boolean;
+	    auto_create_min_accounts?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -125,11 +131,15 @@ export namespace store {
 	        this.qwen_upstream = source["qwen_upstream"];
 	        this.qwen_api_key = source["qwen_api_key"];
 	        this.deepseek_api_key = source["deepseek_api_key"];
+	        this.opencode_go_api_key = source["opencode_go_api_key"];
 	        this.theme_accent = source["theme_accent"];
 	        this.kimi_stealth_headless = source["kimi_stealth_headless"];
 	        this.google_email = source["google_email"];
 	        this.google_password = source["google_password"];
 	        this.load_balancer_strategies = source["load_balancer_strategies"];
+	        this.system_prompts = source["system_prompts"];
+	        this.auto_create_on_exhausted = source["auto_create_on_exhausted"];
+	        this.auto_create_min_accounts = source["auto_create_min_accounts"];
 	    }
 	}
 
@@ -161,6 +171,7 @@ export namespace upstream {
 	    name?: string;
 	    tool_call_id?: string;
 	    tool_calls?: ToolCall[];
+	    reasoning_items?: any[];
 	
 	    static createFrom(source: any = {}) {
 	        return new ChatMessage(source);
@@ -173,6 +184,7 @@ export namespace upstream {
 	        this.name = source["name"];
 	        this.tool_call_id = source["tool_call_id"];
 	        this.tool_calls = this.convertValues(source["tool_calls"], ToolCall);
+	        this.reasoning_items = source["reasoning_items"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

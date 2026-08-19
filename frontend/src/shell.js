@@ -187,8 +187,8 @@ export function ensureShell() {
     (state.models.length
       ? state.models
       : [
-          { id: "grok-4.5", name: "Grok 4.5" },
-          { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
+          { id: "grok-4.6", name: "Grok 4.6" },
+          { id: "grok-4.6-responses", name: "Grok 4.6 (Responses)" },
         ]
     ).map((m) => ({ value: m.id, label: m.name || m.id }));
 
@@ -303,7 +303,7 @@ export function fillModels() {
   // custom menus re-render options via refresh
   state.menus["set-model"]?.refresh?.();
   state.menus["c-model"]?.refresh?.();
-  const prefer = state.settings.default_model || state.picks.model || "grok-4.5";
+  const prefer = state.settings.default_model || state.picks.model || "grok-4.6";
   if (state.menus["set-model"]) state.menus["set-model"].setValue(prefer);
   if (state.menus["c-model"] && !state.picks.cModelTouched) {
     state.menus["c-model"].setValue(prefer);
@@ -427,7 +427,7 @@ export function paintChrome() {
   // sync pick values from settings
   state.picks.effort = state.settings.reasoning_effort || state.picks.effort || "high";
   state.picks.api = state.settings.api_mode || state.picks.api || "chat";
-  state.picks.model = state.settings.default_model || state.picks.model || "grok-4.5";
+  state.picks.model = state.settings.default_model || state.picks.model || "grok-4.6";
   if (!state.picks.cEffort) state.picks.cEffort = state.picks.effort;
   if (!state.picks.cApi) state.picks.cApi = state.picks.api;
   if (!state.picks.cModel) state.picks.cModel = state.picks.model;
@@ -584,8 +584,8 @@ export async function refreshBootstrap(full = true) {
             { id: "opencode/laguna-s-2.1-free", name: "Laguna S 2.1 Free" },
           ]
         : [
-            { id: "grok-4.5", name: "Grok 4.5" },
-            { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
+            { id: "grok-4.6", name: "Grok 4.6" },
+            { id: "grok-4.6-responses", name: "Grok 4.6 (Responses)" },
           ];
     }
   }

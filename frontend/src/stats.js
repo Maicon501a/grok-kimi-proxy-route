@@ -52,7 +52,7 @@ export async function openStatsModal() {
   const base = proxy.base_url || "http://127.0.0.1:8787/v1";
   const modelsURL = proxy.models_url || base + "/models";
   const key = proxy.api_key || "local";
-  const modelList = (proxy.models_example || ["grok-4.5", "kimi-for-coding", "k3-agent", "k3-agent-low", "k3-agent-medium", "k3-agent-high", "k3-agent-xhigh"]).join(", ");
+  const modelList = (proxy.models_example || ["grok-4.6", "kimi-for-coding", "k3-agent", "k3-agent-low", "k3-agent-medium", "k3-agent-high", "k3-agent-xhigh"]).join(", ");
 
   const snippets = {
     opencode: proxy.opencode || "",
@@ -100,7 +100,7 @@ export async function openStatsModal() {
           <li>A lista vem com <b>Grok + Kimi</b> juntos (mesma porta).</li>
           <li>Na hora do chat, o client manda o <b>model</b> escolhido — o proxy roteia sozinho:
             <ul>
-              <li><code>grok-4.5</code> → Grok · <code>POST /v1/responses</code></li>
+              <li><code>grok-4.6</code> → Grok · <code>POST /v1/responses</code></li>
               <li><code>kimi-for-coding</code> / <code>k3-agent</code> → Kimi · <code>POST /v1/chat/completions</code></li>
             </ul>
           </li>

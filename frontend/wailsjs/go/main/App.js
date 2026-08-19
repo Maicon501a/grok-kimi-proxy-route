@@ -38,6 +38,14 @@ export function CancelDeviceLogin() {
   return window['go']['main']['App']['CancelDeviceLogin']();
 }
 
+export function CancelGeminiLogin(arg1) {
+  return window['go']['main']['App']['CancelGeminiLogin'](arg1);
+}
+
+export function CompleteGeminiLogin(arg1) {
+  return window['go']['main']['App']['CompleteGeminiLogin'](arg1);
+}
+
 export function CreateSkill(arg1, arg2, arg3) {
   return window['go']['main']['App']['CreateSkill'](arg1, arg2, arg3);
 }
@@ -56,6 +64,10 @@ export function GetAccountGoogleCredentials(arg1) {
 
 export function GetActiveRequest() {
   return window['go']['main']['App']['GetActiveRequest']();
+}
+
+export function GetAutoCreateMinAccounts() {
+  return window['go']['main']['App']['GetAutoCreateMinAccounts']();
 }
 
 export function GetAutoCreateOnExhausted() {
@@ -88,6 +100,10 @@ export function GetSkill(arg1) {
 
 export function GetStats() {
   return window['go']['main']['App']['GetStats']();
+}
+
+export function GetSystemPrompt(arg1, arg2) {
+  return window['go']['main']['App']['GetSystemPrompt'](arg1, arg2);
 }
 
 export function GetUsage() {
@@ -154,6 +170,10 @@ export function SetActiveAccount(arg1) {
   return window['go']['main']['App']['SetActiveAccount'](arg1);
 }
 
+export function SetAutoCreateMinAccounts(arg1) {
+  return window['go']['main']['App']['SetAutoCreateMinAccounts'](arg1);
+}
+
 export function SetAutoCreateOnExhausted(arg1) {
   return window['go']['main']['App']['SetAutoCreateOnExhausted'](arg1);
 }
@@ -166,6 +186,10 @@ export function SetKimiStealthHeadless(arg1) {
   return window['go']['main']['App']['SetKimiStealthHeadless'](arg1);
 }
 
+export function SetSystemPrompt(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetSystemPrompt'](arg1, arg2, arg3);
+}
+
 export function StartAccioLogin() {
   return window['go']['main']['App']['StartAccioLogin']();
 }
@@ -174,8 +198,16 @@ export function StartAutoSignup() {
   return window['go']['main']['App']['StartAutoSignup']();
 }
 
+export function StartCodexLogin() {
+  return window['go']['main']['App']['StartCodexLogin']();
+}
+
 export function StartDeviceLogin() {
   return window['go']['main']['App']['StartDeviceLogin']();
+}
+
+export function StartGeminiLogin(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartGeminiLogin'](arg1, arg2, arg3);
 }
 
 export function StartKimiBrowserLogin() {
@@ -194,6 +226,8 @@ export function StartKimiStealthLoginNewAccount(arg1) {
   return window['go']['main']['App']['StartKimiStealthLoginNewAccount'](arg1);
 }
 
+export function StartSignupBatch(arg1) {
+  return window['go']['main']['App']['StartSignupBatch'](arg1);
 }
 
 export function SyncGrokCLI() {
@@ -214,4 +248,8 @@ export function UpdateSkill(arg1, arg2, arg3, arg4) {
 
 export function UpsertMCPServer(arg1) {
   return window['go']['main']['App']['UpsertMCPServer'](arg1);
+}
+
+export function ValidateGeminiAccount(arg1) {
+  return window['go']['main']['App']['ValidateGeminiAccount'](arg1);
 }

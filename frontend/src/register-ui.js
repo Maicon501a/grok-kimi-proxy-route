@@ -8,6 +8,7 @@ import {
   OpenExternal,
   SetActiveAccount,
   RemoveAccount,
+  LogoffKimiAccount,
   RenameAccount,
   ResetAccount,
   RecoverAccounts,
@@ -453,7 +454,11 @@ export function openAccountsManager({ refreshBootstrap, paintChrome }) {
             } else if (act === "remove") {
               const a = state.accounts.find((x) => x.id === id);
               if (!confirm(`Remover ${a?.label || a?.email || id}?`)) return;
-              await RemoveAccount(id);
+              if (a?.provider === "kimi_work" && (a.has_web_session || a.has_refresh)) {
+                await LogoffKimiAccount(id);
+              } else {
+                await RemoveAccount(id);
+              }
               await refreshBootstrap?.(false);
               renderList();
               await paintChrome?.();

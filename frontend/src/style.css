@@ -469,6 +469,67 @@ button {
   display: flex;
 }
 
+/* Per-provider/model system prompt editor */
+.system-prompt-card {
+  margin: 2px 4px 14px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.system-prompt-card-head,
+.system-prompt-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.system-prompt-card-head { margin-bottom: 8px; }
+
+.system-prompt-card-head .field-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.system-prompt-scope,
+.system-prompt-count,
+.system-prompt-note {
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.system-prompt-scope { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 178px; }
+.system-prompt-count { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+#system-prompt-input {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-height: 122px;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.26);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+#system-prompt-input:focus { border-color: rgba(255, 255, 255, 0.34); box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.05); }
+#system-prompt-input:disabled { opacity: 0.55; }
+.system-prompt-actions { margin-top: 8px; }
+.system-prompt-actions .btn { height: 29px; padding: 0 11px; font-size: 11px; }
+.system-prompt-clear { color: #e2a8a8; }
+.system-prompt-save { margin-left: auto; }
+.system-prompt-note { margin: 8px 0 0; }
+
 /* Composer chips live inside a horizontal scroll area. A fixed menu escapes
    that clipping region while JS keeps it anchored to the chip. */
 .dd-menu.dd-menu-fixed {
@@ -2297,6 +2358,11 @@ select option {
   color: rgba(255,255,255,0.55); margin: 8px 0 4px; cursor: pointer;
 }
 .auto-toggle input { margin-top: 2px; }
+.auto-toggle .auto-min-input {
+  width: 52px; margin: -2px 2px 0; padding: 2px 6px; border-radius: 6px;
+  background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+  color: rgba(255,255,255,0.85); font-size: 12px; text-align: center;
+}
 .signup-log {
   margin-top: 12px; padding: 10px 12px; border-radius: 10px;
   background: rgba(0,0,0,0.28);
