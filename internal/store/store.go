@@ -3246,6 +3246,14 @@ func (s *Store) UpsertAccount(a Account) error {
 	}
 	a.UpdatedAt = now
 	s.accounts[a.ID] = a
+	// Normalize duplicates: the same Google/Kimi identity must not accumulate
+	// multiple rows (re-login after remote logoff mints a NEW Kimi user id for
+	// the SAME Google account, so kimi-<userID> rows multiply otherwise).
+	// The quota-reset flow (logoff → re-login) is unaffected: it replaces the
+	// predecessor row with the fresh one, which is exactly what dedup does.
+	if a.NormalizedProvider() == ProviderKimiWork {
+		s.dedupKimiAccountsLocked(a)
+	}
 	// Activate if empty or active belongs to another provider.
 	activate := s.settings.ActiveAccountID == ""
 	if !activate {
@@ -3262,8 +3270,81 @@ func (s *Store) UpsertAccount(a Account) error {
 	return s.saveAccountLocked(a)
 }
 
-func (s *Store) RemoveAccount(id string) error {
-	s.mu.Lock()
+// normalizeKimiIdentityEmail lowercases/trims an email and, for Gmail only,
+// strips dots and +tags from the local part (Google treats them as identical).
+func normalizeKimiIdentityEmail(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	local, domain, ok := strings.Cut(email, "@")
+	if !ok {
+		return email
+	}
+	if domain == "gmail.com" || domain == "googlemail.com" {
+		if i := strings.Index(local, "+"); i >= 0 {
+			local = local[:i]
+		}
+		local = strings.ReplaceAll(local, ".", "")
+	}
+	return local + "@" + domain
+}
+
+// sameKimiIdentity reports whether two Kimi Work accounts belong to the same
+// Google/Kimi identity: matching Google refresh token (strongest) or matching
+// normalized email on either the Email or GoogleEmail fields.
+func sameKimiIdentity(a, b Account) bool {
+	if a.GoogleRefreshToken != "" && a.GoogleRefreshToken == b.GoogleRefreshToken {
+		return true
+	}
+	pairs := [][2]string{
+		{a.Email, b.Email},
+		{a.GoogleEmail, b.GoogleEmail},
+		{a.Email, b.GoogleEmail},
+		{a.GoogleEmail, b.Email},
+	}
+	for _, p := range pairs {
+		x, y := normalizeKimiIdentityEmail(p[0]), normalizeKimiIdentityEmail(p[1])
+		if x != "" && !strings.HasPrefix(x, "@") && x == y {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupKimiAccountsLocked removes OTHER Kimi Work rows that share the freshly
+// upserted account's identity. The new row always wins: it carries the live
+// binding (Google maps the account to the newest Kimi user) and fresh quota.
+// Caller must hold s.mu.
+func (s *Store) dedupKimiAccountsLocked(keep Account) {
+	for id, other := range s.accounts {
+		if id == keep.ID || other.NormalizedProvider() != ProviderKimiWork {
+			continue
+		}
+		if !sameKimiIdentity(keep, other) {
+			continue
+		}
+		logging.Info("store.account.dedup", "removed", id, "kept", keep.ID, "email", other.Email)
+		if s.db != nil {
+			_ = s.deleteAccountDB(id)
+		}
+		_ = os.Remove(s.accountPath(id))
+		delete(s.accounts, id)
+		delete(s.usage, id)
+		filtered := s.history[:0]
+		for _, h := range s.history {
+			if h.AccountID != id {
+				filtered = append(filtered, h)
+			}
+		}
+		s.history = filtered
+		if s.settings.ActiveAccountID == id {
+			s.settings.ActiveAccountID = keep.ID
+			_ = s.saveSettingsLocked()
+		}
+	}
+	_ = s.saveUsageLocked()
+	_ = s.saveHistoryLocked()
+}
+
+func (s *Store) RemoveAccount(id string) error {	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, had := s.accounts[id]
 	if s.db != nil {
