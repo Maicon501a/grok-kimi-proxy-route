@@ -287,6 +287,7 @@ func (a *App) shutdown(ctx context.Context) {
 		a.signupCancel()
 	}
 	a.mu.Unlock()
+	kimi.CloseGoogleBridge() // shared off-screen Chrome used by bridge logins
 	if a.accMgr != nil {
 		a.accMgr.Stop()
 	}
@@ -860,9 +861,30 @@ func (a *App) startKimiStealthLoginNewAccount(autoClose bool, background bool, g
 		"phase":   "stealth_new",
 		"message": "Iniciando login com perfil isolado (nova conta Google)…",
 	})
-	gl, err := kimi.LoginWithGoogleStealth(root, profileDir, 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless, googleEmail, googlePassword)
-	if err != nil {
-		return nil, err
+	var gl *kimi.GoogleLoginSession
+	if strings.TrimSpace(googleEmail) != "" && strings.TrimSpace(googlePassword) != "" {
+		// Preferred path: HTTP-direct bridge login — one shared off-screen
+		// Chrome mints the anti-bot tokens; Go drives everything else.
+		// Faster and more reliable than UI automation.
+		a.safeEmit("kimi:login", map[string]any{
+			"phase":   "bridge",
+			"message": "Login Google via bridge HTTP (Chrome compartilhado, invisível)…",
+		})
+		gl, err = kimi.LoginWithGoogleBridge(root, googleEmail, googlePassword, 4*time.Minute)
+		if err != nil {
+			logging.Warn("kimi.bridge_login.failed", "err", err.Error())
+			a.safeEmit("kimi:login", map[string]any{
+				"phase":   "stealth_fallback",
+				"message": "Bridge falhou — tentando login stealth (UI)…",
+			})
+			gl = nil
+		}
+	}
+	if gl == nil {
+		gl, err = kimi.LoginWithGoogleStealth(root, profileDir, 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless, googleEmail, googlePassword)
+		if err != nil {
+			return nil, err
+		}
 	}
 	access := gl.AccessToken
 	refresh := gl.RefreshToken
@@ -878,6 +900,11 @@ func (a *App) startKimiStealthLoginNewAccount(autoClose bool, background bool, g
 	rec, err := a.addKimiSession(access, refresh, gl.GoogleRefreshToken, payload, "google_stealth_new", gl.Email, gl.Name, background)
 	if err != nil {
 		return nil, err
+	}
+	// Persist the Google credentials on the new row so future bridge/stealth
+	// re-logins work even if the Google refresh token dies.
+	if id, _ := rec["id"].(string); id != "" && strings.TrimSpace(googleEmail) != "" {
+		a.SetAccountGoogleCredentials(id, googleEmail, googlePassword)
 	}
 	if rec != nil {
 		rec["mode"] = "playwright_new"
