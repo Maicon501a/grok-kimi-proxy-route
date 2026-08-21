@@ -113,6 +113,9 @@ func sanitizeResponsesToolsCore(raw any) []any {
 		if norm == nil {
 			continue
 		}
+		if strings.EqualFold(asString(norm["type"]), "function") {
+			repairToolSchema(norm["parameters"])
+		}
 		nt := strings.ToLower(asString(norm["type"]))
 		switch nt {
 		case "web_search":
@@ -258,6 +261,69 @@ func normalizeOneTool(m map[string]any) map[string]any {
 	return out
 }
 
+// repairToolSchema drops entries from every "required" array that are not
+// declared in the sibling "properties" object. Strict backends reject payloads
+// otherwise (Kimi/Moonshot: "is not a valid moonshot flavored json schema ...
+// At path 'properties.migrations.items.required': required property 'tag' is
+// not defined in properties"). Only schema-bearing keywords are walked so
+// example/default payloads embedded in descriptions stay untouched.
+func repairToolSchema(node any) {
+	switch n := node.(type) {
+	case map[string]any:
+		props, _ := n["properties"].(map[string]any)
+		if props != nil {
+			for _, sub := range props {
+				repairToolSchema(sub)
+			}
+		}
+		// A nil properties map means every required name is undefined as far
+		// as strict validators are concerned.
+		switch req := n["required"].(type) {
+		case []any:
+			kept := make([]any, 0, len(req))
+			for _, r := range req {
+				if _, defined := props[asString(r)]; defined {
+					kept = append(kept, r)
+				}
+			}
+			if len(kept) == 0 {
+				delete(n, "required")
+			} else {
+				n["required"] = kept
+			}
+		case []string:
+			kept := make([]string, 0, len(req))
+			for _, r := range req {
+				if _, defined := props[r]; defined {
+					kept = append(kept, r)
+				}
+			}
+			if len(kept) == 0 {
+				delete(n, "required")
+			} else {
+				n["required"] = kept
+			}
+		}
+		for _, key := range []string{"items", "prefixItems", "anyOf", "oneOf", "allOf"} {
+			repairToolSchema(n[key])
+		}
+		if ap, ok := n["additionalProperties"]; ok {
+			repairToolSchema(ap) // bool form is a no-op
+		}
+		for _, key := range []string{"$defs", "definitions"} {
+			if defs, ok := n[key].(map[string]any); ok {
+				for _, sub := range defs {
+					repairToolSchema(sub)
+				}
+			}
+		}
+	case []any:
+		for _, item := range n {
+			repairToolSchema(item)
+		}
+	}
+}
+
 // sanitizeChatTools keeps only function tools in OpenAI nested shape for /chat/completions.
 func sanitizeChatTools(raw any) []any {
 	list := flattenToolList(raw)
@@ -303,6 +369,7 @@ func sanitizeChatTools(raw any) []any {
 		if params == nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
+		repairToolSchema(params)
 		out = append(out, map[string]any{
 			"type": "function",
 			"function": map[string]any{

@@ -224,3 +224,110 @@ func TestSanitizeToolCallsList_DropsInvalid(t *testing.T) {
 		t.Fatalf("expected bash, got %s", asString(fn["name"]))
 	}
 }
+
+func TestRepairToolSchema_DropsRequiredNotInProperties(t *testing.T) {
+	// Exact shape from the field report: Moonshot rejects
+	// "At path 'properties.migrations.items.required': required property
+	// 'tag' is not defined in properties".
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"migrations": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type":     "object",
+					"required": []any{"tag"},
+					"properties": map[string]any{
+						"name": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+		"required": []any{"migrations"},
+	}
+	raw := []any{map[string]any{
+		"type":       "function",
+		"name":       "apply_migrations",
+		"parameters": params,
+	}}
+
+	out := sanitizeChatTools(raw)
+	fn := out[0].(map[string]any)["function"].(map[string]any)
+	fixed := fn["parameters"].(map[string]any)
+
+	items := fixed["properties"].(map[string]any)["migrations"].(map[string]any)["items"].(map[string]any)
+	if _, ok := items["required"]; ok {
+		b, _ := json.Marshal(fixed)
+		t.Fatalf("nested orphan required survived: %s", b)
+	}
+	req, ok := fixed["required"].([]any)
+	if !ok || len(req) != 1 || asString(req[0]) != "migrations" {
+		b, _ := json.Marshal(fixed)
+		t.Fatalf("valid top-level required was damaged: %s", b)
+	}
+}
+
+func TestSanitizeResponsesTools_RepairsRequiredInSchema(t *testing.T) {
+	raw := []any{map[string]any{
+		"type": "function",
+		"name": "apply_migrations",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name": map[string]any{"type": "string"},
+				"opts": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"name": map[string]any{"type": "string"},
+					},
+					"required": []any{"name", "tag"},
+				},
+			},
+		},
+	}}
+	out := sanitizeResponsesTools(raw)
+	params := out[0].(map[string]any)["parameters"].(map[string]any)
+	opts := params["properties"].(map[string]any)["opts"].(map[string]any)
+	req, ok := opts["required"].([]any)
+	if !ok || len(req) != 1 || asString(req[0]) != "name" {
+		b, _ := json.Marshal(params)
+		t.Fatalf("expected [name] kept and orphan tag dropped: %s", b)
+	}
+
+	// No properties at all: every required name counts as undefined for a
+	// strict validator, so the whole key must go.
+	raw2 := []any{map[string]any{
+		"type":       "function",
+		"name":       "no_props",
+		"parameters": map[string]any{"type": "object", "required": []any{"ghost"}},
+	}}
+	out2 := sanitizeResponsesTools(raw2)
+	params2 := out2[0].(map[string]any)["parameters"].(map[string]any)
+	if _, ok := params2["required"]; ok {
+		b, _ := json.Marshal(params2)
+		t.Fatalf("orphan-only required should be removed: %s", b)
+	}
+}
+
+func TestRepairToolSchema_StringRequiredAndEmptyRemoval(t *testing.T) {
+	schema := map[string]any{
+		"type":     "object",
+		"required": []string{"ghost"},
+	}
+	repairToolSchema(schema)
+	if _, ok := schema["required"]; ok {
+		t.Fatalf("orphan-only required should be removed entirely")
+	}
+
+	schema2 := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"a": map[string]any{"type": "string"}},
+		"required":   []string{"a"},
+	}
+	repairToolSchema(schema2)
+	req, ok := schema2["required"].([]string)
+	if !ok || len(req) != 1 || req[0] != "a" {
+		b, _ := json.Marshal(schema2)
+		t.Fatalf("valid string-required damaged: %s", b)
+	}
+}
