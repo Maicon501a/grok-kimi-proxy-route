@@ -22,10 +22,10 @@ import (
 const (
 	AppName         = "GrokDesktop"
 	DefaultUpstream = "https://cli-chat-proxy.grok.com/v1"
-	// Wire identity of the official Grok CLI (currently 1.0.5). cli-chat-proxy
-	// gates function-tool emission on these headers; older 0.2.x values look
+	// Wire identity of the official Grok CLI (currently 1.0.13). cli-chat-proxy
+	// gates function-tool emission on these headers; older 0.2.x / 1.0.4 / 1.0.5 values look
 	// like a chat-only client and the model never returns tool_calls.
-	DefaultClientVersion    = "1.0.5"
+	DefaultClientVersion    = "1.0.13"
 	DefaultClientIdentifier = "grok-cli"
 	DefaultClientSurface    = "grok-cli"
 	DefaultModel            = "grok-4.6"
@@ -1182,10 +1182,17 @@ func looksLikeOpenCodeZenModel(model string) bool {
 	if strings.HasPrefix(m, "opencode/") {
 		return true
 	}
+	// Bare effort-suffixed aliases (x-preview-f-free-max) route like their base id.
+	if base, eff := ExtractZenEffort(m); eff != "" {
+		m = base
+	}
 	switch m {
 	case "deepseek-v4-flash-free", "deepseek-v4-flash",
-		"big-pickle", "mimo-v2.5-free", "mimo-v2.5",
+		"big-pickle", "x-preview-f-free", "ox-alpha-free",
+		"muse-spark-1.2-contributor-free", "muse-spark-1.2-contributor",
+		"mimo-v2.5-free", "mimo-v2.5", "hy3-free", "hy3",
 		"nemotron-3-ultra-free", "nemotron-3-ultra",
+		"nemotron-3.5-lightning-free", "nemotron-3.5-lightning",
 		"north-mini-code-free", "north-mini-code",
 		"ling-3.0-flash-free", "ling-3.0-flash",
 		"laguna-s-2.1-free", "laguna-s-2.1":
@@ -1243,24 +1250,50 @@ func resolveOpenCodeGoModel(model string) string {
 	return strings.TrimSuffix(m, ".")
 }
 
+// ExtractZenEffort splits an effort suffix (-low/-high/-max) from a Zen model
+// id, mirroring the Kimi agent aliases. Example:
+// "opencode/x-preview-f-free-max" → ("opencode/x-preview-f-free", "max").
+func ExtractZenEffort(model string) (base string, effort string) {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-max", "-high", "-low"} {
+		if strings.HasSuffix(m, suffix) {
+			return strings.TrimSuffix(m, suffix), strings.TrimPrefix(suffix, "-")
+		}
+	}
+	return m, ""
+}
+
 func resolveOpenCodeZenModel(model string) string {
 	m := strings.TrimSpace(model)
 	if strings.HasPrefix(strings.ToLower(m), "opencode/") {
 		m = m[len("opencode/"):]
 	}
+	// Effort-suffixed aliases (…-max) never reach the wire: split them off and
+	// resolve the bare catalog id. Callers apply the effort to the request body.
+	if base, eff := ExtractZenEffort(m); eff != "" {
+		m = base
+	}
 	switch strings.ToLower(m) {
 	case "deepseek-v4-flash":
 		return "deepseek-v4-flash-free"
+	case "ox-alpha-free":
+		return "x-preview-f-free"
 	case "mimo-v2.5":
 		return "mimo-v2.5-free"
+	case "hy3":
+		return "hy3-free"
 	case "nemotron-3-ultra":
 		return "nemotron-3-ultra-free"
+	case "nemotron-3.5-lightning":
+		return "nemotron-3.5-lightning-free"
 	case "north-mini-code":
 		return "north-mini-code-free"
 	case "ling-3.0-flash":
 		return "ling-3.0-flash-free"
 	case "laguna-s-2.1":
 		return "laguna-s-2.1-free"
+	case "muse-spark-1.2-contributor":
+		return "muse-spark-1.2-contributor-free"
 	default:
 		return m
 	}
@@ -1839,7 +1872,7 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// staleGrokClientVersion is true for empty / pre-1.0.5 identities that
+// staleGrokClientVersion is true for empty / pre-1.0.13 identities that
 // cli-chat-proxy treats as chat-only (no function tools).
 func staleGrokClientVersion(v string) bool {
 	v = strings.TrimSpace(v)
@@ -1850,7 +1883,7 @@ func staleGrokClientVersion(v string) bool {
 		return true
 	}
 	switch v {
-	case "1.0.4":
+	case "1.0.4", "1.0.5":
 		return true
 	}
 	return false
@@ -3344,7 +3377,8 @@ func (s *Store) dedupKimiAccountsLocked(keep Account) {
 	_ = s.saveHistoryLocked()
 }
 
-func (s *Store) RemoveAccount(id string) error {	s.mu.Lock()
+func (s *Store) RemoveAccount(id string) error {
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, had := s.accounts[id]
 	if s.db != nil {

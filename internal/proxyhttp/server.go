@@ -973,8 +973,9 @@ func openCodeGoModels(settings store.Settings) []upstream.ModelInfo {
 	if ids, err := upstream.FetchOpenCodeGoModelIDs(ctx, upstreamHTTPClient, key); err == nil && len(ids) > 0 {
 		dynamic := make([]upstream.ModelInfo, 0, len(ids))
 		for _, id := range ids {
+			apiMode := upstream.OpenCodeGoModelAPIMode(id)
 			dynamic = append(dynamic, upstream.ModelInfo{
-				ID: "opencode-go/" + id, Name: id, Description: "OpenCode Go · API key · chat/completions", APIMode: "chat",
+				ID: "opencode-go/" + id, Name: id, Description: "OpenCode Go · API key · " + apiMode, APIMode: apiMode,
 			})
 		}
 		models = dynamic
@@ -1508,10 +1509,10 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		settings.APIMode = "chat"
 	} else if routeProv == store.ProviderOpenCodeZen {
 		settings.UpstreamBase = store.OpenCodeZenUpstream
-		settings.APIMode = "chat"
+		settings.APIMode = upstream.OpenCodeZenModelAPIMode(reqModel)
 	} else if routeProv == store.ProviderOpenCodeGo {
 		settings.UpstreamBase = store.OpenCodeGoUpstream
-		settings.APIMode = "chat"
+		settings.APIMode = upstream.OpenCodeGoModelAPIMode(reqModel)
 	} else if routeProv == store.ProviderCodex {
 		settings.UpstreamBase = store.CodexUpstream
 		settings.APIMode = "responses"
@@ -1554,8 +1555,41 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			delete(m, "last_response_id")
 		}
 
-		// Kimi / Ollie / Gemini / Qwen / DeepSeek / OpenCode: /responses → chat/completions
-		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || settings.IsOpenCodeZen() || settings.IsOpenCodeGo()) && path == "/responses" {
+		// Muse Spark Contributor models are Responses-only in both Zen Free and
+		// OpenCode Go. Preserve native Responses clients and translate OpenAI
+		// chat clients below.
+		zenResponses := settings.IsOpenCodeZen() && upstream.OpenCodeZenModelAPIMode(resolvedModel) == "responses"
+		goResponses := settings.IsOpenCodeGo() && upstream.OpenCodeGoModelAPIMode(resolvedModel) == "responses"
+
+		// Zen chat models and Muse's Responses endpoint accept different effort
+		// vocabularies. Normalize before forwarding — both the OpenAI field and
+		// a native Responses reasoning object.
+		if settings.IsOpenCodeZen() {
+			// Effort-suffixed alias (…-max) overrides any client effort field.
+			if _, e := store.ExtractZenEffort(reqModel); e != "" {
+				m["reasoning_effort"] = e
+			}
+			if v, ok := m["reasoning_effort"].(string); ok {
+				if mapped := upstream.ZenReasoningEffortForModel(resolvedModel, v); mapped != "" {
+					m["reasoning_effort"] = mapped
+				} else {
+					delete(m, "reasoning_effort")
+				}
+			}
+			if robj, ok := m["reasoning"].(map[string]any); ok {
+				if v, ok := robj["effort"].(string); ok && strings.TrimSpace(v) != "" {
+					if mapped := upstream.ZenReasoningEffortForModel(resolvedModel, v); mapped != "" {
+						robj["effort"] = mapped
+					} else {
+						delete(robj, "effort")
+					}
+				}
+			}
+		}
+
+		// Kimi / Ollie / Gemini / Qwen / DeepSeek / chat-only Zen and Go:
+		// /responses → chat/completions.
+		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork() || settings.IsQwen() || settings.IsDeepSeek() || (settings.IsOpenCodeZen() && !zenResponses) || (settings.IsOpenCodeGo() && !goResponses)) && path == "/responses" {
 			path = "/chat/completions"
 			wantClientChat = true
 			wantClientResponses = false
@@ -1570,8 +1604,14 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			m = clampKimiContextLimits(m, resolvedModel)
 		}
 
-		// Grok default path: client chat/completions → xAI /responses (response translated back later)
-		if (settings.IsXAI() || settings.IsCodex()) && path == "/chat/completions" {
+		// Grok / Codex and Muse: client chat/completions → /responses
+		// (response translated back later).
+		// NOTE: xAI is intentionally NOT converted here. cli-chat-proxy serves
+		// /chat/completions natively with OpenAI tool_calls (same as the official
+		// Grok CLI 1.0.13). Forcing chat→responses mangled client function tools
+		// and broke IDE tool execution — chat stays chat so any IDE can pass its
+		// own tools through. Web search stays available on the /responses path.
+		if (settings.IsCodex() || zenResponses || goResponses) && path == "/chat/completions" {
 			path = "/responses"
 			m = chatCompletionsBodyToResponses(m, settings)
 			if mid, ok := m["model"].(string); ok && mid != "" {
@@ -2252,8 +2292,13 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 
-		// Grok default: client used /chat/completions, upstream was /responses → translate back to chat.
-		if (settings.IsXAI() || settings.IsCodex()) && wantClientChat && !wantClientResponses {
+		// Grok / Codex and Muse: client used /chat/completions, upstream was
+		// /responses → translate back to chat.
+		// NOTE: xAI no longer forces chat→responses (native chat passthrough
+		// preserves IDE tool_calls), so only Codex/Muse need back-translation.
+		if (settings.IsCodex() ||
+			(settings.IsOpenCodeZen() && upstream.OpenCodeZenModelAPIMode(resolvedModel) == "responses") ||
+			(settings.IsOpenCodeGo() && upstream.OpenCodeGoModelAPIMode(resolvedModel) == "responses")) && wantClientChat && !wantClientResponses {
 			accountID := ""
 			if acc != nil {
 				accountID = acc.ID
@@ -2422,9 +2467,13 @@ func normalizeCodexResponsesInput(input any) any {
 //   - real wire model ids (k3-agent / k2d6-agent / …), never force kimi-for-coding
 //   - client thinking / reasoning_effort only (no global settings)
 //   - Desktop shape: thinking: { type, effort?, keep? }
+//   - drop/coerce empty messages (agent-gw rejects "message at position N must not be empty")
 func sanitizeKimiWorkChatBody(m map[string]any) {
 	if m == nil {
 		return
+	}
+	if msgs, ok := m["messages"].([]any); ok {
+		m["messages"] = sanitizeKimiChatMessages(msgs)
 	}
 	orig, _ := m["model"].(string)
 	// Resolve wire model from client id (strips effort suffix for model field).
@@ -2479,6 +2528,100 @@ func sanitizeKimiWorkChatBody(m map[string]any) {
 		}
 	default:
 		m["thinking"] = map[string]any{"type": "enabled", "keep": "all"}
+	}
+}
+
+// sanitizeKimiChatMessages drops empty user/assistant/system messages that make
+// agent-gw reject the whole request with:
+// "the message at position N with role 'assistant' must not be empty".
+// Opencode/Codex histories often contain those after interrupted builds or
+// aborted tool calls. Assistant turns that only carry tool_calls are kept.
+// Empty tool results are coerced (dropping them would orphan the tool_call).
+func sanitizeKimiChatMessages(msgs []any) []any {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	out := make([]any, 0, len(msgs))
+	for _, raw := range msgs {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role == "" {
+			continue
+		}
+		// Assistant with tool_calls: keep even when content is empty/null.
+		if tcs, has := msg["tool_calls"]; has {
+			if list, ok := tcs.([]any); ok && len(list) > 0 {
+				if c, exists := msg["content"]; exists {
+					if s, isStr := c.(string); isStr && strings.TrimSpace(s) == "" {
+						msg["content"] = nil
+					}
+				}
+				out = append(out, msg)
+				continue
+			}
+		}
+		// Tool messages must stay paired with their call; coerce empty instead of dropping.
+		if role == "tool" {
+			if kimiChatTextEmpty(msg["content"]) {
+				msg["content"] = "[interrupted tool result]"
+			}
+			out = append(out, msg)
+			continue
+		}
+		if kimiChatTextEmpty(msg["content"]) {
+			continue
+		}
+		out = append(out, msg)
+	}
+	if len(out) == 0 {
+		return []any{map[string]any{"role": "user", "content": "Hello"}}
+	}
+	return out
+}
+
+// kimiChatTextEmpty reports whether an OpenAI chat content (string or parts)
+// carries no usable text/image for Kimi agent-gw.
+func kimiChatTextEmpty(content any) bool {
+	switch c := content.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []any:
+		for _, p := range c {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				if s, ok := p.(string); ok && strings.TrimSpace(s) != "" {
+					return false
+				}
+				continue
+			}
+			pt := strings.ToLower(strings.TrimSpace(asString(pm["type"])))
+			switch pt {
+			case "text", "input_text", "output_text":
+				if s := firstNonEmpty(asString(pm["text"]), contentToPlainText(pm["content"])); strings.TrimSpace(s) != "" {
+					return false
+				}
+			case "image_url", "input_image", "image":
+				return false
+			case "refusal":
+				if s := firstNonEmpty(asString(pm["refusal"]), asString(pm["text"])); strings.TrimSpace(s) != "" {
+					return false
+				}
+			default:
+				if s := asString(pm["text"]); strings.TrimSpace(s) != "" {
+					return false
+				}
+			}
+		}
+		return true
+	default:
+		s := contentToPlainText(c)
+		return strings.TrimSpace(s) == ""
 	}
 }
 

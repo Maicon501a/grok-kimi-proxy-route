@@ -8,8 +8,12 @@ import (
 )
 
 // xAI Responses API accepts only these tool type variants.
+// Extended with the agent tool families observed in the official Grok CLI
+// 1.0.13 binary (FunctionShellCall, LocalShellToolCall, CustomToolCall, etc.)
+// so client tools are passed through instead of being dropped as "unknown".
 var allowedToolTypes = map[string]bool{
 	"function":           true,
+	"custom":             true,
 	"web_search":         true,
 	"x_search":           true,
 	"collections_search": true,
@@ -18,6 +22,10 @@ var allowedToolTypes = map[string]bool{
 	"code_interpreter":   true,
 	"mcp":                true,
 	"shell":              true,
+	"local_shell":        true,
+	"function_shell":     true,
+	"computer":           true,
+	"apply_patch":        true,
 }
 
 func nativeSearchTools() []any {
@@ -230,7 +238,13 @@ func normalizeOneTool(m map[string]any) map[string]any {
 	}
 
 	// Built-in server tools — pass only type (+ known optional filters)
+	// Agent custom families (custom, local_shell, function_shell, computer,
+	// apply_patch) carry their own name/params — preserve the full definition
+	// so the model can actually call them instead of receiving a bare type.
 	if typ != "function" {
+		if typ == "custom" || typ == "local_shell" || typ == "function_shell" || typ == "computer" || typ == "apply_patch" {
+			return cloneMap(m)
+		}
 		out := map[string]any{"type": typ}
 		// preserve safe optional knobs
 		for _, k := range []string{"filters", "allowed_domains", "excluded_domains", "enable_image_understanding", "enable_image_search", "vector_store_ids", "max_num_results"} {

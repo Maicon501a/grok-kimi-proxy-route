@@ -37,18 +37,27 @@ func TestXAIChatForwardsOpenCodeFunctionToolsWithoutNativeSearch(t *testing.T) {
 		gotBody = string(b)
 		w := httptest.NewRecorder()
 		w.Header().Set("Content-Type", "application/json")
+		// Native chat/completions passthrough (same as official Grok CLI 1.0.13):
+		// upstream returns OpenAI tool_calls, proxy forwards untouched.
 		_, _ = w.Write([]byte(`{
-			"id":"resp_tools",
+			"id":"chatcmpl_tools",
+			"object":"chat.completion",
+			"created":1788637437,
 			"model":"grok-4.6",
-			"output":[{
-				"type":"function_call",
-				"id":"fc_1",
-				"call_id":"call_bash",
-				"name":"bash",
-				"arguments":"{\"command\":\"ls\"}",
-				"status":"completed"
+			"choices":[{
+				"index":0,
+				"message":{
+					"role":"assistant",
+					"content":null,
+					"tool_calls":[{
+						"id":"call_bash",
+						"type":"function",
+						"function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}
+					}]
+				},
+				"finish_reason":"tool_calls"
 			}],
-			"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}
+			"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
 		}`))
 		return w.Result(), nil
 	})
@@ -86,8 +95,8 @@ func TestXAIChatForwardsOpenCodeFunctionToolsWithoutNativeSearch(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status=%d body=%s", res.StatusCode, raw)
 	}
-	if gotPath != "/v1/responses" {
-		t.Fatalf("upstream path=%q want /v1/responses", gotPath)
+	if gotPath != "/v1/chat/completions" {
+		t.Fatalf("upstream path=%q want /v1/chat/completions (native passthrough, same as Grok CLI)", gotPath)
 	}
 	if gotIdent != store.DefaultClientIdentifier {
 		t.Fatalf("identifier=%q want %q", gotIdent, store.DefaultClientIdentifier)
@@ -108,7 +117,9 @@ func TestXAIChatForwardsOpenCodeFunctionToolsWithoutNativeSearch(t *testing.T) {
 		t.Fatalf("want exactly 1 client function tool, got %#v body=%s", tools, gotBody)
 	}
 	tm := tools[0].(map[string]any)
-	if tm["type"] != "function" || tm["name"] != "bash" {
+	// Native OpenAI chat shape (preserved for cli-chat-proxy).
+	fn, _ := tm["function"].(map[string]any)
+	if tm["type"] != "function" || fn["name"] != "bash" {
 		t.Fatalf("tool=%#v", tm)
 	}
 
@@ -125,9 +136,9 @@ func TestXAIChatForwardsOpenCodeFunctionToolsWithoutNativeSearch(t *testing.T) {
 	if len(tcs) != 1 {
 		t.Fatalf("tool_calls=%#v", tcs)
 	}
-	fn := tcs[0].(map[string]any)["function"].(map[string]any)
-	if fn["name"] != "bash" {
-		t.Fatalf("name=%v", fn["name"])
+	fn2 := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn2["name"] != "bash" {
+		t.Fatalf("name=%v", fn2["name"])
 	}
 }
 
